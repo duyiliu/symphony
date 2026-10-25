@@ -57,11 +57,11 @@ defmodule SymphonyElixir.McpBridgeTest do
     test "tools/call without a tool name is an invalid params error" do
       body = rpc_call("tools/call", %{"arguments" => %{}})
 
-      assert body["error"]["code"] == -32602
+      assert body["error"]["code"] == -32_602
     end
 
     test "unknown methods are rejected" do
-      assert %{"error" => %{"code" => -32601}} = rpc_call("resources/list")
+      assert %{"error" => %{"code" => -32_601}} = rpc_call("resources/list")
     end
 
     test "malformed json is a parse error" do
@@ -70,7 +70,7 @@ defmodule SymphonyElixir.McpBridgeTest do
         |> authorize()
         |> call()
 
-      assert Jason.decode!(conn.resp_body)["error"]["code"] == -32700
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == -32_700
     end
 
     test "a request without the bearer token is unauthorized" do

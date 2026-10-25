@@ -88,10 +88,20 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
     runtime = runtime_module()
+    opts = Keyword.put(opts, :runtime, runtime)
 
     with {:ok, session} <- runtime.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_agent_turns(runtime, session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_agent_turns(
+          session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          1,
+          max_turns
+        )
       after
         runtime.stop_session(session)
       end
@@ -105,7 +115,17 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp do_run_agent_turns(runtime, app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_agent_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
+    runtime = Keyword.fetch!(opts, :runtime)
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
@@ -122,7 +142,6 @@ defmodule SymphonyElixir.AgentRunner do
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
           do_run_agent_turns(
-            runtime,
             app_session,
             workspace,
             refreshed_issue,

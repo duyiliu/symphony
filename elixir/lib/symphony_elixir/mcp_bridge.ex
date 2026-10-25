@@ -16,6 +16,11 @@ defmodule SymphonyElixir.McpBridge do
   @mcp_path "/mcp"
 
   defmodule Router do
+    @moduledoc """
+    Plug that serves the MCP JSON-RPC surface: `initialize`, `tools/list` and
+    `tools/call`, gated by the bridge's bearer token.
+    """
+
     @behaviour Plug
     import Plug.Conn
 
@@ -59,8 +64,8 @@ defmodule SymphonyElixir.McpBridge do
 
       case Jason.decode(body) do
         {:ok, %{"method" => method} = request} -> dispatch(conn, method, request)
-        {:ok, _other} -> rpc_error(conn, nil, -32600, "Invalid Request")
-        {:error, _reason} -> rpc_error(conn, nil, -32700, "Parse error")
+        {:ok, _other} -> rpc_error(conn, nil, -32_600, "Invalid Request")
+        {:error, _reason} -> rpc_error(conn, nil, -32_700, "Parse error")
       end
     end
 
@@ -99,12 +104,12 @@ defmodule SymphonyElixir.McpBridge do
         result = Tracker.execute_bound_agent_tool(binding, name, arguments, [])
         rpc_result(conn, request, to_mcp_result(result))
       else
-        rpc_error(conn, request, -32602, "Missing tool name")
+        rpc_error(conn, request, -32_602, "Missing tool name")
       end
     end
 
     defp dispatch(conn, _method, request) do
-      rpc_error(conn, request, -32601, "Method not found")
+      rpc_error(conn, request, -32_601, "Method not found")
     end
 
     defp normalise_tool_spec(spec) do

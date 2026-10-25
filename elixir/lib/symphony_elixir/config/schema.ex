@@ -495,10 +495,15 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    runtime =
-      %{settings.runtime | command: runtime_command(settings), mcp: normalize_optional_map(settings.runtime.mcp) || %{}}
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, runtime: finalize_runtime(settings)}
+  end
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex, runtime: runtime}
+  defp finalize_runtime(settings) do
+    %{
+      settings.runtime
+      | command: runtime_command(settings),
+        mcp: normalize_optional_map(settings.runtime.mcp) || %{}
+    }
   end
 
   defp runtime_command(settings) do
