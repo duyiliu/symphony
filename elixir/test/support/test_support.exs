@@ -114,6 +114,11 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          runtime_kind: "codex",
+          runtime_command: nil,
+          runtime_turn_timeout_ms: 3_600_000,
+          runtime_stall_timeout_ms: 300_000,
+          runtime_mcp: %{},
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -152,6 +157,11 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    runtime_kind = Keyword.get(config, :runtime_kind)
+    runtime_command = Keyword.get(config, :runtime_command)
+    runtime_turn_timeout_ms = Keyword.get(config, :runtime_turn_timeout_ms)
+    runtime_stall_timeout_ms = Keyword.get(config, :runtime_stall_timeout_ms)
+    runtime_mcp = Keyword.get(config, :runtime_mcp)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -186,6 +196,12 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        "runtime:",
+        "  kind: #{yaml_value(runtime_kind)}",
+        "  command: #{yaml_value(runtime_command)}",
+        "  turn_timeout_ms: #{yaml_value(runtime_turn_timeout_ms)}",
+        "  stall_timeout_ms: #{yaml_value(runtime_stall_timeout_ms)}",
+        "  mcp: #{yaml_value(runtime_mcp)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",

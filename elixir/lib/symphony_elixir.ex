@@ -40,7 +40,8 @@ defmodule SymphonyElixir.Application do
       SymphonyElixir.WorkflowStore,
       SymphonyElixir.AgentRuntimeSupervisor,
       SymphonyElixir.HttpServer,
-      SymphonyElixir.StatusDashboard
+      SymphonyElixir.StatusDashboard,
+      SymphonyElixir.McpBridge
     ]
 
     Supervisor.start_link(

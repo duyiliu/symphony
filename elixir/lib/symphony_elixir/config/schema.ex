@@ -171,6 +171,39 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Runtime do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @kinds ~w(codex pi)
+
+    @primary_key false
+    embedded_schema do
+      field(:kind, :string, default: "codex")
+      field(:command, :string)
+      field(:model, :string)
+      field(:thinking, :string)
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:mcp, :map, default: %{})
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [:kind, :command, :model, :thinking, :turn_timeout_ms, :stall_timeout_ms, :mcp],
+        empty_values: []
+      )
+      |> update_change(:kind, &(&1 |> String.trim() |> String.downcase()))
+      |> validate_inclusion(:kind, @kinds)
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+  end
+
   defmodule Codex do
     @moduledoc false
     use Ecto.Schema
@@ -295,6 +328,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:runtime, Runtime, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
@@ -389,6 +423,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
+    |> cast_embed(:runtime, with: &Runtime.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
@@ -460,7 +495,20 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    runtime =
+      %{settings.runtime | command: runtime_command(settings), mcp: normalize_optional_map(settings.runtime.mcp) || %{}}
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, runtime: runtime}
+  end
+
+  defp runtime_command(settings) do
+    case settings.runtime.command do
+      command when is_binary(command) and command != "" ->
+        command
+
+      _ ->
+        if settings.runtime.kind == "codex", do: settings.codex.command, else: nil
+    end
   end
 
   defp normalize_keys(value) when is_map(value) do

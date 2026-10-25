@@ -1,0 +1,14 @@
+FROM symphony:1.19
+
+# pi coding agent (same version as the host install)
+RUN npm install -g @earendil-works/pi-coding-agent@1.3.0 \
+ && pi --version
+
+# ssh client + git already installed by the base image; keep bash for rpc mode
+RUN command -v bash && command -v git && command -v ssh
+
+ENV HOME=/root
+WORKDIR /app
+
+ENTRYPOINT ["/bin/bash", "-lc"]
+CMD ["exec ./bin/symphony /config/WORKFLOW.md --logs-root /logs --port 8317 --i-understand-that-this-will-be-running-without-the-usual-guardrails"]

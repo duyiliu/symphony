@@ -1,0 +1,21 @@
+[Unit]
+Description=Symphony agent orchestrator (pi runtime)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/symphony-src/elixir
+EnvironmentFile=/root/symphony/env
+Environment=HOME=/root
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+Environment=PATH=/usr/local/erlang28/bin:/usr/local/elixir19/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/erlang28/bin/escript /opt/symphony-src/elixir/bin/symphony /root/symphony/config/WORKFLOW.md --logs-root /root/symphony/logs --port 8320 --i-understand-that-this-will-be-running-without-the-usual-guardrails
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
