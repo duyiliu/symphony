@@ -1,0 +1,14 @@
+[Unit]
+Description=Symphony run archive + issue board
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/root/symphony/board.env
+Type=simple
+ExecStart=/usr/bin/python3 /root/symphony/bin/session-serve --port 8322 --bind 192.168.1.199
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
