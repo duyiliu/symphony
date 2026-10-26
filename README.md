@@ -28,11 +28,19 @@ Tell your favorite coding agent to build Symphony in a programming language of y
 ### Option 2. Use our experimental reference implementation
 
 Check out [elixir/README.md](elixir/README.md) for instructions on how to set up your environment
-and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
+and run the Elixir-based Symphony implementation. For GitHub's opt-in two-label development and
+host-enforced merge workflow, see [the GitHub workflow guide](elixir/docs/github-workflow.md).
+You can also ask your favorite coding agent to
 help with the setup:
 
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
+
+### Chinese GitHub issue board
+
+The repository also includes a [Chinese issue board](board/README.md) with swimlanes, Pi run history,
+live logs, and read-only status aggregation. Its Python source lives in `board/`; it runs as a separate
+service alongside the Elixir orchestrator. See the board README for configuration and deployment.
 
 ---
 

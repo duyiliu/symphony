@@ -1,0 +1,27 @@
+name: Chinese issue board
+
+on:
+  push:
+    paths:
+      - 'board/**'
+      - 'deploy/symphony-runs.service'
+      - '.github/workflows/board-tests.yml'
+  pull_request:
+    paths:
+      - 'board/**'
+      - 'deploy/symphony-runs.service'
+      - '.github/workflows/board-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s board/tests -v
+      - run: python3 -m py_compile board/server.py board/session.py

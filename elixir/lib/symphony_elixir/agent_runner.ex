@@ -5,6 +5,8 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.GitHub.Workflow, as: GitHubWorkflow
+  alias SymphonyElixir.GitHub.WorkflowPolicy, as: GitHubWorkflowPolicy
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -24,11 +26,22 @@ defmodule SymphonyElixir.AgentRunner do
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    tracker = Config.settings!().tracker
+
+    result =
+      case GitHubWorkflow.begin_run(issue, tracker, Keyword.take(opts, [:github_client])) do
+        :ok -> run_on_worker_host(issue, codex_update_recipient, opts, worker_host)
+        :skip -> :ok
+        :waiting -> exit({:shutdown, :github_workflow_waiting})
+        {:error, _reason} = error -> error
+      end
+
+    case result do
       :ok ->
         :ok
 
       {:error, reason} ->
+        GitHubWorkflow.record_failure(issue, tracker, reason)
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
     end
@@ -183,7 +196,8 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
+        if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) and
+             GitHubWorkflowPolicy.same_phase?(issue, refreshed_issue, Config.settings!().tracker) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}
@@ -209,7 +223,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp active_issue_state?(_state_name), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    GitHubWorkflow.routable?(issue, Config.settings!().tracker)
   end
 
   defp selected_worker_host(nil, []), do: nil

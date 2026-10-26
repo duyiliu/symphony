@@ -260,7 +260,15 @@ codex:
 - Tool and auth: `github_api` accepts a relative REST `path` plus optional `params` and JSON
   `body`; Symphony executes it host-side with the session-bound token, removes configured tracker
   credentials and provider authentication aliases from the Codex child, and leaves raw tool access
-  limited by that token's GitHub permissions.
+  limited by that token's GitHub permissions when the optional workflow below is disabled.
+- Optional two-label workflow: [`WORKFLOW.github.md`](WORKFLOW.github.md) adds `agent` development
+  and `merge-approved` authorization, host-private JSON delivery receipts, bounded worker attempts,
+  and a guarded `github_workflow` tool. In this mode the raw REST tool is restricted;
+  agents cannot change execution labels, close issues, or call merge directly. It is disabled by
+  default and requires real credential/agent isolation plus a separate automation identity.
+  See [the configuration, security and migration guide](docs/github-workflow.md) before enabling it.
+  There is no background recovery service; interrupted finalization may require host-side recovery.
+  Existing Linear workflows and `required_labels` AND semantics are unchanged.
 
 ### Jira Cloud adapter
 

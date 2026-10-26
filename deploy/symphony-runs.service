@@ -1,0 +1,15 @@
+[Unit]
+Description=Symphony run archive + Chinese issue board
+After=network-online.target symphony.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/symphony-src
+EnvironmentFile=-/root/symphony/board.env
+ExecStart=/usr/bin/python3 /opt/symphony-src/board/server.py --port 8322 --bind 192.168.1.199
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

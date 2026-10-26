@@ -5,7 +5,7 @@ defmodule SymphonyElixir.GitHub.Adapter do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.GitHub.{AgentTool, Client}
+  alias SymphonyElixir.GitHub.{AgentTool, Client, WorkflowPolicy}
   alias SymphonyElixir.Tracker.Issue
 
   @active_states ["open"]
@@ -25,7 +25,9 @@ defmodule SymphonyElixir.GitHub.Adapter do
              @terminal_states,
              :missing_github_terminal_states
            ) do
-      Client.validate_settings(tracker_settings)
+      with :ok <- Client.validate_settings(tracker_settings) do
+        WorkflowPolicy.validate(tracker_settings)
+      end
     end
   end
 

@@ -3,7 +3,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   Provider-native GitHub REST tool exposed to Codex app-server turns.
   """
 
-  alias SymphonyElixir.GitHub.Client
+  alias SymphonyElixir.GitHub.{Client, Workflow, WorkflowPolicy}
 
   @github_api_tool "github_api"
   @allowed_methods ["GET", "POST", "PATCH", "PUT", "DELETE"]
@@ -39,6 +39,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   def execute(tool, arguments, opts) do
     case tool do
       @github_api_tool -> execute_github_api(arguments, opts)
+      "github_workflow" -> execute_workflow(arguments, opts)
       other -> unsupported_tool_response(other)
     end
   end
@@ -51,7 +52,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
         "description" => @github_api_description,
         "inputSchema" => @github_api_input_schema
       }
-    ]
+    ] ++ workflow_tool_specs()
   end
 
   defp execute_github_api(arguments, opts) do
@@ -59,6 +60,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
     client_opts = Keyword.take(opts, [:tracker_settings])
 
     with {:ok, method, path, params, body} <- normalize_arguments(arguments),
+         :ok <- WorkflowPolicy.allow_request(tracker_settings(opts), method, path, body),
          {:ok, %{status: status, body: response_body}} <-
            github_client.(method, path, params, body, client_opts),
          true <- is_integer(status) do
@@ -68,6 +70,45 @@ defmodule SymphonyElixir.GitHub.AgentTool do
       _ -> failure_response(tool_error_payload(:github_unknown_payload))
     end
   end
+
+  defp tracker_settings(opts) do
+    Keyword.get_lazy(opts, :tracker_settings, fn -> SymphonyElixir.Config.settings!().tracker end)
+  end
+
+  defp workflow_tool_specs do
+    if WorkflowPolicy.enabled?(SymphonyElixir.Config.settings!().tracker) do
+      [
+        %{
+          "name" => "github_workflow",
+          "description" =>
+            "Host-enforced GitHub workflow. Register delivery before handoff; merge only a label-authorized delivery. Issue is its numeric GitHub number. Never manipulate execution labels through github_api.",
+          "inputSchema" => %{
+            "type" => "object",
+            "additionalProperties" => false,
+            "required" => ["action", "issue"],
+            "properties" => %{
+              "action" => %{"type" => "string", "enum" => ["status", "deliver", "merge", "pause"]},
+              "issue" => %{"type" => "string"},
+              "pr" => %{"type" => "integer"},
+              "tests" => %{"type" => "string"},
+              "reason" => %{"type" => "string"}
+            }
+          }
+        }
+      ]
+    else
+      []
+    end
+  end
+
+  defp execute_workflow(arguments, opts) when is_map(arguments) do
+    case Workflow.execute(tracker_settings(opts), arguments, opts) do
+      {:ok, result} -> dynamic_tool_response(true, encode_payload(result))
+      {:error, reason} -> failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp execute_workflow(_arguments, _opts), do: failure_response(tool_error_payload(:invalid_arguments))
 
   defp normalize_arguments(arguments) when is_map(arguments) do
     with {:ok, method} <- normalize_method(Map.get(arguments, "method")),

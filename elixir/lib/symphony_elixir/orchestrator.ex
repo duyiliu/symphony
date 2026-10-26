@@ -8,6 +8,8 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.GitHub.Workflow, as: GitHubWorkflow
+  alias SymphonyElixir.GitHub.WorkflowPolicy, as: GitHubWorkflowPolicy
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -203,6 +205,11 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  defp handle_agent_down({:shutdown, :github_workflow_waiting}, state, issue_id, running_entry, _session_id) do
+    state = block_issue_from_entry(state, issue_id, running_entry, "GitHub workflow paused; waiting for a new label event")
+    put_in(state.blocked[issue_id][:github_workflow_waiting], true)
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
@@ -430,6 +437,10 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false)
 
+      github_phase_changed?(state, issue) ->
+        Logger.info("GitHub execution phase changed: #{issue_context(issue)}; restarting with a new workflow run")
+        terminate_running_issue(state, issue.id, false)
+
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
@@ -441,6 +452,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp github_phase_changed?(state, issue) do
+    case Map.get(state.running, issue.id) do
+      %{issue: previous} ->
+        not GitHubWorkflowPolicy.same_phase?(previous, issue, Config.settings!().tracker)
+
+      _ ->
+        false
+    end
+  end
 
   defp reconcile_blocked_issue_states([], state, _active_states, _terminal_states), do: state
 
@@ -464,6 +485,9 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
         release_issue_claim(state, issue.id)
 
+      github_workflow_reactivated?(state, issue) ->
+        release_issue_claim(state, issue.id)
+
       active_issue_state?(issue.state, active_states) ->
         refresh_blocked_issue_state(state, issue)
 
@@ -474,6 +498,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp github_workflow_reactivated?(state, issue) do
+    Map.get(state.blocked[issue.id] || %{}, :github_workflow_waiting, false) and
+      not GitHubWorkflow.waiting?(issue, Config.settings!().tracker)
+  end
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -870,7 +899,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    GitHubWorkflow.routable?(issue, Config.settings!().tracker)
   end
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
