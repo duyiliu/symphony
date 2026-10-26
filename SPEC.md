@@ -489,6 +489,11 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+- `live_log_dir` (string, optional)
+  - When set for the `pi` runtime, the orchestrator mirrors the raw RPC stdout
+    stream into `<dir>/<timestamp>_<session_id>.live.jsonl` with a synthetic
+    `session` header line, so external monitors can follow the run in real
+    time without waiting on the agent's own session-file flush.
 
 ### 5.4 Prompt Template Contract
 

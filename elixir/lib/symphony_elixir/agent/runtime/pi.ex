@@ -33,8 +33,9 @@ defmodule SymphonyElixir.Agent.Runtime.Pi do
       true ->
         with :ok <- sanitise_pi_dir(workspace),
              :ok <- write_mcp_config(workspace),
-             :ok <- exclude_pi_dir(workspace) do
-          open_port(workspace, config)
+             :ok <- exclude_pi_dir(workspace),
+             {:ok, session} <- open_port(workspace, config) do
+          {:ok, open_live_log(session, workspace, config)}
         end
     end
   end
@@ -120,9 +121,10 @@ defmodule SymphonyElixir.Agent.Runtime.Pi do
       System.find_executable("bash") ||
         raise RuntimeError, "pi runtime requires bash on PATH"
 
-    script = build_script(config, Config.settings!().tracker.secret_environment_names)
+    session_id = new_session_id()
+    script = build_script(config, Config.settings!().tracker.secret_environment_names, session_id)
 
-    Logger.info("Starting pi runtime workspace=#{workspace} command=#{config.command}")
+    Logger.info("Starting pi runtime workspace=#{workspace} session=#{session_id} command=#{config.command}")
 
     port =
       Port.open({:spawn_executable, bash}, [
@@ -139,25 +141,48 @@ defmodule SymphonyElixir.Agent.Runtime.Pi do
        config: config,
        buffer: "",
        usage: empty_usage(),
-       session_id: "pi-#{Path.basename(workspace)}"
+       session_id: session_id
      }}
   rescue
     error -> {:error, {:pi_start_failed, Exception.message(error)}}
   end
 
-  defp build_script(config, secret_names) do
+  defp new_session_id do
+    <<a::32, b::16, c0::16, d0::16, e::48>> = :crypto.strong_rand_bytes(16)
+    c = Bitwise.bor(Bitwise.band(c0, 0x0FFF), 0x4000)
+    d = Bitwise.bor(Bitwise.band(d0, 0x3FFF), 0x8000)
+
+    [
+      Base.encode16(<<a::32>>, case: :lower),
+      Base.encode16(<<b::16>>, case: :lower),
+      Base.encode16(<<c::16>>, case: :lower),
+      Base.encode16(<<d::16>>, case: :lower),
+      Base.encode16(<<e::48>>, case: :lower)
+    ]
+    |> Enum.join("-")
+  end
+
+  defp build_script(config, secret_names, session_id) do
     unsets =
       secret_names
       |> Enum.map_join(" ", &"unset #{&1};")
 
     command =
-      [config.command, model_flag(config), thinking_flag(config)]
+      [config.command, session_id_flag(config, session_id), model_flag(config), thinking_flag(config)]
       |> Enum.reject(&(&1 in [nil, ""]))
       |> Enum.join(" ")
 
     [unsets, "exec", command]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join(" ")
+  end
+
+  defp session_id_flag(%{command: command}, session_id) do
+    if is_binary(command) and Regex.match?(~r/--session[\s=]|--session-id[\s=]/, command) do
+      nil
+    else
+      "--session-id #{shell_quote(session_id)}"
+    end
   end
 
   defp model_flag(%{model: model}) when is_binary(model) and model != "", do: "--model #{shell_quote(model)}"
@@ -344,9 +369,65 @@ defmodule SymphonyElixir.Agent.Runtime.Pi do
     end
   end
 
+  defp open_live_log(session, workspace, config) do
+    case live_log_dir(config) do
+      nil ->
+        session
+
+      dir ->
+        path =
+          Path.join(dir, "#{live_timestamp()}_#{sanitize_name(session.session_id)}.live.jsonl")
+
+        with :ok <- File.mkdir_p(dir),
+             :ok <- File.write(path, live_header(session.session_id, workspace)) do
+          Logger.info("Mirroring pi rpc stream workspace=#{workspace} live_log=#{path}")
+          Map.put(session, :live_path, path)
+        else
+          reason ->
+            Logger.warning("Live session mirror disabled workspace=#{workspace} reason=#{inspect(reason)}")
+
+            session
+        end
+    end
+  end
+
+  defp live_log_dir(%{live_log_dir: dir}) when is_binary(dir) and dir != "", do: dir
+  defp live_log_dir(_config), do: nil
+
+  defp live_timestamp do
+    DateTime.utc_now()
+    |> DateTime.truncate(:millisecond)
+    |> DateTime.to_iso8601()
+    |> String.replace(":", "-")
+  end
+
+  defp sanitize_name(name) when is_binary(name), do: String.replace(name, ~r/[^A-Za-z0-9._-]/, "_")
+  defp sanitize_name(_name), do: "session"
+
+  defp live_header(session_id, workspace) do
+    Jason.encode!(%{
+      "type" => "session",
+      "version" => 3,
+      "id" => session_id,
+      "timestamp" => DateTime.utc_now() |> DateTime.truncate(:millisecond) |> DateTime.to_iso8601(),
+      "cwd" => workspace
+    }) <> "\n"
+  end
+
+  defp mirror_lines(nil, _lines), do: :ok
+  defp mirror_lines(_path, []), do: :ok
+
+  defp mirror_lines(path, lines) do
+    File.write(path, Enum.map_join(lines, "", &(&1 <> "\n")), [:append])
+    :ok
+  rescue
+    _ -> :ok
+  end
+
   defp decode(state, data) do
     parts = String.split(state.buffer <> data, "\n")
     {complete, [rest]} = Enum.split(parts, -1)
+    mirror_lines(Map.get(state, :live_path), complete)
 
     records =
       complete
