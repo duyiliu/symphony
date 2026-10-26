@@ -187,6 +187,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
       field(:mcp, :map, default: %{})
+      field(:live_log_dir, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -194,7 +195,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :command, :model, :thinking, :turn_timeout_ms, :stall_timeout_ms, :mcp],
+        [:kind, :command, :model, :thinking, :turn_timeout_ms, :stall_timeout_ms, :mcp, :live_log_dir],
         empty_values: []
       )
       |> update_change(:kind, &(&1 |> String.trim() |> String.downcase()))
