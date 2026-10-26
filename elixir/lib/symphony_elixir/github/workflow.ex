@@ -250,11 +250,9 @@ defmodule SymphonyElixir.GitHub.Workflow do
     ensure(d["published"] == true, :delivery_not_published)
     ensure(event["id"] not in d["previous_approvals"], :authorization_predates_delivery)
     actor = event["actor"] || %{}
-    identity = WorkflowAPI.request(settings, "GET", "/user", nil, opts)
-    ensure(identity["login"] == WorkflowPolicy.config(settings)["automation_login"], :automation_identity_mismatch)
-    ensure(actor["type"] == "User" and is_integer(actor["id"]) and actor["id"] != identity["id"], :automation_cannot_authorize)
-    repo = WorkflowAPI.request(settings, "GET", WorkflowAPI.root(settings), nil, opts)
-    ensure(get_in(repo, ["permissions", "admin"]) == false, :automation_must_not_be_admin)
+    # In this trusted deployment, repository label-write permissions define
+    # approvers. Shared machine-user credentials cannot prove human identity.
+    ensure(actor["type"] == "User" and is_integer(actor["id"]), :invalid_label_actor)
     ensure(linked_pr!(settings, number, opts) == d["pr"], :pr_association_changed)
     pr = WorkflowAPI.pr(settings, d["pr"], opts)
     validate_pr!(settings, pr)
@@ -262,9 +260,6 @@ defmodule SymphonyElixir.GitHub.Workflow do
   end
 
   defp ready?(settings, d, opts) do
-    base = URI.encode(d["base"], &URI.char_unreserved?/1)
-    branch = WorkflowAPI.request(settings, "GET", "#{WorkflowAPI.root(settings)}/branches/#{base}", nil, opts)
-    ensure(branch["protected"] == true, :unprotected_target_branch)
     runs = WorkflowAPI.pages(settings, "#{WorkflowAPI.root(settings)}/commits/#{d["sha"]}/check-runs", "check_runs", opts)
     statuses = WorkflowAPI.pages(settings, "#{WorkflowAPI.root(settings)}/commits/#{d["sha"]}/statuses", nil, opts)
     checks_pass = Enum.all?(WorkflowPolicy.config(settings)["required_checks"], &check_passes?(&1, runs, statuses, d["sha"]))
@@ -311,13 +306,10 @@ defmodule SymphonyElixir.GitHub.Workflow do
            :missing_delivery,
            :delivery_not_published,
            :authorization_predates_delivery,
-           :automation_cannot_authorize,
-           :automation_identity_mismatch,
-           :automation_must_not_be_admin,
+           :invalid_label_actor,
            :pr_association_changed,
            :delivery_changed,
-           :unexpected_base_branch,
-           :unprotected_target_branch
+           :unexpected_base_branch
          ] do
         pause(settings, number, record, save, inspect(reason), opts)
       end

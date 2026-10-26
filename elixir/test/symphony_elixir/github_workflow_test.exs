@@ -16,10 +16,8 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
       provider: %{"repo" => "owner/repo", "token" => "test"},
       github_workflow: %{
         "enabled" => true,
-        "isolated_agent" => true,
         "state_dir" => dir,
         "base_branch" => "main",
-        "automation_login" => "automation",
         "required_checks" => ["test"],
         "max_attempts" => 2
       }
@@ -54,10 +52,10 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert Workflow.routable?(issue([]), %{settings | kind: "linear", required_labels: []})
   end
 
-  test "configuration fails closed without isolation, identity, private storage or checks", %{settings: settings} do
+  test "configuration validates storage, base, budgets and required checks", %{settings: settings} do
     assert :ok = WorkflowPolicy.validate(settings)
 
-    for {key, value} <- [{"isolated_agent", false}, {"state_dir", "/"}, {"base_branch", ""}, {"automation_login", ""}, {"required_checks", []}, {"max_attempts", 0}] do
+    for {key, value} <- [{"state_dir", "/"}, {"base_branch", ""}, {"required_checks", []}, {"max_attempts", 0}] do
       assert {:error, _} = WorkflowPolicy.validate(put_in(settings.github_workflow[key], value))
     end
 
@@ -115,7 +113,7 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert {"PUT", "/repos/owner/repo/pulls/2/merge", %{"sha" => @sha, "merge_method" => "squash"}} in Agent.get(ctx.remote, & &1.calls)
   end
 
-  test "missing delivery and automation-added labels are rejected", ctx do
+  test "missing delivery and invalid label actors are rejected", ctx do
     human_label(ctx.remote, "merge-approved")
     assert {:error, :missing_delivery} = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
     assert_no_merge(ctx)
@@ -123,7 +121,8 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert :ok = Workflow.begin_run(issue(), ctx.settings, ctx.opts)
     assert {:ok, _} = deliver(ctx)
     human_label(ctx.remote, "merge-approved", "automation")
-    assert {:error, :automation_cannot_authorize} = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
+    Agent.update(ctx.remote, &update_in(&1.events, fn events -> List.update_at(events, -1, fn e -> put_in(e, ["actor", "type"], "Bot") end) end))
+    assert {:error, :invalid_label_actor} = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
     assert_no_merge(ctx)
   end
 
@@ -151,7 +150,7 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert Agent.get(ctx.remote, & &1.issue_state) == "open"
   end
 
-  test "GitHub review gates, unknown mergeability and unprotected base block merge", ctx do
+  test "GitHub review gates and unknown mergeability block merge", ctx do
     prepare_merge(ctx)
     assert :ok = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
 
@@ -164,8 +163,6 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
       assert {:ok, %{"status" => "waiting_for_checks"}} = call(ctx.settings, "merge", ctx.opts)
     end
 
-    Agent.update(ctx.remote, &%{&1 | protected: false})
-    assert {:error, :unprotected_target_branch} = call(ctx.settings, "merge", ctx.opts)
     assert_no_merge(ctx)
   end
 
@@ -194,14 +191,13 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert_no_merge(ctx)
   end
 
-  test "automation identity and administrator accounts cannot authorize merge", ctx do
+  test "trusted deployment accepts the shared administrator identity without extra protection requirements", ctx do
     prepare_merge(ctx)
-    wrong_identity = put_in(ctx.settings, [:github_workflow, "automation_login"], "different-bot")
-    assert {:error, :automation_identity_mismatch} = Workflow.begin_run(issue(["merge-approved"]), wrong_identity, ctx.opts)
-    human_label(ctx.remote, "merge-approved")
-    Agent.update(ctx.remote, &Map.put(&1, :admin, true))
-    assert {:error, :automation_must_not_be_admin} = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
-    assert_no_merge(ctx)
+    human_label(ctx.remote, "merge-approved", "automation")
+    Agent.update(ctx.remote, &(&1 |> Map.put(:admin, true) |> Map.put(:protected, false)))
+    assert :ok = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
+    assert {:ok, %{"status" => "merged"}} = call(ctx.settings, "merge", ctx.opts)
+    assert Agent.get(ctx.remote, & &1.issue_state) == "closed"
   end
 
   test "a label already present at delivery cannot approve that delivery", ctx do

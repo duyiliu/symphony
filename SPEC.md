@@ -2327,7 +2327,8 @@ Linear workflow or the all-required-labels routing contract.
 - The host MUST freeze and durably store the delivered PR, head SHA and base branch before handoff.
   A new human label event may authorize only that delivery. Old comments are not authorization.
 - Agent tools MUST NOT create authorization labels, directly merge, close unmerged work, or bypass
-  host policy. Deployment MUST isolate agents from host credentials and the durable ledger.
+  host policy. This extension assumes a trusted deployment; shared credentials and unrestricted
+  shells are outside its tool-enforced boundary, and human identity cannot be proven separately.
 - A changed delivery invalidates authorization. Repairs producing commits require a fresh delivery
   and human label authorization; merge MUST use an expected head SHA and obey GitHub protection.
 - Worker-start budgets and merge intent MUST survive restart. Confirmed merges MUST be verified

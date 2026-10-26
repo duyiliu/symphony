@@ -10,7 +10,6 @@ defmodule SymphonyElixir.GitHub.WorkflowIntegrationTest do
     sample =
       Path.expand("../../WORKFLOW.github.md", __DIR__)
       |> File.read!()
-      |> String.replace("isolated_agent: false", "isolated_agent: true")
       |> String.replace("$SYMPHONY_GITHUB_TOKEN", "offline-test-token")
       |> String.replace("/var/lib/symphony-github/receipts", state_dir)
 

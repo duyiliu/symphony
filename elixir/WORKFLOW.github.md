@@ -9,11 +9,8 @@ tracker:
   terminal_states: [closed]
   github_workflow:
     enabled: true
-    # Fail closed until the deployment actually isolates agents from host tokens,
-    # this workflow, the ledger, and alternative unrestricted GitHub credentials.
-    # This flag is an operator assertion, NOT a sandbox implementation.
-    isolated_agent: false
-    automation_login: "YOUR-DEDICATED-AUTOMATION-LOGIN"
+    # For a trusted deployment. Repository label-write permissions define
+    # approvers; this does not isolate agents from host credentials.
     state_dir: "/var/lib/symphony-github/receipts"
     base_branch: "main"
     required_checks: ["test"]

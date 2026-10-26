@@ -26,10 +26,8 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
 
   defp validate_enabled(cfg, required_labels) do
     rules = [
-      {cfg["isolated_agent"] == true, :github_workflow_requires_isolated_agent},
       {absolute_private_path?(cfg["state_dir"]), :invalid_github_workflow_state_dir},
       {present?(cfg["base_branch"]), :missing_github_workflow_base_branch},
-      {present?(cfg["automation_login"]), :missing_github_workflow_automation_login},
       {positive?(Map.get(cfg, "max_attempts", 3)), :invalid_github_workflow_max_attempts},
       {checks?(cfg["required_checks"]), :missing_github_workflow_required_checks},
       {not Enum.any?(required_labels, &(&1 in ["agent", "merge-approved"])), :execution_labels_must_not_be_required_labels}

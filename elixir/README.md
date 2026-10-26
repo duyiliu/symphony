@@ -265,7 +265,8 @@ codex:
   and `merge-approved` authorization, host-private JSON delivery receipts, bounded worker attempts,
   and a guarded `github_workflow` tool. In this mode the raw REST tool is restricted;
   agents cannot change execution labels, close issues, or call merge directly. It is disabled by
-  default and requires real credential/agent isolation plus a separate automation identity.
+  default and assumes a trusted deployment using repository label-write permissions.
+  Shared credentials and agent shells are not isolated by this feature.
   See [the configuration, security and migration guide](docs/github-workflow.md) before enabling it.
   There is no background recovery service; interrupted finalization may require host-side recovery.
   Existing Linear workflows and `required_labels` AND semantics are unchanged.
