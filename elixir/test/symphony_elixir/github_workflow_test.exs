@@ -18,7 +18,6 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
         "enabled" => true,
         "state_dir" => dir,
         "base_branch" => "main",
-        "required_checks" => ["test"],
         "max_attempts" => 2
       }
     }
@@ -57,10 +56,10 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert Workflow.routable?(issue([]), %{settings | kind: "linear", required_labels: []})
   end
 
-  test "configuration validates storage, base, budgets, checks and risk rules", %{settings: settings} do
+  test "configuration validates storage, base, budgets and risk rules", %{settings: settings} do
     assert :ok = WorkflowPolicy.validate(settings)
 
-    for {key, value} <- [{"state_dir", "/"}, {"base_branch", ""}, {"required_checks", []}, {"max_attempts", 0}] do
+    for {key, value} <- [{"state_dir", "/"}, {"base_branch", ""}, {"max_attempts", 0}] do
       assert {:error, _} = WorkflowPolicy.validate(put_in(settings.github_workflow[key], value))
     end
 
@@ -146,15 +145,12 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert :ok = Workflow.begin_run(issue(), ctx.settings, ctx.opts)
     assert {:ok, _} = deliver(ctx)
 
-    Agent.update(ctx.remote, &%{&1 | checks: []})
-    assert {:ok, %{"status" => "waiting_checks", "pending" => ["test"]}} = call(ctx.settings, "merge", ctx.opts)
-
     Agent.update(ctx.remote, &%{&1 | checks: [%{"id" => 2, "name" => "test", "head_sha" => @sha, "status" => "in_progress", "conclusion" => nil}]})
     assert {:ok, %{"status" => "waiting_checks", "pending" => ["test"]}} = call(ctx.settings, "merge", ctx.opts)
 
     Agent.update(ctx.remote, &%{&1 | checks: [%{"id" => 3, "name" => "test", "head_sha" => @sha, "status" => "completed", "conclusion" => "failure"}]})
     assert {:ok, %{"status" => "needs_repair", "reason" => reason}} = call(ctx.settings, "merge", ctx.opts)
-    assert reason =~ "required checks failing"
+    assert reason =~ "checks failing"
     assert_no_merge(ctx)
 
     # Repair: new head on the same PR, fresh delivery, checks green again.
@@ -165,6 +161,28 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
 
     assert {:ok, %{"status" => "merged"}} = call(ctx.settings, "merge", ctx.opts)
     assert Agent.get(ctx.remote, & &1.issue_state) == "closed"
+  end
+
+  test "no reported checks does not bypass the GitHub merge gate", ctx do
+    assert :ok = Workflow.begin_run(issue(), ctx.settings, ctx.opts)
+    assert {:ok, _} = deliver(ctx)
+    Agent.update(ctx.remote, &%{&1 | checks: [], gate: %{"mergeStateStatus" => "BLOCKED", "reviewDecision" => nil}})
+    assert {:ok, %{"status" => "needs_repair"}} = call(ctx.settings, "merge", ctx.opts)
+    assert_no_merge(ctx)
+    Agent.update(ctx.remote, &%{&1 | gate: %{"mergeStateStatus" => "CLEAN", "reviewDecision" => nil}})
+    assert {:ok, %{"status" => "merged"}} = call(ctx.settings, "merge", ctx.opts)
+  end
+
+  test "checks discovered from GitHub must all pass", ctx do
+    assert :ok = Workflow.begin_run(issue(), ctx.settings, ctx.opts)
+    assert {:ok, _} = deliver(ctx)
+    Agent.update(ctx.remote, &Map.put(&1, :statuses, [%{"context" => "external-ci", "state" => "pending"}]))
+    assert {:ok, %{"status" => "waiting_checks", "pending" => ["external-ci"]}} = call(ctx.settings, "merge", ctx.opts)
+    Agent.update(ctx.remote, &Map.put(&1, :statuses, [%{"context" => "external-ci", "state" => "failure"}]))
+    assert {:ok, %{"status" => "needs_repair"}} = call(ctx.settings, "merge", ctx.opts)
+    assert_no_merge(ctx)
+    Agent.update(ctx.remote, &Map.put(&1, :statuses, [%{"context" => "external-ci", "state" => "success"}]))
+    assert {:ok, %{"status" => "merged"}} = call(ctx.settings, "merge", ctx.opts)
   end
 
   test "dirty merge states and requested changes are repaired; unknown waits; reviews are awaited", ctx do
@@ -251,6 +269,15 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     # Human resolves and re-labels; the delivery must be registered again.
     human_label(ctx.remote, "agent")
     assert :ok = Workflow.begin_run(issue(), ctx.settings, ctx.opts)
+
+    assert Enum.any?(Agent.get(ctx.remote, & &1.calls), fn
+             {"POST", "/repos/owner/repo/issues/1/comments", %{"body" => body}} ->
+               body =~ "Manual resume" and body =~ "@human" and body =~ "CI keeps failing" and
+                 body =~ "not merge authorization"
+
+             _ ->
+               false
+           end)
 
     assert {:ok, %{"status" => "delivered"}} =
              Workflow.execute(ctx.settings, %{"action" => "deliver", "issue" => "1", "pr" => 2, "tests" => "fixed"}, ctx.opts)
@@ -578,7 +605,7 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
   defp respond("GET", "/repos/owner/repo/branches/main", _, _, s), do: ok(%{"protected" => s.protected}, s)
 
   defp respond("GET", "/repos/owner/repo/commits/" <> path, _, _, s) do
-    if String.ends_with?(path, "/check-runs"), do: ok(%{"check_runs" => s.checks}, s), else: ok([], s)
+    if String.ends_with?(path, "/check-runs"), do: ok(%{"check_runs" => s.checks}, s), else: ok(Map.get(s, :statuses, []), s)
   end
 
   defp respond("POST", "/graphql", _, body, s) do

@@ -50,7 +50,6 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
       {absolute_private_path?(cfg["state_dir"]), :invalid_github_workflow_state_dir},
       {present?(cfg["base_branch"]), :missing_github_workflow_base_branch},
       {positive?(Map.get(cfg, "max_attempts", 3)), :invalid_github_workflow_max_attempts},
-      {checks?(cfg["required_checks"]), :missing_github_workflow_required_checks},
       {risk_config?(cfg["risk"]), :invalid_github_workflow_risk},
       {not Enum.any?(required_labels, &(&1 in [@agent_label, @pause_label, @high_risk_label, "merge-approved"])), :execution_labels_must_not_be_required_labels}
     ]
@@ -177,7 +176,6 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
   defp keys?(_body, _allowed), do: false
   defp present?(s), do: is_binary(s) and String.trim(s) != ""
   defp positive?(n), do: is_integer(n) and n > 0
-  defp checks?(items), do: is_list(items) and items != [] and Enum.all?(items, &present?/1)
 
   defp risk_config?(nil), do: true
 

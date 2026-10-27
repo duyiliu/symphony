@@ -101,7 +101,14 @@ defmodule SymphonyElixir.GitHub.Workflow do
   defp admit_labeled(issue, number, settings, record, save, opts) do
     {event, _labels} = signal!(settings, number, opts)
     ensure(WorkflowPolicy.phase(issue.labels) == :develop, :execution_phase_changed)
+    resume? = record["blocked"] == true and record["cycle"] != cycle(event)
+    pause_reason = record["error"]
     record = new_cycle(record, cycle(event))
+
+    record =
+      if resume?,
+        do: publish_resume(settings, number, record, save, event, pause_reason, opts),
+        else: record
 
     cond do
       record["blocked"] ->
@@ -203,6 +210,22 @@ defmodule SymphonyElixir.GitHub.Workflow do
     end
   end
 
+  defp publish_resume(settings, number, record, save, event, pause_reason, opts) do
+    actor = get_in(event, ["actor", "login"]) || "unknown"
+
+    WorkflowAPI.comment(
+      settings,
+      number,
+      "Manual resume (人工恢复执行): `needs-human` removed and `agent` re-added by @#{actor}.\n\n" <>
+        "Previous pause reason: #{pause_reason || "human intervention"}\n" <>
+        "Host resumes as a new develop cycle. This is not merge authorization: checks, delivery SHA " <>
+        "and review approvals are re-verified before any merge.",
+      opts
+    )
+
+    save.(Map.put(record, "resumed_event", event["id"]))
+  end
+
   defp merge(settings, number, record, save, opts) do
     cond do
       record["merged"] ->
@@ -272,14 +295,13 @@ defmodule SymphonyElixir.GitHub.Workflow do
   defp auto_ready?(settings, d, pr, issue_labels, opts) do
     runs = WorkflowAPI.pages(settings, "#{WorkflowAPI.root(settings)}/commits/#{d["sha"]}/check-runs", "check_runs", opts)
     statuses = WorkflowAPI.pages(settings, "#{WorkflowAPI.root(settings)}/commits/#{d["sha"]}/statuses", nil, opts)
-    required = WorkflowPolicy.config(settings)["required_checks"] || []
-    {pending, failing} = classify_checks(required, runs, statuses, d["sha"])
+    {pending, failing} = classify_checks(runs, statuses, d["sha"])
     gate = WorkflowAPI.merge_gate(settings, d["pr"], opts)
     ensure(gate["headRefOid"] == d["sha"] and gate["baseRefName"] == d["base"], :delivery_changed)
 
     cond do
       failing != [] ->
-        {:fix, "required checks failing on #{d["sha"]}: #{Enum.join(failing, ", ")}"}
+        {:fix, "checks failing on #{d["sha"]}: #{Enum.join(failing, ", ")}"}
 
       pending != [] ->
         {:await, :checks, pending}
@@ -322,11 +344,12 @@ defmodule SymphonyElixir.GitHub.Workflow do
     end
   end
 
-  defp classify_checks(required, runs, statuses, sha) do
+  defp classify_checks(runs, statuses, sha) do
     statuses = statuses |> Enum.uniq_by(& &1["context"])
+    names = Enum.uniq(Enum.map(runs, & &1["name"]) ++ Enum.map(statuses, & &1["context"]))
 
     {pending, failing} =
-      Enum.reduce(required, {[], []}, fn name, {pending, failing} ->
+      Enum.reduce(names, {[], []}, fn name, {pending, failing} ->
         latest =
           runs
           |> Enum.filter(&(&1["name"] == name))
@@ -336,14 +359,13 @@ defmodule SymphonyElixir.GitHub.Workflow do
         context_statuses = Enum.filter(statuses, &(&1["context"] == name))
 
         cond do
-          latest == [] and context_statuses == [] ->
-            # No report yet: the check may not have started. Waiting, not failing.
-            {[name | pending], failing}
-
           Enum.any?(latest, &(&1["head_sha"] != sha)) ->
             {[name | pending], failing}
 
           Enum.any?(latest, &(&1["status"] != "completed")) ->
+            {[name | pending], failing}
+
+          Enum.any?(context_statuses, &(&1["state"] == "pending")) ->
             {[name | pending], failing}
 
           Enum.all?(latest, &(&1["conclusion"] == "success")) and Enum.all?(context_statuses, &(&1["state"] == "success")) ->

@@ -2316,23 +2316,26 @@ Extension config:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
 
-## Appendix B. Optional GitHub Two-Label Workflow Extension
+## Appendix B. Optional GitHub Workflow Extension
 
 The Elixir implementation provides an opt-in GitHub-specific policy described in
 [`elixir/docs/github-workflow.md`](elixir/docs/github-workflow.md). It does not change the default
 Linear workflow or the all-required-labels routing contract.
 
-- Open issues execute only with exactly one of `agent` (development/rework) or `merge-approved`
-  (human-authorized merge). Both labels are invalid; neither means wait for a human.
+- Open issues execute with `agent`; `needs-human` pauses execution. Both together are invalid.
+  `merge-approved` is a legacy label and does not authorize a merge. Resuming after `needs-human`
+  opens a new cycle; the host MUST comment with the actor and previous pause reason and state that
+  resuming is not merge authorization.
 - The host MUST freeze and durably store the delivered PR, head SHA and base branch before handoff.
-  A new human label event may authorize only that delivery. Old comments are not authorization.
+- Before merging, the host MUST require all reported GitHub checks and statuses on the delivered SHA
+  to pass. GitHub branch protection governs checks not yet reported, including when none exist.
 - Agent tools MUST NOT create authorization labels, directly merge, close unmerged work, or bypass
   host policy. This extension assumes a trusted deployment; shared credentials and unrestricted
   shells are outside its tool-enforced boundary, and human identity cannot be proven separately.
-- A changed delivery invalidates authorization. Repairs producing commits require a fresh delivery
-  and human label authorization; merge MUST use an expected head SHA and obey GitHub protection.
+- Repairs producing commits require a fresh delivery; merge MUST use an expected head SHA and obey
+  GitHub protection. Risky changes require a valid review approval for the delivered SHA.
 - Worker-start budgets and merge intent MUST survive restart. Confirmed merges MUST be verified
   before host-side issue closure. The minimal implementation stores per-issue JSON receipts and
   rechecks interrupted merges on the next call; finalization outside label-based polling requires
   explicit host-side recovery. No background recovery service or workflow database is required.
-- The issue board is read-only and MUST NOT provide an alternative authorization path.
+- Board actions MUST NOT substitute for a required review approval.
