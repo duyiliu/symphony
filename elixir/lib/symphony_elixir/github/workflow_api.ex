@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.GitHub.WorkflowAPI do
   @moduledoc false
 
+  require Logger
   alias SymphonyElixir.GitHub.{Client, WorkflowPolicy}
 
   @spec request(map(), String.t(), String.t(), term(), keyword()) :: term()
@@ -9,10 +10,19 @@ defmodule SymphonyElixir.GitHub.WorkflowAPI do
     params = Keyword.get(opts, :params, %{})
 
     case client.(method, path, params, body, tracker_settings: settings) do
-      {:ok, %{status: status, body: result}} when status in 200..299 -> result
-      {:ok, %{status: 404}} when method == "DELETE" -> %{}
-      {:ok, %{status: status}} -> fail({:github_status, status, method, path})
-      {:error, reason} -> fail({:github_request_failed, reason})
+      {:ok, %{status: status, body: result}} when status in 200..299 ->
+        result
+
+      {:ok, %{status: 404}} when method == "DELETE" ->
+        %{}
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.error("GitHub API error status=#{status} method=#{method} path=#{path} body=#{inspect(body, charlists: :as_lists, printable_limit: 2000)}")
+
+        fail({:github_status, status, method, path})
+
+      {:error, reason} ->
+        fail({:github_request_failed, reason})
     end
   end
 
@@ -74,7 +84,7 @@ defmodule SymphonyElixir.GitHub.WorkflowAPI do
         opts
       )
 
-    ensure(not Map.has_key?(result, "errors"), :github_graphql_error)
+    ensure_graphql_ok(result)
     connection = get_in(result, ["data", "repository", "issue", "closedByPullRequestsReferences"])
     ensure(is_map(connection) and get_in(connection, ["pageInfo", "hasNextPage"]) == false, :ambiguous_pr_association)
     connection["nodes"] || []
@@ -104,7 +114,7 @@ defmodule SymphonyElixir.GitHub.WorkflowAPI do
         opts
       )
 
-    ensure(not Map.has_key?(result, "errors"), :github_graphql_error)
+    ensure_graphql_ok(result)
     gate = get_in(result, ["data", "repository", "pullRequest"])
     ensure(is_map(gate), :missing_merge_gate)
     gate
@@ -125,6 +135,20 @@ defmodule SymphonyElixir.GitHub.WorkflowAPI do
 
   @spec ensure(term(), term()) :: :ok
   def ensure(value, reason), do: if(value, do: :ok, else: fail(reason))
+
+  @doc false
+  @spec ensure_graphql_ok(map()) :: :ok
+  def ensure_graphql_ok(result) do
+    case result do
+      %{"errors" => errors} ->
+        Logger.error("GitHub GraphQL error detail=#{inspect(errors, charlists: :as_lists, limit: 20, printable_limit: 4000)}")
+
+        fail(:github_graphql_error)
+
+      _ ->
+        :ok
+    end
+  end
 
   @spec fail(term()) :: no_return()
   def fail(reason), do: throw({:workflow_error, reason})

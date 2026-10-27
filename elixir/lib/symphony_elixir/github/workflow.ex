@@ -33,17 +33,33 @@ defmodule SymphonyElixir.GitHub.Workflow do
 
   @spec begin_run(Issue.t(), map(), keyword()) :: :ok | :skip | :waiting | {:error, term()}
   def begin_run(issue, settings, opts \\ []) do
-    if WorkflowPolicy.enabled?(settings), do: locked(settings, issue.id, &admit(issue, settings, &1, &2, opts)), else: :ok
+    if WorkflowPolicy.enabled?(settings) do
+      case number(issue.id) do
+        {:ok, number} ->
+          locked(settings, number, &admit(issue, number, settings, &1, &2, opts))
+
+        _ ->
+          {:error, :invalid_github_workflow_issue}
+      end
+    else
+      :ok
+    end
   end
 
   @spec waiting?(Issue.t(), map(), keyword()) :: boolean()
   def waiting?(issue, settings, opts \\ []) do
     if WorkflowPolicy.enabled?(settings) do
       result =
-        locked(settings, issue.id, fn record, _save ->
-          {phase, event} = signal!(settings, issue.id, opts)
-          record["blocked"] == true and record["cycle"] == "#{phase}:#{event["id"]}"
-        end)
+        case number(issue.id) do
+          {:ok, number} ->
+            locked(settings, number, fn record, _save ->
+              {phase, event} = signal!(settings, number, opts)
+              record["blocked"] == true and record["cycle"] == "#{phase}:#{event["id"]}"
+            end)
+
+          _ ->
+            true
+        end
 
       # Failed refreshes must not release a paused task.
       result != false
@@ -65,17 +81,17 @@ defmodule SymphonyElixir.GitHub.Workflow do
 
   def execute(_settings, _args, _opts), do: {:error, :invalid_arguments}
 
-  defp admit(issue, settings, record, save, opts) do
+  defp admit(issue, number, settings, record, save, opts) do
     if record["pending_merge"] do
-      resolve_merge(settings, issue.id, record, save, opts)
+      resolve_merge(settings, number, record, save, opts)
       :skip
     else
-      admit_labeled(issue, settings, record, save, opts)
+      admit_labeled(issue, number, settings, record, save, opts)
     end
   end
 
-  defp admit_labeled(issue, settings, record, save, opts) do
-    {phase, event} = signal!(settings, issue.id, opts)
+  defp admit_labeled(issue, number, settings, record, save, opts) do
+    {phase, event} = signal!(settings, number, opts)
     ensure(phase == WorkflowPolicy.phase(issue.labels), :execution_phase_changed)
     cycle = "#{phase}:#{event["id"]}"
     record = new_cycle(record, cycle, phase)
@@ -85,18 +101,18 @@ defmodule SymphonyElixir.GitHub.Workflow do
         :waiting
 
       record["attempts"] >= Map.get(WorkflowPolicy.config(settings), "max_attempts", 3) ->
-        pause(settings, issue.id, record, save, "Worker attempt limit reached; human intervention required", opts)
+        pause(settings, number, record, save, "Worker attempt limit reached; human intervention required", opts)
         :waiting
 
       get_in(record, ["delivery", "cycle"]) == cycle ->
         record = save.(Map.update!(record, "attempts", &(&1 + 1)))
-        handoff(settings, issue.id, record, save, opts)
+        handoff(settings, number, record, save, opts)
         :skip
 
       true ->
         record = save.(Map.update!(record, "attempts", &(&1 + 1)))
 
-        admit_phase(phase, settings, issue.id, event, record, save, opts)
+        admit_phase(phase, settings, number, event, record, save, opts)
 
         :ok
     end
@@ -230,17 +246,36 @@ defmodule SymphonyElixir.GitHub.Workflow do
     ensure(phase == :merge and record["cycle"] == "merge:#{event["id"]}" and not record["blocked"], :not_a_merge_run)
     authorize!(settings, number, event, record, opts)
 
-    if ready?(settings, record["delivery"], opts) do
-      # Re-read authorization after CI inspection; GitHub also enforces expected
-      # head SHA and branch protection at the actual mutation.
-      {phase, event} = signal!(settings, number, opts)
-      ensure(phase == :merge and record["cycle"] == "merge:#{event["id"]}", :authorization_revoked)
-      authorize!(settings, number, event, record, opts)
-      record = save.(Map.put(record, "pending_merge", true))
-      WorkflowAPI.request(settings, "PUT", "#{WorkflowAPI.root(settings)}/pulls/#{record["delivery"]["pr"]}/merge", %{"sha" => record["delivery"]["sha"], "merge_method" => "squash"}, opts)
-      resolve_merge(settings, number, record, save, opts)
-    else
-      {:ok, %{"status" => "waiting_for_checks"}}
+    case ready?(settings, record["delivery"], opts) do
+      {:ok, :ready} ->
+        # Re-read authorization after CI inspection; GitHub also enforces expected
+        # head SHA and branch protection at the actual mutation.
+        {phase, event} = signal!(settings, number, opts)
+        ensure(phase == :merge and record["cycle"] == "merge:#{event["id"]}", :authorization_revoked)
+        authorize!(settings, number, event, record, opts)
+        record = save.(Map.put(record, "pending_merge", true))
+
+        WorkflowAPI.request(
+          settings,
+          "PUT",
+          "#{WorkflowAPI.root(settings)}/pulls/#{record["delivery"]["pr"]}/merge",
+          %{"sha" => record["delivery"]["sha"], "merge_method" => "squash"},
+          opts
+        )
+
+        resolve_merge(settings, number, record, save, opts)
+
+      {:error, reason} when is_binary(reason) ->
+        pause(
+          settings,
+          number,
+          record,
+          save,
+          "Merge gate not satisfied: #{reason}. Resolve it and re-add merge-approved for the same SHA",
+          opts
+        )
+
+        {:ok, %{"status" => "paused"}}
     end
   end
 
@@ -262,10 +297,24 @@ defmodule SymphonyElixir.GitHub.Workflow do
   defp ready?(settings, d, opts) do
     runs = WorkflowAPI.pages(settings, "#{WorkflowAPI.root(settings)}/commits/#{d["sha"]}/check-runs", "check_runs", opts)
     statuses = WorkflowAPI.pages(settings, "#{WorkflowAPI.root(settings)}/commits/#{d["sha"]}/statuses", nil, opts)
-    checks_pass = Enum.all?(WorkflowPolicy.config(settings)["required_checks"], &check_passes?(&1, runs, statuses, d["sha"]))
+    required = WorkflowPolicy.config(settings)["required_checks"] || []
+    missing = for name <- required, not check_passes?(name, runs, statuses, d["sha"]), do: name
     gate = WorkflowAPI.merge_gate(settings, d["pr"], opts)
     ensure(gate["headRefOid"] == d["sha"] and gate["baseRefName"] == d["base"], :delivery_changed)
-    checks_pass and gate["mergeStateStatus"] == "CLEAN" and gate["reviewDecision"] not in ["REVIEW_REQUIRED", "CHANGES_REQUESTED"]
+
+    cond do
+      missing != [] ->
+        {:error, "required checks missing or failing: #{Enum.join(missing, ", ")}"}
+
+      gate["mergeStateStatus"] != "CLEAN" ->
+        {:error, "merge state #{gate["mergeStateStatus"]}"}
+
+      gate["reviewDecision"] in ["REVIEW_REQUIRED", "CHANGES_REQUESTED"] ->
+        {:error, "review decision #{gate["reviewDecision"]}"}
+
+      true ->
+        {:ok, :ready}
+    end
   end
 
   defp check_passes?(name, runs, statuses, sha) do

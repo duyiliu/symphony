@@ -150,20 +150,27 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert Agent.get(ctx.remote, & &1.issue_state) == "open"
   end
 
-  test "GitHub review gates and unknown mergeability block merge", ctx do
+  test "GitHub review gates and unknown mergeability pause with explicit reasons", ctx do
     prepare_merge(ctx)
     assert :ok = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
 
-    for gate <- [
-          %{"mergeStateStatus" => "UNKNOWN", "reviewDecision" => nil},
-          %{"mergeStateStatus" => "BLOCKED", "reviewDecision" => "REVIEW_REQUIRED"},
-          %{"mergeStateStatus" => "CLEAN", "reviewDecision" => "CHANGES_REQUESTED"}
+    for {gate, reason} <- [
+          {%{"mergeStateStatus" => "UNKNOWN", "reviewDecision" => nil}, "Merge gate not satisfied: merge state UNKNOWN"},
+          {%{"mergeStateStatus" => "BLOCKED", "reviewDecision" => "REVIEW_REQUIRED"}, "Merge gate not satisfied: merge state BLOCKED"},
+          {%{"mergeStateStatus" => "CLEAN", "reviewDecision" => "CHANGES_REQUESTED"}, "Merge gate not satisfied: review decision CHANGES_REQUESTED"}
         ] do
       Agent.update(ctx.remote, &%{&1 | gate: gate})
-      assert {:ok, %{"status" => "waiting_for_checks"}} = call(ctx.settings, "merge", ctx.opts)
-    end
+      assert {:ok, %{"status" => "paused"}} = call(ctx.settings, "merge", ctx.opts)
 
-    assert_no_merge(ctx)
+      assert Enum.any?(Agent.get(ctx.remote, & &1.calls), fn
+               {"POST", "/repos/owner/repo/issues/1/comments", %{"body" => body}} -> String.contains?(body, reason)
+               _ -> false
+             end)
+
+      assert_no_merge(ctx)
+      human_label(ctx.remote, "merge-approved")
+      assert :ok = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
+    end
   end
 
   test "repair delivers a new SHA and cannot inherit existing approval", ctx do
@@ -208,11 +215,14 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert_no_merge(ctx)
   end
 
-  test "new head after admission is rejected and merge-queue/dirty states wait", ctx do
+  test "dirty states pause with reason and new heads need reauthorization", ctx do
     prepare_merge(ctx)
     assert :ok = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
     Agent.update(ctx.remote, &%{&1 | gate: %{"mergeStateStatus" => "DIRTY", "reviewDecision" => nil}})
-    assert {:ok, %{"status" => "waiting_for_checks"}} = call(ctx.settings, "merge", ctx.opts)
+    assert {:ok, %{"status" => "paused"}} = call(ctx.settings, "merge", ctx.opts)
+    assert_no_merge(ctx)
+    human_label(ctx.remote, "merge-approved")
+    assert :ok = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
     Agent.update(ctx.remote, &%{&1 | sha: @new_sha})
     assert {:error, :delivery_changed} = call(ctx.settings, "merge", ctx.opts)
     assert_no_merge(ctx)
@@ -253,16 +263,46 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert {:ok, %{"attempts" => 1}} = call(ctx.settings, "status", ctx.opts)
   end
 
-  test "pending or failed checks wait without merging", ctx do
+  test "missing or failing checks pause with reason without merging", ctx do
     prepare_merge(ctx)
     assert :ok = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
 
     for checks <- [[], [%{"id" => 2, "name" => "test", "head_sha" => @sha, "status" => "completed", "conclusion" => "failure"}]] do
       Agent.update(ctx.remote, &%{&1 | checks: checks})
-      assert {:ok, %{"status" => "waiting_for_checks"}} = call(ctx.settings, "merge", ctx.opts)
-    end
+      assert {:ok, %{"status" => "paused"}} = call(ctx.settings, "merge", ctx.opts)
 
-    assert_no_merge(ctx)
+      assert Enum.any?(Agent.get(ctx.remote, & &1.calls), fn
+               {"POST", "/repos/owner/repo/issues/1/comments", %{"body" => body}} ->
+                 String.contains?(body, "required checks missing or failing: test")
+
+               _ ->
+                 false
+             end)
+
+      assert_no_merge(ctx)
+      human_label(ctx.remote, "merge-approved")
+      assert :ok = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
+    end
+  end
+
+  test "string issue ids from the poller reach GraphQL variables as integers", ctx do
+    prepare_merge(ctx)
+    human_label(ctx.remote, "merge-approved")
+    assert :ok = Workflow.begin_run(issue(["merge-approved"]), ctx.settings, ctx.opts)
+
+    graphql_bodies =
+      Agent.get(ctx.remote, & &1.calls)
+      |> Enum.filter(fn {_method, path, _body} -> path == "/graphql" end)
+      |> Enum.map(fn {_method, _path, body} -> body end)
+
+    assert graphql_bodies != []
+
+    Enum.each(graphql_bodies, fn %{"variables" => variables} ->
+      assert variables != %{}
+      assert Enum.any?(Map.values(variables), &is_integer/1)
+      refute is_binary(variables["issue"])
+      refute is_binary(variables["pr"])
+    end)
   end
 
   test "lost merge response resolves on next call without repeating merge", ctx do

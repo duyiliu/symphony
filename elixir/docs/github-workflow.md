@@ -29,7 +29,8 @@ Closed Issue 不再启动开发或合并任务。
    GitHub 也可能通过 closing association 自动关闭 Issue。
 
 Agent 可以修复冲突和 CI，但新提交必须重新 `deliver`，移除旧授权并等待人工重新贴标签。
-不会把旧授权自动绑定最新 head。授权评论和看板按钮不再是审批入口。
+不会把旧授权自动绑定最新 head。授权评论不再是审批入口；看板“批准合并”按钮等价于人工在 GitHub
+添加 `merge-approved` 标签（看板用服务端凭据发出真实标签事件，仍受上述事件与操作者校验约束）。
 
 ## 配置
 
@@ -74,7 +75,7 @@ Pi 使用宿主工具需要启用 `runtime.mcp.enabled: true`。不再加载解�
 
 ## 迁移与验证
 
-先处理完或暂停旧任务，停用看板审批和旧 `symphony-merge-authorize` 规则，再部署新二进制和 Workflow。
+先处理完或暂停旧任务，停用旧授权评论入口（`symphony-merge-authorize`），再部署新二进制和 Workflow。
 已有旧评论不能转为新授权；已有 PR 需要完成新的交付登记后才能用标签授权。
 一仓库、一 Workflow、一 Symphony 实例，不增加多项目调度。
 
