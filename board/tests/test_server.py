@@ -334,7 +334,8 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    ("POST", "/repos/example/repo/issues/1/comments", {"body": "CI 一直红，先人工看看"}),
+                    ("POST", "/repos/example/repo/issues/1/comments",
+                     {"body": "[board] 人工暂停（needs-human）：CI 一直红，先人工看看"}),
                     ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["needs-human"]}),
                     ("DELETE", "/repos/example/repo/issues/1/labels/agent", None),
                 ],
@@ -386,7 +387,33 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(
                 board.pause_reason("example/repo", "t", 1), "Merge gate not satisfied: merge state DIRTY."
             )
+
+        board_comments = [
+            {"body": "[agent] Delivery PR #7"},
+            {"body": "[board] 人工暂停（needs-human）：CI 一直红，先人工看看"},
+        ]
+
+        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
+            board, "github_request", return_value=board_comments
+        ):
+            self.assertEqual(board.pause_reason("example/repo", "t", 1), "CI 一直红，先人工看看")
+
+        host_comments = [{"body": "[agent] Paused (needs-human): 验证完成，无需改动\nDelivery: nil"}]
+        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
+            board, "github_request", return_value=host_comments
+        ):
+            self.assertEqual(board.pause_reason("example/repo", "t", 1), "验证完成，无需改动")
         self.assertEqual(board.pause_reason("example/repo", "", 1), "")
+
+    def test_write_endpoints_reject_non_object_json(self):
+        for body in ('"text"', "[]", "123", "null", "true"):
+            for endpoint in ("/api/label", "/api/intervene"):
+                status, payload = self.request(
+                    "POST", endpoint, body, {"Content-Type": "application/json"}
+                )
+                self.assertEqual(status, 400, "%s %s" % (endpoint, body))
+                self.assertIn("JSON", json.loads(payload)["error"])
+        self.github_mock.assert_not_called()
 
     def test_completed_is_inline_and_history_bookmark_redirects(self):
         with patch.object(board, "github_history", return_value=([], "")):

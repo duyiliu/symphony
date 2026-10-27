@@ -1311,11 +1311,15 @@ def load_tracker():
     return repo, token
 
 
-PAUSE_COMMENT_PREFIX = "[agent] Paused"
+# Host pauses are written by the workflow as "[agent] Paused (needs-human): …";
+# a board-initiated pause writes its own marker so the reason is still visible.
+PAUSE_COMMENT_PREFIXES = ("[agent] Paused", "[board] 人工暂停")
+BOARD_PAUSE_PREFIX = "[board] 人工暂停（needs-human）："
+DEFAULT_PAUSE_NOTE = "看板转人工处理，请补充原因后恢复执行"
 
 
 def pause_reason(repo, token, number):
-    """Latest host pause comment for an issue, best effort."""
+    """Latest pause reason for an issue (host or board initiated), best effort."""
     if not repo or not token:
         return ""
     try:
@@ -1328,10 +1332,13 @@ def pause_reason(repo, token, number):
         return ""
     for comment in reversed(comments):
         body = str((comment or {}).get("body") or "")
-        if body.startswith(PAUSE_COMMENT_PREFIX):
-            reason = body[len(PAUSE_COMMENT_PREFIX):].lstrip()
-            reason = reason.split("Delivery:", 1)[0].strip(" \n-：:")
-            return reason[:600]
+        for prefix in PAUSE_COMMENT_PREFIXES:
+            if body.startswith(prefix):
+                reason = body[len(prefix):].lstrip(" \n-：:")
+                reason = reason.split("Delivery:", 1)[0]
+                # Strip the "(needs-human)" / "（needs-human）" marker each side adds.
+                reason = re.sub(r"^[(（]\s*needs-human\s*[)）]\s*[:：]?\s*", "", reason)
+                return reason.strip(" \n-：:")[:600]
     return ""
 
 
@@ -2690,6 +2697,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        try:
+            self.route_post(parsed)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:  # noqa: BLE001 - a bad request must not kill the connection
+            try:
+                self.send_json(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            except OSError:
+                pass
+
+    def route_post(self, parsed):
         if parsed.path == "/api/label":
             return self.handle_label()
         if parsed.path == "/api/approve":
@@ -2718,10 +2736,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "请求体为空或过大"})
             return None
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             self.send_json(400, {"error": "请求体不是合法 JSON"})
             return None
+        if not isinstance(payload, dict):
+            self.send_json(400, {"error": "请求体必须是 JSON 对象"})
+            return None
+        return payload
 
     def issue_number(self, value):
         issue = str(value or "")
@@ -2858,9 +2880,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(400, {"error": "该 issue 没有待处理的 needs-human 标签"})
 
         posted = False
-        if comment:
+        note = None
+        if op == "pause":
+            note = BOARD_PAUSE_PREFIX + (comment or DEFAULT_PAUSE_NOTE)
+        elif comment:
+            note = comment
+        if note:
             try:
-                github_request("POST", "/repos/%s/issues/%s/comments" % (repo, number), token, {"body": comment})
+                github_request("POST", "/repos/%s/issues/%s/comments" % (repo, number), token, {"body": note})
                 posted = True
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")[:200]
