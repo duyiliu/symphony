@@ -38,24 +38,35 @@ defmodule SymphonyElixir.GitHub.WorkflowIntegrationTest do
     refute result["success"]
     assert result["output"] =~ "github_workflow_policy_denied"
     assert PromptBuilder.build_prompt(issue(["agent"])) =~ "Host-enforced execution contract"
+    assert PromptBuilder.build_prompt(issue(["agent"])) =~ "Auto merge"
+    assert PromptBuilder.build_prompt(issue(["agent"])) =~ "needs-human"
   end
 
-  test "dispatch refresh uses both labels and refuses their intersection" do
+  test "dispatch refresh runs only on agent and refuses conflicting labels" do
     original = issue(["agent"])
-    merge = issue(["merge-approved"])
-    invalid = issue(["agent", "merge-approved"])
-    assert {:ok, ^merge} = Orchestrator.revalidate_issue_for_dispatch_for_test(original, fn _ -> {:ok, [merge]} end)
-    fetch_invalid = fn _ -> {:ok, [invalid]} end
-    assert {:skip, ^invalid} = Orchestrator.revalidate_issue_for_dispatch_for_test(original, fetch_invalid)
-    assert {:skip, _} = Orchestrator.revalidate_issue_for_dispatch_for_test(original, fn _ -> {:ok, [issue([])]} end)
+
+    assert {:ok, ^original} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(original, fn _ -> {:ok, [issue(["agent"])]} end)
+
+    # needs-human pauses, agent conflicts fail closed and legacy labels alone are inert.
+    skipped = [["merge-approved"], ["needs-human"], ["agent", "needs-human"], []]
+
+    for labels <- skipped do
+      fetch = fn _ -> {:ok, [issue(labels)]} end
+      assert {:skip, _} = Orchestrator.revalidate_issue_for_dispatch_for_test(original, fetch)
+    end
+
+    # A leftover legacy label does not block execution.
+    legacy = issue(["agent", "merge-approved"])
+    assert {:ok, ^legacy} = Orchestrator.revalidate_issue_for_dispatch_for_test(original, fn _ -> {:ok, [legacy]} end)
   end
 
-  test "continuation does not reuse development context for a merge phase" do
+  test "execution label semantics keep phases separate across continuations" do
     develop = issue(["agent"])
-    merge = issue(["merge-approved"])
-    assert {:done, ^merge} = AgentRunner.continue_with_issue_for_test(develop, fn _ -> {:ok, [merge]} end)
-    assert {:done, ^develop} = AgentRunner.continue_with_issue_for_test(merge, fn _ -> {:ok, [develop]} end)
-    assert {:continue, ^develop} = AgentRunner.continue_with_issue_for_test(develop, fn _ -> {:ok, [develop]} end)
+    risky = issue(["agent", "high-risk"])
+    assert {:continue, ^risky} = AgentRunner.continue_with_issue_for_test(develop, fn _ -> {:ok, [risky]} end)
+    assert {:done, _} = AgentRunner.continue_with_issue_for_test(develop, fn _ -> {:ok, [issue(["needs-human"])]} end)
+    assert {:done, _} = AgentRunner.continue_with_issue_for_test(develop, fn _ -> {:ok, [issue(["agent", "needs-human"])]} end)
   end
 
   test "state storage cannot be inside workspaces and default Linear behavior remains unchanged" do

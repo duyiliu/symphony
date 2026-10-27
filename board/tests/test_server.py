@@ -84,6 +84,9 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(board.status_of("GH-1", ["Agent"], None, True), "ready")
         self.assertEqual(board.status_of("GH-1", [], None, True), "awaiting")
         self.assertEqual(board.status_of("GH-1", [], None, False), "idle")
+        self.assertEqual(board.status_of("GH-1", ["needs-human"], None, True), "blocked")
+        self.assertEqual(board.status_of("GH-1", ["agent", "needs-human"], None, True), "blocked")
+        self.assertEqual(board.status_of("GH-1", ["merge-approved"], None, True), "awaiting")
 
 
 class HTTPTests(unittest.TestCase):
@@ -128,7 +131,7 @@ class HTTPTests(unittest.TestCase):
         self.assertIn("data-writable='1'", self.request("GET", "/")[1])
 
     def test_label_rejects_cross_site_requests(self):
-        for endpoint in ("/api/label", "/api/approve"):
+        for endpoint in ("/api/label", "/api/approve", "/api/intervene"):
             status, body = self.request(
                 "POST", endpoint, "{}", {"Origin": "http://evil.example"}
             )
@@ -141,6 +144,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 400)
         bad_payloads = (
             {"issue": "GH-1", "action": "add", "label": "bug"},
+            {"issue": "GH-1", "action": "add", "label": "merge-approved"},
             {"issue": "GH-1", "action": "toggle", "label": "agent"},
             {"issue": "jira-1", "action": "add", "label": "agent"},
             {"issue": "GH-x", "action": "add", "label": "agent"},
@@ -172,21 +176,21 @@ class HTTPTests(unittest.TestCase):
             )
             self.assertEqual(status, 403)
             status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
-            self.assertEqual(status, 403)
+            self.assertEqual(status, 410)
+            self.assertIn("merge-approved", json.loads(body)["error"])
         member = {"author_association": "MEMBER", "state": "open", "labels": []}
         with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
             board, "fetch_issue", return_value=member
         ), patch.object(board, "github_pulls", return_value={}):
             status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
-        self.assertEqual(status, 400)
-        self.assertIn("open PR", json.loads(body)["error"])
+        self.assertEqual(status, 410)
         self.github_mock.assert_not_called()
 
     def test_label_add_swaps_mutually_exclusive_label(self):
         member = {
             "author_association": "MEMBER",
             "state": "open",
-            "labels": [{"name": "merge-approved"}],
+            "labels": [{"name": "needs-human"}],
         }
         calls = []
 
@@ -207,46 +211,150 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("DELETE", "/repos/example/repo/issues/1/labels/merge-approved", None),
+                ("DELETE", "/repos/example/repo/issues/1/labels/needs-human", None),
                 ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["agent"]}),
             ],
         )
         self.assertIsNone(board._cache["issues"])
 
-    def test_approve_posts_merge_approved_after_dropping_agent(self):
+    def test_leftover_legacy_labels_do_not_block_execution(self):
+        member = {
+            "author_association": "MEMBER",
+            "state": "open",
+            "labels": [{"name": "agent"}, {"name": "merge-approved"}],
+        }
+        calls = []
+
+        def fake_request(method, path, token, body=None, timeout=10):
+            calls.append((method, path, body))
+            return {}
+
+        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
+            board, "fetch_issue", return_value=member
+        ), patch.object(board, "github_request", side_effect=fake_request):
+            status, body = self.request(
+                "POST",
+                "/api/label",
+                json.dumps({"issue": "GH-1", "action": "add", "label": "agent"}),
+            )
+        self.assertEqual(status, 200)
+        # merge-approved carries no meaning: adding agent touches only agent.
+        self.assertEqual(
+            calls,
+            [("POST", "/repos/example/repo/issues/1/labels", {"labels": ["agent"]})],
+        )
+
+    def test_approve_endpoint_is_gone(self):
+        status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
+        self.assertEqual(status, 410)
+        self.assertIn("needs-human", json.loads(body)["error"])
+        self.github_mock.assert_not_called()
+
+    def test_label_add_needs_human_swaps_out_agent(self):
         member = {
             "author_association": "MEMBER",
             "state": "open",
             "labels": [{"name": "agent"}],
         }
-        pull = {"number": 7, "url": "https://example/pr/7", "draft": False, "title": "t"}
-        pr = {"state": "open", "draft": False, "head": {"sha": "abcd1234e5"}}
         calls = []
 
         def fake_request(method, path, token, body=None, timeout=10):
             calls.append((method, path, body))
-            if path == "/repos/example/repo/pulls/7":
-                return pr
             return {}
 
         with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
             board, "fetch_issue", return_value=member
-        ), patch.object(board, "github_pulls", return_value={1: pull}), patch.object(
-            board, "github_request", side_effect=fake_request
-        ):
-            status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
+        ), patch.object(board, "github_request", side_effect=fake_request):
+            status, body = self.request(
+                "POST",
+                "/api/label",
+                json.dumps({"issue": "GH-1", "action": "add", "label": "needs-human"}),
+            )
         self.assertEqual(status, 200)
-        payload = json.loads(body)
-        self.assertEqual(payload["pr"], 7)
+        self.assertIn("needs-human", json.loads(body)["message"])
         self.assertEqual(
             calls,
             [
-                ("GET", "/repos/example/repo/pulls/7", None),
                 ("DELETE", "/repos/example/repo/issues/1/labels/agent", None),
-                ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["merge-approved"]}),
+                ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["needs-human"]}),
             ],
         )
-        self.assertIn("merge-approved", payload["message"])
+
+    def test_intervene_pauses_and_resumes_in_auto_mode(self):
+        member = {"author_association": "MEMBER", "state": "open", "labels": [{"name": "agent"}]}
+        calls = []
+
+        def fake_request(method, path, token, body=None, timeout=10):
+            calls.append((method, path, body))
+            return {}
+
+        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
+            board, "fetch_issue", return_value=member
+        ), patch.object(board, "github_request", side_effect=fake_request):
+            status, body = self.request(
+                "POST",
+                "/api/intervene",
+                json.dumps({"issue": "GH-1", "op": "pause", "comment": "CI 一直红，先人工看看"}),
+            )
+            self.assertEqual(status, 200)
+            self.assertIn("needs-human", json.loads(body)["message"])
+            # 顺序与宿主一致：先评论，再加 needs-human，最后才摘 agent。
+            self.assertEqual(
+                calls,
+                [
+                    ("POST", "/repos/example/repo/issues/1/comments", {"body": "CI 一直红，先人工看看"}),
+                    ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["needs-human"]}),
+                    ("DELETE", "/repos/example/repo/issues/1/labels/agent", None),
+                ],
+            )
+
+            calls.clear()
+            paused = {
+                "author_association": "MEMBER",
+                "state": "open",
+                "labels": [{"name": "needs-human"}],
+            }
+            with patch.object(board, "fetch_issue", return_value=paused):
+                status, body = self.request(
+                    "POST", "/api/intervene", json.dumps({"issue": "GH-1", "op": "resume"})
+                )
+            self.assertEqual(status, 200)
+            self.assertIn("agent", json.loads(body)["message"])
+            self.assertEqual(
+                calls,
+                [
+                    ("DELETE", "/repos/example/repo/issues/1/labels/needs-human", None),
+                    ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["agent"]}),
+                ],
+            )
+
+        # Cross-site guards still apply.
+        status, _ = self.request(
+            "POST", "/api/intervene", json.dumps({"issue": "GH-1", "op": "pause"}), {"Origin": "http://evil.example"}
+        )
+        self.assertEqual(status, 403)
+        status, body = self.request("POST", "/api/intervene", json.dumps({"issue": "GH-1", "op": "toggle"}))
+        self.assertEqual(status, 400)
+        self.github_mock.assert_not_called()
+
+    def test_pause_reason_extracts_the_latest_host_pause_comment(self):
+        comments = [
+            {"body": "[agent] Delivery PR #7"},
+            {"body": "[agent] Paused: Merge gate not satisfied: merge state DIRTY.\nDelivery: %{\"pr\" => 7}"},
+            {"body": "普通评论"},
+        ]
+
+        def fake_request(method, path, token, body=None, timeout=10):
+            self.assertIn("comments", path)
+            return comments
+
+        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
+            board, "github_request", side_effect=fake_request
+        ):
+            self.assertEqual(
+                board.pause_reason("example/repo", "t", 1), "Merge gate not satisfied: merge state DIRTY."
+            )
+        self.assertEqual(board.pause_reason("example/repo", "", 1), "")
 
     def test_completed_is_inline_and_history_bookmark_redirects(self):
         with patch.object(board, "github_history", return_value=([], "")):

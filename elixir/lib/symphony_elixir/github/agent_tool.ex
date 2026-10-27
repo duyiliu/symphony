@@ -81,7 +81,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
         %{
           "name" => "github_workflow",
           "description" =>
-            "Host-enforced GitHub workflow. Register delivery before handoff; merge only a label-authorized delivery. Issue is its numeric GitHub number. Never manipulate execution labels through github_api.",
+            "Host-enforced GitHub workflow. Register delivery before handoff. `agent` alone carries develop through host-guarded merge: only the host merges, after re-checking labels, SHA, required checks, risk rules and review approvals. Issue is its numeric GitHub number. Never manipulate execution labels through github_api.",
           "inputSchema" => %{
             "type" => "object",
             "additionalProperties" => false,

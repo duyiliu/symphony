@@ -125,6 +125,17 @@ defmodule SymphonyElixir.GitHub.WorkflowAPI do
     request(settings, "DELETE", "#{root(settings)}/issues/#{number}/labels/#{label}", nil, opts)
   end
 
+  @spec add_label(map(), pos_integer(), String.t(), keyword()) :: term()
+  def add_label(settings, number, label, opts) do
+    request(settings, "POST", "#{root(settings)}/issues/#{number}/labels", %{"labels" => [label]}, opts)
+  end
+
+  @spec pr_files(map(), pos_integer(), keyword()) :: [map()]
+  def pr_files(settings, number, opts), do: pages(settings, "#{root(settings)}/pulls/#{number}/files", nil, opts)
+
+  @spec pr_reviews(map(), pos_integer(), keyword()) :: [map()]
+  def pr_reviews(settings, number, opts), do: pages(settings, "#{root(settings)}/pulls/#{number}/reviews", nil, opts)
+
   @spec comment(map(), pos_integer(), String.t(), keyword()) :: term()
   def comment(settings, number, text, opts) do
     request(settings, "POST", "#{root(settings)}/issues/#{number}/comments", %{"body" => "[agent] " <> text}, opts)

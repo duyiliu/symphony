@@ -441,13 +441,14 @@ function openIssue(name) {
     state: card.getAttribute('data-state') || 'idle',
     text: card.getAttribute('data-state-text') || '',
     agent: card.getAttribute('data-agent') === '1',
-    approved: card.getAttribute('data-approved') === '1',
+    paused: card.getAttribute('data-paused') === '1',
+    pauseReason: card.getAttribute('data-pause-reason') || '',
     closed: card.getAttribute('data-closed') === '1',
     completedAt: card.getAttribute('data-completed-at') || '',
     description: card.getAttribute('data-description') || '',
     pr: card.getAttribute('data-pr') || '',
     prNum: card.getAttribute('data-pr-num') || ''
-  } : { name: name, title: name, url: '', state: 'idle', text: '', agent: false, approved: false, pr: '', prNum: '' };
+  } : { name: name, title: name, url: '', state: 'idle', text: '', agent: false, paused: false, pauseReason: '', pr: '', prNum: '' };
   dheadEl.innerHTML = "<button class='dclose' id='dclose' title='关闭'>&#8249;</button>"
     + "<div class='dinfo'><div class='dtop'>"
     + "<a class='did' href='" + escHtml(CARD.url) + "' target='_blank' rel='noopener noreferrer'>" + escHtml(CARD.name) + "</a>"
@@ -495,7 +496,8 @@ function refreshCard() {
   CARD.text = card.getAttribute('data-state-text') || CARD.text;
   CARD.title = card.getAttribute('data-title') || CARD.title;
   CARD.agent = card.getAttribute('data-agent') === '1';
-  CARD.approved = card.getAttribute('data-approved') === '1';
+  CARD.paused = card.getAttribute('data-paused') === '1';
+  CARD.pauseReason = card.getAttribute('data-pause-reason') || '';
   CARD.pr = card.getAttribute('data-pr') || '';
   CARD.prNum = card.getAttribute('data-pr-num') || '';
 }
@@ -508,24 +510,27 @@ function actionsHtml() {
   }
   if (!WRITABLE) {
     inner = "<p class='an'>写操作未启用：服务端未配置 GitHub 凭据（SYMPHONY_WORKFLOW / SYMPHONY_ENV）。</p>";
-  } else if (CARD.agent && CARD.approved) {
-    inner = "<p class='an'>agent 与 merge-approved 同时存在，Symphony 已停止执行并记录异常；摘掉其中一个标签可恢复对应流程。</p>"
+  } else if (CARD.agent && CARD.paused) {
+    inner = "<p class='an'>agent 与 needs-human 同时存在，Symphony 已停止执行并记录异常；摘掉其中一个标签可恢复对应流程。</p>"
       + "<div class='abtns'>"
       + "<button class='abtn warn' data-act='remove' data-label='agent'" + (BUSY ? ' disabled' : '') + ">摘掉 agent</button>"
-      + "<button class='abtn warn' data-act='remove' data-label='merge-approved'" + (BUSY ? ' disabled' : '') + ">摘掉 merge-approved</button>"
+      + "<button class='abtn warn' data-act='remove' data-label='needs-human'" + (BUSY ? ' disabled' : '') + ">摘掉 needs-human</button>"
       + "</div>";
+  } else if (CARD.paused) {
+    inner = "<p class='an'>已暂停等待人工。" + (CARD.pauseReason ? '<br>原因：' + escHtml(CARD.pauseReason) : '<br>原因见 issue 内的暂停评论。')
+      + "</p>"
+      + "<div class='abtns'>"
+      + "<button class='abtn ok' data-intervene='resume'" + (BUSY ? ' disabled' : '') + ">"
+      + (BUSY ? '正在提交…' : '恢复执行') + "</button></div>";
   } else if (CARD.agent) {
     const running = CARD.state === 'running';
     const label = running ? '停止' : '暂停派发';
     const tone = running ? 'danger' : 'warn';
     inner = "<p class='an'>操作直接写 GitHub 标签；摘标签会在下个轮询周期终止正在运行的任务。</p>"
-      + "<div class='abtns'><button class='abtn " + tone + "' data-act='remove' data-label='agent'"
-      + (BUSY ? ' disabled' : '') + ">" + (BUSY ? '正在提交…' : label) + "</button></div>";
-  } else if (CARD.approved) {
-    inner = "<p class='an'>merge-approved 已授权合并已发布的交付 SHA；agent 会校验 CI 与 review gate 后执行 squash 合并。</p>"
       + "<div class='abtns'>"
-      + "<button class='abtn warn' data-act='remove' data-label='merge-approved'" + (BUSY ? ' disabled' : '') + ">"
-      + (BUSY ? '正在提交…' : '撤销合并授权') + "</button></div>";
+      + "<button class='abtn warn' data-intervene='pause'" + (BUSY ? ' disabled' : '') + ">转人工处理</button>"
+      + "<button class='abtn " + tone + "' data-act='remove' data-label='agent'"
+      + (BUSY ? ' disabled' : '') + ">" + (BUSY ? '正在提交…' : label) + "</button></div>";
   } else if (FORM_OPEN) {
     inner = "<p class='an'>重新执行前建议留一条说明：agent 启动后会读取 issue 评论，知道这次要做什么、上次为何失败。</p>"
       + "<textarea id='acomment' class='acmt' rows='3' maxlength='4000' "
@@ -536,15 +541,11 @@ function actionsHtml() {
       + "<button class='abtn' data-cancel='1'" + (BUSY ? ' disabled' : '') + ">取消</button>"
       + "</div>";
   } else {
-    const approve = CARD.pr
-      ? "<button class='abtn ok' data-approve='1'" + (BUSY ? ' disabled' : '') + ">"
-        + (BUSY ? '正在提交…' : '批准合并') + "</button>"
-      : "";
     const openLabel = CARD.state === 'awaiting' ? '重新执行…' : '开始执行…';
-    inner = "<p class='an'>批准合并会加 merge-approved 标签，授权 agent 合并已发布的交付（校验 CI 与 head 后执行）；"
-      + "执行类操作加 agent 标签，调度器会在下个轮询周期领取。</p>"
-      + "<div class='abtns'>" + approve
-      + "<button class='abtn' data-open='1'" + (BUSY ? ' disabled' : '') + ">" + openLabel + "</button></div>";
+    inner = "<p class='an'>加 agent 标签后，agent 会开发、交付，宿主自动校验 CI/风险规则并完成合并；"
+      + "高风险或收敛不了时会暂停并标记 needs-human，到时在这里恢复。</p>"
+      + "<div class='abtns'>"
+      + "<button class='abtn ok' data-open='1'" + (BUSY ? ' disabled' : '') + ">" + openLabel + "</button></div>";
   }
   return "<section class='actions' id='actions'><p class='at'>在看板操作 GitHub 标签</p>" + inner + "</section>";
 }
@@ -557,22 +558,26 @@ function renderActions() {
   el.outerHTML = actionsHtml();
 }
 
-async function approveMerge() {
-  if (!CUR || BUSY || !CARD.pr) { return; }
-  if (!confirm('批准合并 PR #' + CARD.prNum + '？会给 issue 加 merge-approved 标签，'
-    + 'agent 校验 CI 与已发布交付的 head 后执行 squash 合并并关闭 issue。合并不可逆，新提交需重新交付并重新授权。')) { return; }
+async function interveneAction(op) {
+  if (!CUR || BUSY) { return; }
+  let comment = '';
+  if (op === 'pause') {
+    comment = (prompt('转人工处理 ' + CUR + '？可填写原因（可选，会作为 issue 评论发布）：') || '').trim();
+    if (comment === null) { return; }
+  } else if (!confirm('恢复执行 ' + CUR + '？会移除 needs-human 并重新加 agent；'
+    + '合并前宿主会重新核验当前 SHA 的检查与有效审批，重贴 agent 本身不是合并授权。')) { return; }
   BUSY = true;
   renderActions();
   try {
-    const res = await fetch('/api/approve', {
+    const res = await fetch('/api/intervene', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ issue: CUR })
+      body: JSON.stringify({ issue: CUR, op: op, comment: comment })
     });
     let data = {};
     try { data = await res.json(); } catch (err) { }
     if (!res.ok) { throw new Error(data.error || ('HTTP ' + res.status)); }
-    toast(data.message || '已加 merge-approved 标签');
+    toast(data.message || '已提交');
     await refreshIssues();
     refreshCard();
     await loadRuns(true);
@@ -596,13 +601,13 @@ async function labelAction(action, label) {
       ? '发布说明并给 ' + CUR + ' 加上 agent 标签？调度器会在下个轮询周期开始执行（改代码，可能推 PR）。'
       : '没有填写说明，直接给 ' + CUR + ' 加 agent 标签？agent 可能重复上次的做法。';
   } else if (action === 'add') {
-    verb = '给 ' + CUR + ' 加 merge-approved 标签？';
+    verb = '给 ' + CUR + ' 加 needs-human 并摘掉 agent 标签？调度器不会再派发，直到人工恢复。';
   } else if (label === 'agent') {
     verb = running
       ? '摘掉 ' + CUR + ' 的 agent 标签？调度器会在下个轮询周期终止正在运行的任务。'
       : '摘掉 ' + CUR + ' 的 agent 标签？调度器不会再派发它。';
   } else {
-    verb = '摘掉 ' + CUR + ' 的 merge-approved 标签？尚未发出的合并请求会被撤销。';
+    verb = '摘掉 ' + CUR + ' 的 needs-human 标签？如需继续执行，请再重新加 agent。';
   }
   if (!confirm(verb)) { return; }
   if (action === 'add') { DRAFT_COMMENT = comment; }
@@ -650,13 +655,19 @@ function noteBoxHtml() {
     body = 'agent 运行中，等待最新事件。';
   } else if (st === 'blocked') {
     title = '已阻塞';
-    body = '运行失败或需要人工处理；修复后可重新加上 agent 标签让调度器派发。' + troubleHtml();
+    if (CARD.paused) {
+      body = '已暂停等待人工处理（needs-human）。'
+        + (CARD.pauseReason ? '<br>原因：' + escHtml(CARD.pauseReason) : '')
+        + '<br>在 GitHub 或本页处理完后点“恢复执行”；重贴 agent 不是合并授权，合并前会重新核验当前 SHA 与审批。';
+    } else {
+      body = '运行失败或需要人工处理；修复后可重新加上 agent 标签让调度器派发。' + troubleHtml();
+    }
   } else if (st === 'retrying') {
     title = '等待重试';
     body = '调度器会在退避窗口结束后重新尝试。' + troubleHtml();
   } else if (st === 'awaiting') {
     title = '等待合并';
-    body = 'PR 已开，等待人工 review；确认交付评论后可点“批准合并”（加 merge-approved），agent 校验 CI 后执行合并并关闭 issue。';
+    body = 'PR 已开；agent 交付后宿主会自动校验检查与风险规则并完成合并，高风险或需人工审批时会等待 Review / 暂停转人工。';
   } else if (st === 'ready') {
     title = '等待派发';
     body = 'Issue 带有 agent 标签，调度器会在下个轮询周期领取。';
@@ -897,7 +908,8 @@ dheadEl.addEventListener('click', function (e) {
 
 dbodyEl.addEventListener('click', function (e) {
   if (e.target.closest('#dclose')) { closeDrawer(); return; }
-  if (e.target.closest('[data-approve]')) { approveMerge(); return; }
+  const iv = e.target.closest('[data-intervene]');
+  if (iv) { interveneAction(iv.getAttribute('data-intervene')); return; }
   const act = e.target.closest('[data-act]');
   if (act) { labelAction(act.getAttribute('data-act'), act.getAttribute('data-label')); return; }
   if (e.target.closest('[data-open]')) {
@@ -1299,6 +1311,30 @@ def load_tracker():
     return repo, token
 
 
+PAUSE_COMMENT_PREFIX = "[agent] Paused"
+
+
+def pause_reason(repo, token, number):
+    """Latest host pause comment for an issue, best effort."""
+    if not repo or not token:
+        return ""
+    try:
+        comments = github_request(
+            "GET", "/repos/%s/issues/%s/comments?per_page=30" % (repo, number), token
+        )
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError, http.client.HTTPException):
+        return ""
+    if not isinstance(comments, list):
+        return ""
+    for comment in reversed(comments):
+        body = str((comment or {}).get("body") or "")
+        if body.startswith(PAUSE_COMMENT_PREFIX):
+            reason = body[len(PAUSE_COMMENT_PREFIX):].lstrip()
+            reason = reason.split("Delivery:", 1)[0].strip(" \n-：:")
+            return reason[:600]
+    return ""
+
+
 def github_issues():
     now = time.time()
     if _cache["issues"] is not None and now - _cache["issues_at"] < ISSUE_CACHE_TTL:
@@ -1600,10 +1636,11 @@ EXT_ICON = (
 def status_of(issue, labels, agent, has_pr=False):
     if agent in ("running", "blocked", "retrying"):
         return agent
-    execution = {label.lower() for label in labels} & {"agent", "merge-approved"}
-    if len(execution) == 2:
+    lower = {label.lower() for label in labels}
+    # needs-human pauses execution and conflicts with the execution label.
+    if "needs-human" in lower:
         return "blocked"
-    if execution:
+    if "agent" in lower:
         return "ready"
     if has_pr:
         return "awaiting"
@@ -1660,7 +1697,9 @@ def build_cards():
         title = issue.get("title") or ""
         gen = "<span class='bgen'>%d 次</span>" % runs if runs else ""
         has_agent = any(label.lower() == "agent" for label in labels)
-        has_approved = any(label.lower() == "merge-approved" for label in labels)
+        has_paused = any(label.lower() == "needs-human" for label in labels)
+        pause_note = pause_reason(repo, token, number) if has_paused else ""
+        state_text = "等待人工处理" if has_paused else STATUS_TEXT[st]
         pr_html = ""
         pr_url = ""
         pr_number = ""
@@ -1682,7 +1721,8 @@ def build_cards():
                 "html": (
                     "<div class='bcard %(state)s%(live)s' data-issue='%(name)s' "
                     "data-title='%(title)s' data-url='%(url)s' data-state='%(state)s' "
-                    "data-state-text='%(text)s' data-agent='%(agent)s' data-approved='%(approved)s' "
+                    "data-state-text='%(text)s' data-agent='%(agent)s' "
+                    "data-paused='%(paused)s' data-pause-reason='%(pause)s' "
                     "data-pr='%(prurl)s' data-pr-num='%(prnum)s' data-search='%(search)s'>"
                     "<div class='btitle'>%(title)s</div>"
                     "<div class='bmeta'>"
@@ -1699,9 +1739,10 @@ def build_cards():
                     "name": esc(name),
                     "title": esc(title),
                     "url": esc(issue.get("html_url")),
-                    "text": esc(STATUS_TEXT[st]),
+                    "text": esc(state_text),
                     "agent": "1" if has_agent else "0",
-                    "approved": "1" if has_approved else "0",
+                    "paused": "1" if has_paused else "0",
+                    "pause": esc(pause_note),
                     "prurl": esc(pr_url),
                     "prnum": esc(pr_number),
                     "search": esc(search),
@@ -1799,8 +1840,8 @@ def issues_page():
         "</header>"
         "<div class='head'><div class='hrow'><h1>Issue 工作台</h1>"
         "<span class='sum' id='sum'>%s</span></div>"
-        "<div class='note'>业务状态来自 Symphony 的 agent / merge-approved 标签与本地运行状态（最近一次对账）；"
-        "点击卡片可查看历次运行、实时日志，并直接操作 agent / merge-approved 标签（Running/Retrying 等执行状态只记录在本机）。</div></div>"
+        "<div class='note'>业务状态来自 Symphony 的 agent / needs-human 标签与本地运行状态（最近一次对账）；"
+        "点击卡片可查看历次运行、实时日志，并直接操作 agent / needs-human 标签（Running/Retrying 等执行状态只记录在本机）。</div></div>"
         "<div class='tools'>"
         "<div class='chips'><button class='chip on' data-repo=''>全部 "
         "<b id='chipAll'>%d</b></button>%s</div>"
@@ -2653,6 +2694,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_label()
         if parsed.path == "/api/approve":
             return self.handle_approve()
+        if parsed.path == "/api/intervene":
+            return self.handle_intervene()
         return self.send_json(404, {"error": "not found"})
 
     def write_guard(self):
@@ -2688,69 +2731,16 @@ class Handler(BaseHTTPRequestHandler):
         return int(number_text) if number_text.isdigit() else None
 
     def handle_approve(self):
-        """批准合并：写 merge-approved 标签（先摘掉互斥的 agent），授权入口仍是标签事件。"""
+        """merge-approved 已从协议移除：合并由宿主自动判定，人工入口是 needs-human。"""
         if not self.write_guard():
             return
-        payload = self.read_json_body()
-        if payload is None:
-            return
-        number = self.issue_number(payload.get("issue"))
-        if number is None:
-            return self.send_json(400, {"error": "issue 标识不合法"})
-        repo, token = load_tracker()
-        if not repo or not token:
-            return self.send_json(503, {"error": "GitHub 未配置"})
-        issue = fetch_issue(repo, token, number)
-        if issue is None:
-            return self.send_json(502, {"error": "读取 issue 失败"})
-        if not issue_trusted(issue):
-            return self.send_json(403, {"error": "该 issue 作者不在受信任范围"})
-        if (issue.get("state") or "") != "open":
-            return self.send_json(400, {"error": "issue 不是 open 状态，无法授权合并"})
-        labels = {str(l.get("name") or "").lower() for l in issue.get("labels") or []}
-        pull = github_pulls().get(number)
-        if not pull:
-            return self.send_json(400, {"error": "没有找到关联的 open PR；确认交付评论已发布"})
-        pr_number = pull.get("number")
-        try:
-            pr = github_request("GET", "/repos/%s/pulls/%s" % (repo, pr_number), token)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:200]
-            return self.send_json(502, {"error": "读取 PR 失败 GitHub %s: %s" % (exc.code, detail)})
-        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-            return self.send_json(502, {"error": "读取 PR 失败: %s" % exc})
-        if (pr.get("state") or "") != "open":
-            return self.send_json(400, {"error": "PR 不是 open 状态，无法授权合并"})
-        if pr.get("draft"):
-            return self.send_json(400, {"error": "PR 仍是草稿，先在 GitHub 标记为 ready for review"})
-        head_sha = ((pr.get("head") or {}).get("sha") or "").strip()
-        if "agent" in labels:
-            try:
-                github_request("DELETE", "/repos/%s/issues/%s/labels/agent" % (repo, number), token)
-            except urllib.error.HTTPError as exc:
-                if exc.code != 404:
-                    detail = exc.read().decode("utf-8", "replace")[:200]
-                    return self.send_json(502, {"error": "摘掉 agent 标签失败 GitHub %s: %s" % (exc.code, detail)})
-            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-                return self.send_json(502, {"error": "摘掉 agent 标签失败: %s" % exc})
-        try:
-            github_request(
-                "POST", "/repos/%s/issues/%s/labels" % (repo, number), token, {"labels": ["merge-approved"]}
-            )
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:200]
-            return self.send_json(502, {"error": "添加 merge-approved 失败 GitHub %s: %s" % (exc.code, detail)})
-        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-            return self.send_json(502, {"error": "添加 merge-approved 失败: %s" % exc})
-        clear_github_cache()
-        message = "已加 merge-approved（PR #%s%s），agent 会校验 CI 与交付 head 后执行 squash 合并" % (
-            pr_number,
-            " @ %s" % head_sha[:8] if head_sha else "",
+        return self.send_json(
+            410,
+            {"error": "merge-approved 已移除：合并由宿主自动判定；如需人工控制，用“转人工处理”（needs-human）或在 GitHub 摘掉 agent"},
         )
-        return self.send_json(200, {"ok": True, "pr": pr_number, "sha": head_sha, "message": message})
 
     def handle_label(self):
-        """加 / 摘 agent 或 merge-approved 标签，可选先发一条 issue 评论。"""
+        """加 / 摘 agent 或 needs-human 标签，可选先发一条 issue 评论。"""
         if not self.write_guard():
             return
         payload = self.read_json_body()
@@ -2759,8 +2749,8 @@ class Handler(BaseHTTPRequestHandler):
         action = payload.get("action")
         label = str(payload.get("label") or "agent").lower()
         comment = str(payload.get("comment") or "").strip()
-        if label not in ("agent", "merge-approved"):
-            return self.send_json(400, {"error": "只允许修改 agent / merge-approved 标签"})
+        if label not in ("agent", "needs-human"):
+            return self.send_json(400, {"error": "只允许修改 agent / needs-human 标签"})
         if action not in ("add", "remove"):
             return self.send_json(400, {"error": "action 必须是 add 或 remove"})
         if len(comment) > 4000:
@@ -2789,21 +2779,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(502, {"error": "评论发布失败 GitHub %s: %s" % (exc.code, detail)})
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
                 return self.send_json(502, {"error": "评论发布失败: %s" % exc})
-        other = "merge-approved" if label == "agent" else "agent"
-        if action == "add" and other in labels:
-            # 两个执行标签互斥：加其中一个前先摘掉另一个。
-            try:
-                github_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, other), token)
-            except urllib.error.HTTPError as exc:
-                if exc.code != 404:
-                    detail = exc.read().decode("utf-8", "replace")[:200]
+        others = [name for name in ("agent", "needs-human") if name != label]
+        if action == "add":
+            # 执行/暂停标签互斥：加其中一个前先摘掉已在的其他标签。
+            for other in [name for name in others if name in labels]:
+                try:
+                    github_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, other), token)
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 404:
+                        detail = exc.read().decode("utf-8", "replace")[:200]
+                        prefix = "评论已发布，但" if posted else ""
+                        return self.send_json(
+                            502, {"error": "%s摘掉 %s 标签失败 GitHub %s: %s" % (prefix, other, exc.code, detail)}
+                        )
+                except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
                     prefix = "评论已发布，但" if posted else ""
-                    return self.send_json(
-                        502, {"error": "%s摘掉 %s 标签失败 GitHub %s: %s" % (prefix, other, exc.code, detail)}
-                    )
-            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-                prefix = "评论已发布，但" if posted else ""
-                return self.send_json(502, {"error": "%s摘掉 %s 标签失败: %s" % (prefix, other, exc)})
+                    return self.send_json(502, {"error": "%s摘掉 %s 标签失败: %s" % (prefix, other, exc)})
         try:
             if action == "add":
                 github_request("POST", "/repos/%s/issues/%s/labels" % (repo, number), token, {"labels": [label]})
@@ -2829,9 +2820,90 @@ class Handler(BaseHTTPRequestHandler):
         elif action == "remove" and label == "agent":
             message = "已移除 agent 标签，调度器会在下个轮询周期停止该任务"
         elif action == "add":
-            message = "已加入 merge-approved 标签，agent 会校验后执行合并"
+            message = "已加入 needs-human 并移除执行标签；该 issue 暂停等待人工"
         else:
-            message = "已移除 merge-approved 标签，尚未发出的合并请求会被撤销"
+            message = "已移除 needs-human 标签"
+        return self.send_json(200, {"ok": True, "message": message, "commented": posted})
+
+    def handle_intervene(self):
+        """人工介入：pause 加 needs-human 并摘 agent；resume 反向恢复。"""
+        if not self.write_guard():
+            return
+        payload = self.read_json_body()
+        if payload is None:
+            return
+        op = str(payload.get("op") or "")
+        if op not in ("pause", "resume"):
+            return self.send_json(400, {"error": "op 必须是 pause 或 resume"})
+        comment = str(payload.get("comment") or "").strip()
+        if len(comment) > 4000:
+            return self.send_json(400, {"error": "说明过长（上限 4000 字）"})
+        number = self.issue_number(payload.get("issue"))
+        if number is None:
+            return self.send_json(400, {"error": "issue 标识不合法"})
+        repo, token = load_tracker()
+        if not repo or not token:
+            return self.send_json(503, {"error": "GitHub 未配置"})
+        issue = fetch_issue(repo, token, number)
+        if issue is None:
+            return self.send_json(502, {"error": "读取 issue 失败"})
+        if not issue_trusted(issue):
+            return self.send_json(403, {"error": "该 issue 作者不在受信任范围"})
+        if (issue.get("state") or "") != "open":
+            return self.send_json(400, {"error": "issue 不是 open 状态"})
+        labels = {str(l.get("name") or "").lower() for l in issue.get("labels") or []}
+        if op == "pause" and "needs-human" in labels and "agent" not in labels:
+            return self.send_json(400, {"error": "该 issue 已在等待人工处理"})
+        if op == "resume" and "needs-human" not in labels:
+            return self.send_json(400, {"error": "该 issue 没有待处理的 needs-human 标签"})
+
+        posted = False
+        if comment:
+            try:
+                github_request("POST", "/repos/%s/issues/%s/comments" % (repo, number), token, {"body": comment})
+                posted = True
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+                return self.send_json(502, {"error": "评论发布失败 GitHub %s: %s" % (exc.code, detail)})
+            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+                return self.send_json(502, {"error": "评论发布失败: %s" % exc})
+
+        def swap(add_label, drop_label):
+            # 顺序与宿主一致：先加暂停标记再摘执行标签（pause），恢复时反向，
+            # 避免出现 agent + needs-human 的无效组合被调度器看到。
+            try:
+                if add_label:
+                    github_request("POST", "/repos/%s/issues/%s/labels" % (repo, number), token, {"labels": [add_label]})
+                if drop_label:
+                    github_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, drop_label), token)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404 and drop_label:
+                    pass
+                else:
+                    detail = exc.read().decode("utf-8", "replace")[:200]
+                    prefix = "评论已发布，但" if posted else ""
+                    return "%s标签操作失败 GitHub %s: %s" % (prefix, exc.code, detail)
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                prefix = "评论已发布，但" if posted else ""
+                return "%s标签操作失败: %s" % (prefix, exc)
+            return None
+
+        if op == "pause":
+            error = swap("needs-human", "agent" if "agent" in labels else None)
+        else:
+            error = swap(None, "needs-human")
+            if error is None:
+                error = swap("agent", None)
+        if error:
+            return self.send_json(502, {"error": error})
+        clear_github_cache()
+        if op == "pause":
+            message = (
+                "已暂停并标记 needs-human（%s）调度器不会再派发；处理完成后点“恢复执行”"
+                % ("已留言，" if posted else "")
+            )
+        else:
+            message = "已移除 needs-human 并重新加 agent；调度器会重新领取，合并前宿主会重新核验当前 SHA 与审批"
         return self.send_json(200, {"ok": True, "message": message, "commented": posted})
 
     def handle_tail(self, issue, query):

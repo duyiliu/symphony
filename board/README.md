@@ -2,9 +2,13 @@
 
 Symphony 仓库中的中文 GitHub Issue 看板：泳道、运行历史、Pi 实时日志与静态归档。仅依赖 Python 3 标准库。
 
-看板提供 **批准合并** 与 agent 标签的派发 / 停止操作：按钮用服务端 `GITHUB_TOKEN` 直接写 GitHub 标签，
-与人工在 Issue 上操作等价；`agent` / `merge-approved` 互斥，加其中一个会先摘掉另一个。
-审批入口仍是 GitHub 标签事件，宿主的交付 / CI / head 校验不变。
+看板提供标签派发 / 停止 / 人工介入操作：按钮用服务端 `GITHUB_TOKEN` 直接写 GitHub 标签，
+与人工在 Issue 上操作等价；`agent` / `needs-human` 互斥，加其中一个会先摘掉另一个。
+
+- `agent` 是唯一执行开关：开发、交付后由宿主自动校验检查/风险规则并完成合并，无需人工逐 PR 授权。
+- 运行中的 Issue 可“转人工处理”（加 `needs-human` 并摘 `agent`）；已暂停的 Issue 显示暂停原因
+  （取自宿主暂停评论），处理后“恢复执行”（移除 `needs-human`、重新加 `agent`）。
+- 旧的 `merge-approved` 已从协议移除：批准入口返回 410，遗留标签不影响执行。
 完整协议和部署前置条件见 [`elixir/docs/github-workflow.md`](../elixir/docs/github-workflow.md)。
 
 ## 源码与数据
@@ -98,4 +102,4 @@ python3 -m py_compile board/server.py board/session.py
 
 测试使用模拟数据和临时本地端口，不读取部署凭据，不请求真实 GitHub。
 覆盖空泳道类名隔离、动态切换一致性、状态优先级、首页和 API，以及写接口的同源拦截、
-输入校验、信任检查与互斥标签切换。
+输入校验、信任检查与互斥标签切换、人工介入端点与旧批准入口下线。

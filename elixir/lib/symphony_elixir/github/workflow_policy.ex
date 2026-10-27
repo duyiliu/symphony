@@ -4,6 +4,27 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.Tracker.Issue
 
+  @agent_label "agent"
+  @pause_label "needs-human"
+  @high_risk_label "high-risk"
+
+  @default_review_required_paths [
+    "**/*.sql",
+    "**/migrations/**",
+    ".github/workflows/**",
+    "**/.github/workflows/**",
+    "deploy/**",
+    "**/deploy/**",
+    "**/Dockerfile*",
+    "**/docker-compose*.yml",
+    "**/docker-compose*.yaml",
+    "**/*auth*",
+    "**/*permission*",
+    "**/security/**"
+  ]
+
+  @default_max_auto_files 100
+
   @spec config(map()) :: map()
   def config(settings), do: Map.get(settings, :github_workflow, %{}) || %{}
 
@@ -30,7 +51,8 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
       {present?(cfg["base_branch"]), :missing_github_workflow_base_branch},
       {positive?(Map.get(cfg, "max_attempts", 3)), :invalid_github_workflow_max_attempts},
       {checks?(cfg["required_checks"]), :missing_github_workflow_required_checks},
-      {not Enum.any?(required_labels, &(&1 in ["agent", "merge-approved"])), :execution_labels_must_not_be_required_labels}
+      {risk_config?(cfg["risk"]), :invalid_github_workflow_risk},
+      {not Enum.any?(required_labels, &(&1 in [@agent_label, @pause_label, @high_risk_label, "merge-approved"])), :execution_labels_must_not_be_required_labels}
     ]
 
     case Enum.find(rules, fn {valid, _reason} -> not valid end) do
@@ -56,15 +78,42 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
     end
   end
 
-  @spec phase([String.t()]) :: :develop | :merge | :waiting | :invalid
+  @doc """
+  Label routing: `agent` is the only execution switch and runs unattended through
+  the host-guarded merge; `needs-human` pauses for a human. Both together fail
+  closed. Legacy `merge-approved` labels carry no meaning and are ignored.
+  """
+  @spec phase([String.t()]) :: :develop | :waiting | :invalid
   def phase(labels) do
-    case {"agent" in labels, "merge-approved" in labels} do
-      {true, false} -> :develop
-      {false, true} -> :merge
-      {false, false} -> :waiting
-      {true, true} -> :invalid
+    cond do
+      @agent_label in labels and @pause_label in labels -> :invalid
+      @agent_label in labels -> :develop
+      true -> :waiting
     end
   end
+
+  @doc "Project-level deterministic risk policy for auto merges."
+  @spec review_required_paths(map()) :: [String.t()]
+  def review_required_paths(settings) do
+    case get_in(config(settings), ["risk", "review_required_paths"]) do
+      paths when is_list(paths) and paths != [] -> paths
+      _ -> @default_review_required_paths
+    end
+  end
+
+  @spec max_auto_files(map()) :: pos_integer()
+  def max_auto_files(settings) do
+    case get_in(config(settings), ["risk", "max_auto_files"]) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> @default_max_auto_files
+    end
+  end
+
+  @spec high_risk_label :: String.t()
+  def high_risk_label, do: @high_risk_label
+
+  @spec pause_label :: String.t()
+  def pause_label, do: @pause_label
 
   @spec same_phase?(Issue.t(), Issue.t(), map()) :: boolean()
   def same_phase?(before, after_issue, settings) do
@@ -74,7 +123,7 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
   @spec routable?(Issue.t(), map()) :: boolean()
   def routable?(issue, settings) do
     Issue.routable?(issue, settings.required_labels) and
-      (not enabled?(settings) or phase(issue.labels) in [:develop, :merge])
+      (not enabled?(settings) or phase(issue.labels) == :develop)
   end
 
   @spec repo(map()) :: String.t()
@@ -129,6 +178,27 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
   defp present?(s), do: is_binary(s) and String.trim(s) != ""
   defp positive?(n), do: is_integer(n) and n > 0
   defp checks?(items), do: is_list(items) and items != [] and Enum.all?(items, &present?/1)
+
+  defp risk_config?(nil), do: true
+
+  defp risk_config?(risk) when is_map(risk) do
+    paths_valid =
+      case risk["review_required_paths"] do
+        nil -> true
+        paths -> is_list(paths) and Enum.all?(paths, &present?/1)
+      end
+
+    files_valid =
+      case risk["max_auto_files"] do
+        nil -> true
+        n -> is_integer(n) and n > 0
+      end
+
+    known = MapSet.new(["review_required_paths", "max_auto_files"])
+    paths_valid and files_valid and Enum.all?(Map.keys(risk), &(&1 in known))
+  end
+
+  defp risk_config?(_risk), do: false
 
   defp absolute_private_path?(path) when is_binary(path) do
     Path.type(path) == :absolute and length(Path.split(path)) >= 3
