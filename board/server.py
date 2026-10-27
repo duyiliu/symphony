@@ -96,6 +96,20 @@ a{color:inherit;text-decoration:none}
 .search input{width:100%;padding:6px 9px 6px 27px;border:1px solid var(--edge);border-radius:6px;background:var(--card);color:var(--fg);font:11px var(--sans);outline:none}
 .search input::placeholder{color:var(--fg3)}
 .search input:focus{border-color:var(--edge2)}
+[hidden]{display:none!important}
+.view-tabs{display:flex;gap:6px;flex-wrap:wrap}
+.completed-panel{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:16px;scrollbar-gutter:stable}
+.completed-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
+.completed-note,#completed-status{color:var(--fg2);font-size:12px;overflow-wrap:anywhere}
+.completed-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:12px;align-items:start}
+.completed-card{min-width:0;padding:16px;overflow-wrap:anywhere}
+.completed-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.completed-badge{color:var(--ok);font-size:12px}
+.completed-time{color:var(--fg2);font-size:12px;margin-top:12px}
+.completed-hint{color:var(--info);font-size:12px;margin-top:8px}
+.completed-description pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 var(--sans)}
+.completed-description summary{cursor:pointer;margin-top:8px;min-height:32px}
+.completed-card:focus-visible,.chip:focus-visible{outline:2px solid var(--info);outline-offset:2px}
 .board{flex:1;min-height:0;display:flex;gap:12px;padding:12px 16px 16px;overflow-x:auto;overflow-y:hidden}
 .col{display:flex;flex-direction:column;flex:1 1 0;min-width:232px;min-height:0;border:1px solid var(--edge);border-radius:8px;background:var(--panel)}
 .col[hidden]{display:none}
@@ -292,6 +306,24 @@ table{border-collapse:collapse;width:100%}
 th,td{text-align:left;padding:5px 10px;border-bottom:1px solid var(--edge);font-size:12px}
 th{color:var(--fg3);font-weight:500}
 #feed{padding:12px 16px 40px;background:var(--canvas)}
+@media(max-width:640px){
+ .app{height:100dvh}
+ .topbar{padding:0 10px;gap:8px}.auto{gap:4px}.auto>a{max-width:100px;overflow:hidden;text-overflow:ellipsis}.auto>svg,.auto>span{display:none}
+ .head{padding:10px}.head h1{font-size:16px}.head .note{font-size:11px;line-height:1.4}
+ .tools{padding:8px 10px;gap:8px}.tools>.chips{display:none}
+ .view-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%;order:-1;gap:6px}
+ .view-tabs .chip{justify-content:center;padding:8px 4px;font-size:13px;min-height:44px}
+ .search{flex:1;min-width:0;width:auto;max-width:none}.search input{font-size:16px;min-height:44px}
+ .chk{min-height:44px}.chip,.abtn,.logbtn,.fbtn{min-height:44px}
+ .board{padding:10px;gap:10px;scroll-snap-type:x proximity}.col{min-width:min(84vw,340px);scroll-snap-align:start}.col.is-empty{flex-basis:232px}
+ .completed-panel{padding:12px 10px;padding-bottom:max(16px,env(safe-area-inset-bottom))}
+ .completed-list{grid-template-columns:minmax(0,1fr);gap:10px}.completed-card{padding:14px}.completed-card .btitle{font-size:15px}
+ .drawer{width:100vw;max-width:100vw;height:100dvh;border-left:0}
+ .dhead{padding:10px;padding-top:max(10px,env(safe-area-inset-top))}.dclose,.dext{min-width:44px;min-height:44px}
+ .dbody{padding:12px 10px;padding-bottom:max(24px,env(safe-area-inset-bottom))}.dtitle{font-size:16px}
+ .acmt{font-size:16px}.abtns .abtn{flex:1;min-width:100px;font-size:13px}.mgrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .run-head{flex-wrap:wrap}.run-time{white-space:normal;overflow-wrap:anywhere}.log-body{max-height:55dvh}
+}
 """
 
 BOARD = """
@@ -310,7 +342,7 @@ const MAX_MSGS = 400;
 let CUR = null, CARD = null, RUNS = [], AGENT = null, TROUBLE = null, LOG = null;
 let SHOW_EMPTY = localStorage.getItem('sb-show-empty') !== '0';
 let PENDING_RUN = new URLSearchParams(location.search).get('run');
-let BUSY = false, TOAST_TIMER = null, FORM_OPEN = false, DRAFT_COMMENT = '';
+let BUSY = false, TOAST_TIMER = null, FORM_OPEN = false, DRAFT_COMMENT = '', WRITABLE = false;
 
 // Legacy board credentials are no longer used. Strip old token links without
 // storing their credentials; all authorization now happens through GitHub labels.
@@ -337,6 +369,7 @@ const shadeEl = document.getElementById('shade');
 const drawerEl = document.getElementById('drawer');
 const dheadEl = document.getElementById('dhead');
 const dbodyEl = document.getElementById('dbody');
+WRITABLE = boardEl.getAttribute('data-writable') === '1';
 
 const ICON = {
   running: "<svg viewBox='0 0 16 16'><circle cx='8' cy='8' r='5.6' fill='none' stroke='currentColor' stroke-width='1.6' opacity='.35'/><circle class='spin' cx='8' cy='8' r='5.6' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-dasharray='26 35.2' transform='rotate(-90 8 8)' style='transform-origin:8px 8px'/></svg>",
@@ -379,7 +412,7 @@ function tickDurations() {
 setInterval(tickDurations, 1000);
 
 function markSel() {
-  boardEl.querySelectorAll('.bcard[data-issue]').forEach(function (c) {
+  document.querySelectorAll('.bcard[data-issue]').forEach(function (c) {
     c.classList.toggle('sel', c.getAttribute('data-issue') === CUR);
   });
 }
@@ -400,7 +433,7 @@ function openIssue(name) {
   FORM_OPEN = false; DRAFT_COMMENT = '';
   markSel();
   syncUrl(name);
-  const card = boardEl.querySelector(".bcard[data-issue='" + name + "']");
+  const card = (VIEW === 'active' ? boardEl : document.getElementById('completed-list')).querySelector(".bcard[data-issue='" + name + "']");
   CARD = card ? {
     name: name,
     title: card.getAttribute('data-title') || name,
@@ -408,9 +441,13 @@ function openIssue(name) {
     state: card.getAttribute('data-state') || 'idle',
     text: card.getAttribute('data-state-text') || '',
     agent: card.getAttribute('data-agent') === '1',
+    approved: card.getAttribute('data-approved') === '1',
+    closed: card.getAttribute('data-closed') === '1',
+    completedAt: card.getAttribute('data-completed-at') || '',
+    description: card.getAttribute('data-description') || '',
     pr: card.getAttribute('data-pr') || '',
     prNum: card.getAttribute('data-pr-num') || ''
-  } : { name: name, title: name, url: '', state: 'idle', text: '', agent: false, pr: '', prNum: '' };
+  } : { name: name, title: name, url: '', state: 'idle', text: '', agent: false, approved: false, pr: '', prNum: '' };
   dheadEl.innerHTML = "<button class='dclose' id='dclose' title='关闭'>&#8249;</button>"
     + "<div class='dinfo'><div class='dtop'>"
     + "<a class='did' href='" + escHtml(CARD.url) + "' target='_blank' rel='noopener noreferrer'>" + escHtml(CARD.name) + "</a>"
@@ -452,23 +489,156 @@ function troubleHtml() {
 
 function refreshCard() {
   if (!CUR) { return; }
-  const card = boardEl.querySelector(".bcard[data-issue='" + CUR + "']");
+  const card = (VIEW === 'active' ? boardEl : document.getElementById('completed-list')).querySelector(".bcard[data-issue='" + CUR + "']");
   if (!card) { return; }
   CARD.state = card.getAttribute('data-state') || CARD.state;
   CARD.text = card.getAttribute('data-state-text') || CARD.text;
   CARD.title = card.getAttribute('data-title') || CARD.title;
   CARD.agent = card.getAttribute('data-agent') === '1';
+  CARD.approved = card.getAttribute('data-approved') === '1';
   CARD.pr = card.getAttribute('data-pr') || '';
   CARD.prNum = card.getAttribute('data-pr-num') || '';
 }
 
-function actionsHtml() { return ""; }
-function renderActions() {}
+function actionsHtml() {
+  if (!CARD) { return ''; }
+  let inner;
+  if (CARD.closed) {
+    return "<section class='actions' id='actions'><p class='an'>Issue 已完成，可在此查看详情和本地日志。无需再次派发或批准。</p></section>";
+  }
+  if (!WRITABLE) {
+    inner = "<p class='an'>写操作未启用：服务端未配置 GitHub 凭据（SYMPHONY_WORKFLOW / SYMPHONY_ENV）。</p>";
+  } else if (CARD.agent && CARD.approved) {
+    inner = "<p class='an'>agent 与 merge-approved 同时存在，Symphony 已停止执行并记录异常；摘掉其中一个标签可恢复对应流程。</p>"
+      + "<div class='abtns'>"
+      + "<button class='abtn warn' data-act='remove' data-label='agent'" + (BUSY ? ' disabled' : '') + ">摘掉 agent</button>"
+      + "<button class='abtn warn' data-act='remove' data-label='merge-approved'" + (BUSY ? ' disabled' : '') + ">摘掉 merge-approved</button>"
+      + "</div>";
+  } else if (CARD.agent) {
+    const running = CARD.state === 'running';
+    const label = running ? '停止' : '暂停派发';
+    const tone = running ? 'danger' : 'warn';
+    inner = "<p class='an'>操作直接写 GitHub 标签；摘标签会在下个轮询周期终止正在运行的任务。</p>"
+      + "<div class='abtns'><button class='abtn " + tone + "' data-act='remove' data-label='agent'"
+      + (BUSY ? ' disabled' : '') + ">" + (BUSY ? '正在提交…' : label) + "</button></div>";
+  } else if (CARD.approved) {
+    inner = "<p class='an'>merge-approved 已授权合并已发布的交付 SHA；agent 会校验 CI 与 review gate 后执行 squash 合并。</p>"
+      + "<div class='abtns'>"
+      + "<button class='abtn warn' data-act='remove' data-label='merge-approved'" + (BUSY ? ' disabled' : '') + ">"
+      + (BUSY ? '正在提交…' : '撤销合并授权') + "</button></div>";
+  } else if (FORM_OPEN) {
+    inner = "<p class='an'>重新执行前建议留一条说明：agent 启动后会读取 issue 评论，知道这次要做什么、上次为何失败。</p>"
+      + "<textarea id='acomment' class='acmt' rows='3' maxlength='4000' "
+      + "placeholder='可选：这次要做什么 / 上次的问题是什么'>" + escHtml(DRAFT_COMMENT) + "</textarea>"
+      + "<div class='abtns'>"
+      + "<button class='abtn ok' data-act='add' data-label='agent'" + (BUSY ? ' disabled' : '') + ">"
+      + (BUSY ? '正在提交…' : '发布并执行') + "</button>"
+      + "<button class='abtn' data-cancel='1'" + (BUSY ? ' disabled' : '') + ">取消</button>"
+      + "</div>";
+  } else {
+    const approve = CARD.pr
+      ? "<button class='abtn ok' data-approve='1'" + (BUSY ? ' disabled' : '') + ">"
+        + (BUSY ? '正在提交…' : '批准合并') + "</button>"
+      : "";
+    const openLabel = CARD.state === 'awaiting' ? '重新执行…' : '开始执行…';
+    inner = "<p class='an'>批准合并会加 merge-approved 标签，授权 agent 合并已发布的交付（校验 CI 与 head 后执行）；"
+      + "执行类操作加 agent 标签，调度器会在下个轮询周期领取。</p>"
+      + "<div class='abtns'>" + approve
+      + "<button class='abtn' data-open='1'" + (BUSY ? ' disabled' : '') + ">" + openLabel + "</button></div>";
+  }
+  return "<section class='actions' id='actions'><p class='at'>在看板操作 GitHub 标签</p>" + inner + "</section>";
+}
+
+function renderActions() {
+  const el = document.getElementById('actions');
+  if (!el) { return; }
+  const active = document.activeElement;
+  if (active && active.id === 'acomment') { return; }
+  el.outerHTML = actionsHtml();
+}
+
+async function approveMerge() {
+  if (!CUR || BUSY || !CARD.pr) { return; }
+  if (!confirm('批准合并 PR #' + CARD.prNum + '？会给 issue 加 merge-approved 标签，'
+    + 'agent 校验 CI 与已发布交付的 head 后执行 squash 合并并关闭 issue。合并不可逆，新提交需重新交付并重新授权。')) { return; }
+  BUSY = true;
+  renderActions();
+  try {
+    const res = await fetch('/api/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ issue: CUR })
+    });
+    let data = {};
+    try { data = await res.json(); } catch (err) { }
+    if (!res.ok) { throw new Error(data.error || ('HTTP ' + res.status)); }
+    toast(data.message || '已加 merge-approved 标签');
+    await refreshIssues();
+    refreshCard();
+    await loadRuns(true);
+  } catch (err) {
+    toast(err.message || '操作失败', true);
+  } finally {
+    BUSY = false;
+    renderActions();
+  }
+}
+
+async function labelAction(action, label) {
+  if (!CUR || BUSY) { return; }
+  label = label || 'agent';
+  const input = document.getElementById('acomment');
+  const comment = action === 'add' && input ? input.value.trim() : '';
+  const running = CARD.state === 'running';
+  let verb;
+  if (action === 'add' && label === 'agent') {
+    verb = comment
+      ? '发布说明并给 ' + CUR + ' 加上 agent 标签？调度器会在下个轮询周期开始执行（改代码，可能推 PR）。'
+      : '没有填写说明，直接给 ' + CUR + ' 加 agent 标签？agent 可能重复上次的做法。';
+  } else if (action === 'add') {
+    verb = '给 ' + CUR + ' 加 merge-approved 标签？';
+  } else if (label === 'agent') {
+    verb = running
+      ? '摘掉 ' + CUR + ' 的 agent 标签？调度器会在下个轮询周期终止正在运行的任务。'
+      : '摘掉 ' + CUR + ' 的 agent 标签？调度器不会再派发它。';
+  } else {
+    verb = '摘掉 ' + CUR + ' 的 merge-approved 标签？尚未发出的合并请求会被撤销。';
+  }
+  if (!confirm(verb)) { return; }
+  if (action === 'add') { DRAFT_COMMENT = comment; }
+  BUSY = true;
+  renderActions();
+  try {
+    const res = await fetch('/api/label', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ issue: CUR, action: action, label: label, comment: comment })
+    });
+    let data = {};
+    try { data = await res.json(); } catch (err) { }
+    if (!res.ok) { throw new Error(data.error || ('HTTP ' + res.status)); }
+    toast(data.message || '已提交');
+    FORM_OPEN = false;
+    DRAFT_COMMENT = '';
+    await refreshIssues();
+    refreshCard();
+    await loadRuns(true);
+  } catch (err) {
+    toast(err.message || '操作失败', true);
+  } finally {
+    BUSY = false;
+    renderActions();
+  }
+}
 
 function noteBoxHtml() {
   const st = CARD.state;
   let title = CARD.text, body = '';
-  if (st === 'running' && AGENT) {
+  if (CARD.closed) {
+    title = '已完成';
+    body = '完成于 ' + escHtml(CARD.completedAt) + '（北京时间）。GitHub Issue 已关闭，不代表已独立核实 PR 合并。'
+      + (CARD.description ? "<details class='completed-description'><summary>Issue 内容</summary><pre>" + escHtml(CARD.description) + '</pre></details>' : '');
+  } else if (st === 'running' && AGENT) {
     title = '正在执行';
     body = '▸ ' + escHtml(AGENT.message || AGENT.event || 'agent 运行中')
       + (AGENT.event_at ? ' · ' + ago(AGENT.event_at) + '前' : '')
@@ -486,7 +656,7 @@ function noteBoxHtml() {
     body = '调度器会在退避窗口结束后重新尝试。' + troubleHtml();
   } else if (st === 'awaiting') {
     title = '等待合并';
-    body = 'PR 已开，等待人工 review / 合并；合并并关闭 issue 后卡片会从看板消失。';
+    body = 'PR 已开，等待人工 review；确认交付评论后可点“批准合并”（加 merge-approved），agent 校验 CI 后执行合并并关闭 issue。';
   } else if (st === 'ready') {
     title = '等待派发';
     body = 'Issue 带有 agent 标签，调度器会在下个轮询周期领取。';
@@ -727,6 +897,9 @@ dheadEl.addEventListener('click', function (e) {
 
 dbodyEl.addEventListener('click', function (e) {
   if (e.target.closest('#dclose')) { closeDrawer(); return; }
+  if (e.target.closest('[data-approve]')) { approveMerge(); return; }
+  const act = e.target.closest('[data-act]');
+  if (act) { labelAction(act.getAttribute('data-act'), act.getAttribute('data-label')); return; }
   if (e.target.closest('[data-open]')) {
     FORM_OPEN = true;
     renderActions();
@@ -781,7 +954,95 @@ document.addEventListener('scroll', function (e) {
   }
 }, true);
 
+let VIEW = 'active', COMPLETED = [], COMPLETED_DAY = '', COMPLETED_WARNING = '';
+let COMPLETED_LOADING = false, COMPLETED_LOADED_AT = 0;
+
+function renderCompleted() {
+  const list = document.getElementById('completed-list');
+  if (!list) { return; }
+  const q = (document.getElementById('q').value || '').trim().toLowerCase().replace(/^#/, '');
+  const visible = COMPLETED.filter(function (issue) {
+    return (VIEW !== 'today' || issue.day === COMPLETED_DAY)
+      && (!q || ('gh-' + issue.number + ' ' + issue.title).toLowerCase().includes(q));
+  });
+  document.getElementById('completed-status').textContent = COMPLETED_LOADING ? '正在读取已完成 Issue…' : COMPLETED_WARNING;
+  document.getElementById('completed-count').textContent = (VIEW === 'today' ? COMPLETED_DAY + ' · 今日' : '历史')
+    + '已完成 ' + visible.length + ' 个 Issue（北京时间）';
+  list.innerHTML = visible.map(function (issue) {
+    const name = 'GH-' + issue.number;
+    return "<article class='bcard idle completed-card' tabindex='0' role='button' data-issue='" + name
+      + "' data-title='" + escHtml(issue.title) + "' data-url='" + escHtml(issue.url)
+      + "' data-state='idle' data-state-text='已完成' data-closed='1' data-completed-at='"
+      + escHtml(issue.completed_at) + "' data-description='" + escHtml(issue.body || '') + "'>"
+      + "<div class='completed-card-head'><span class='bid'>" + name + "</span><span class='completed-badge'>已完成</span></div>"
+      + "<div class='btitle'>" + escHtml(issue.title) + "</div><div class='completed-time'>完成于 "
+      + escHtml(issue.completed_at) + "</div><div class='completed-hint'>查看详情与运行日志 ›</div></article>";
+  }).join('') || (COMPLETED_LOADING ? '' : "<div class='empty-col'>" + (COMPLETED_WARNING ? '暂无可显示数据，请重试。' : '当前筛选没有已完成的 Issue。') + "</div>");
+  markSel();
+}
+
+async function loadCompleted(force) {
+  if (COMPLETED_LOADING) { return; }
+  if (!force && Date.now() - COMPLETED_LOADED_AT < 60000) { renderCompleted(); return; }
+  COMPLETED_LOADING = true;
+  renderCompleted();
+  try {
+    const res = await fetch('/api/completed');
+    if (!res.ok) { throw new Error('HTTP ' + res.status); }
+    const data = await res.json();
+    COMPLETED = data.issues || [];
+    COMPLETED_DAY = data.today || '';
+    COMPLETED_WARNING = data.warning || '';
+    COMPLETED_LOADED_AT = Date.now();
+  } catch (err) {
+    COMPLETED_WARNING = '已完成 Issue 读取失败，请点击刷新重试。' + (COMPLETED.length ? ' 当前展示上次数据。' : '');
+  } finally {
+    COMPLETED_LOADING = false;
+    renderCompleted();
+  }
+}
+
+function switchView(view) {
+  if (!['active', 'today', 'history'].includes(view)) { view = 'active'; }
+  VIEW = view;
+  closeDrawer();
+  document.getElementById('board').hidden = view !== 'active';
+  document.getElementById('completed-panel').hidden = view === 'active';
+  document.getElementById('showEmpty').closest('label').hidden = view !== 'active';
+  document.querySelectorAll('[data-view]').forEach(function (button) {
+    button.classList.toggle('on', button.dataset.view === view);
+    button.setAttribute('aria-pressed', String(button.dataset.view === view));
+  });
+  document.querySelector('.head h1').textContent = view === 'active' ? 'Issue 工作台' : (view === 'today' ? '今日已完成 Issue' : '历史已完成 Issue');
+  const note = document.querySelector('.head .note');
+  if (!note.dataset.activeText) { note.dataset.activeText = note.textContent; }
+  note.textContent = view === 'active' ? note.dataset.activeText : '按 Issue 完成时间展示，点击卡片在当前页查看详情和运行日志。';
+  document.getElementById('q').placeholder = view === 'active' ? '搜索标题、仓库或 #编号' : '搜索已完成 Issue 标题或编号';
+  document.getElementById('sum').hidden = view !== 'active';
+  const url = new URL(location.href);
+  url.searchParams.delete('scope');
+  if (view === 'active') { url.searchParams.delete('view'); }
+  else { url.searchParams.set('view', view); }
+  history.replaceState(null, '', url);
+  if (view !== 'active') { return loadCompleted(false); }
+}
+
+document.querySelectorAll('[data-view]').forEach(function (button) {
+  button.addEventListener('click', function () { switchView(button.dataset.view); });
+});
+document.getElementById('completed-refresh').addEventListener('click', function () { loadCompleted(true); });
+document.getElementById('completed-list').addEventListener('click', function (e) {
+  const card = e.target.closest('[data-issue]');
+  if (card) { openIssue(card.dataset.issue); }
+});
+document.getElementById('completed-list').addEventListener('keydown', function (e) {
+  const card = e.target.closest('[data-issue]');
+  if (card && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openIssue(card.dataset.issue); }
+});
+setInterval(function () { if (VIEW !== 'active') { loadCompleted(false); } }, 60000);
+
 function applyFilter() {
+  if (VIEW !== 'active') { renderCompleted(); }
   const q = (document.getElementById('q').value || '').trim().toLowerCase().replace(/^#/, '');
   COLS.forEach(function (k) {
     const body = document.getElementById('col-' + k);
@@ -823,6 +1084,7 @@ async function refreshIssues() {
     const res = await fetch('/api/issues');
     if (!res.ok) { return; }
     const data = await res.json();
+    WRITABLE = data.writable === true;
     for (const k of COLS) {
       const body = document.getElementById('col-' + k);
       if (body) { body.innerHTML = data.cols[k] || ''; }
@@ -856,8 +1118,14 @@ document.addEventListener('keydown', function (e) {
 });
 applyFilter();
 
-const fromUrl = new URLSearchParams(location.search).get('issue');
-if (fromUrl) { openIssue(fromUrl); }
+const initialParams = new URLSearchParams(location.search);
+const fromUrl = initialParams.get('issue');
+const initialView = initialParams.get('view');
+if (initialView && initialView !== 'active') {
+  Promise.resolve(switchView(initialView === 'completed' ? 'history' : initialView)).then(function () {
+    if (fromUrl) { openIssue(fromUrl); }
+  });
+} else if (fromUrl) { openIssue(fromUrl); }
 </script>
 """
 
@@ -1142,12 +1410,22 @@ def github_request(method, path, token, body=None, timeout=10):
     return json.loads(raw) if raw else {}
 
 
-def issue_trusted(repo, token, number):
+def fetch_issue(repo, token, number):
     try:
-        issue = github_request("GET", "/repos/%s/issues/%s" % (repo, number), token)
+        return github_request("GET", "/repos/%s/issues/%s" % (repo, number), token)
     except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
-        return False
+        return None
+
+
+def issue_trusted(issue):
     return (issue.get("author_association") or "").upper() in TRUSTED_ASSOCIATIONS
+
+
+def clear_github_cache():
+    _cache["issues"] = None
+    _cache["issues_at"] = 0.0
+    _pulls_cache["data"] = None
+    _pulls_cache["at"] = 0.0
 
 
 def symphony_state():
@@ -1333,7 +1611,7 @@ def status_of(issue, labels, agent, has_pr=False):
 
 
 def build_cards():
-    repo, _ = load_tracker()
+    repo, token = load_tracker()
     issues = github_issues()
     if issues is None:
         return None
@@ -1382,6 +1660,7 @@ def build_cards():
         title = issue.get("title") or ""
         gen = "<span class='bgen'>%d 次</span>" % runs if runs else ""
         has_agent = any(label.lower() == "agent" for label in labels)
+        has_approved = any(label.lower() == "merge-approved" for label in labels)
         pr_html = ""
         pr_url = ""
         pr_number = ""
@@ -1403,7 +1682,7 @@ def build_cards():
                 "html": (
                     "<div class='bcard %(state)s%(live)s' data-issue='%(name)s' "
                     "data-title='%(title)s' data-url='%(url)s' data-state='%(state)s' "
-                    "data-state-text='%(text)s' data-agent='%(agent)s' "
+                    "data-state-text='%(text)s' data-agent='%(agent)s' data-approved='%(approved)s' "
                     "data-pr='%(prurl)s' data-pr-num='%(prnum)s' data-search='%(search)s'>"
                     "<div class='btitle'>%(title)s</div>"
                     "<div class='bmeta'>"
@@ -1422,6 +1701,7 @@ def build_cards():
                     "url": esc(issue.get("html_url")),
                     "text": esc(STATUS_TEXT[st]),
                     "agent": "1" if has_agent else "0",
+                    "approved": "1" if has_approved else "0",
                     "prurl": esc(pr_url),
                     "prnum": esc(pr_number),
                     "search": esc(search),
@@ -1446,6 +1726,7 @@ def build_cards():
         "total": len(rendered),
         "with_runs": with_runs,
         "repo": repo or "-",
+        "writable": bool(repo and token),
     }
 
 
@@ -1471,7 +1752,7 @@ def issues_page():
             "<span>GitHub 不可用 · 仅显示本地记录</span></div></header>"
             "<div class='head'><div class='hrow'><h1>Issue 工作台</h1>"
             "<span class='sum'>%d 个有记录的 issue</span></div>"
-            "<div class='note'>GitHub issues unavailable; showing recorded runs only</div></div>"
+            "<div class='note'>GitHub issues unavailable; showing recorded runs only · <a href='/history'>今日完成 / 历史记录</a></div></div>"
             "<div class='tools'><div class='chips'><span class='chip on'>全部 <b>%d</b></span></div></div>"
             "<main class='board' id='board'>%s</main></div>"
             % (ACTIVITY_ICON, len(sessions), len(sessions),
@@ -1518,15 +1799,25 @@ def issues_page():
         "</header>"
         "<div class='head'><div class='hrow'><h1>Issue 工作台</h1>"
         "<span class='sum' id='sum'>%s</span></div>"
-        "<div class='note'>业务状态来自 Symphony 的 agent 标签与本地运行状态（最近一次对账）；"
-        "点击卡片查看历次运行与实时日志，Running/Retrying 等执行状态只记录在本机。</div></div>"
+        "<div class='note'>业务状态来自 Symphony 的 agent / merge-approved 标签与本地运行状态（最近一次对账）；"
+        "点击卡片可查看历次运行、实时日志，并直接操作 agent / merge-approved 标签（Running/Retrying 等执行状态只记录在本机）。</div></div>"
         "<div class='tools'>"
         "<div class='chips'><button class='chip on' data-repo=''>全部 "
         "<b id='chipAll'>%d</b></button>%s</div>"
+        "<div class='view-tabs' role='group' aria-label='Issue 视图'>"
+        "<button class='chip on' data-view='active' aria-pressed='true'>处理中</button>"
+        "<button class='chip' data-view='today' aria-pressed='false'>今日已完成</button>"
+        "<button class='chip' data-view='history' aria-pressed='false'>历史已完成</button></div>"
         "<label class='chk'><input type='checkbox' id='showEmpty' checked>显示空列</label>"
         "<div class='search'>%s<input id='q' placeholder='搜索标题、仓库或 #编号' autocomplete='off'></div>"
         "</div>"
-        "<main class='board' id='board'>%s</main>"
+        "<main class='board' id='board' data-writable='%s'>%s</main>"
+        "<main class='completed-panel' id='completed-panel' hidden>"
+        "<div class='completed-toolbar'><b id='completed-count'></b>"
+        "<button class='chip' id='completed-refresh'>刷新</button></div>"
+        "<p class='completed-note'>仅展示已关闭且未标记为“放弃处理”的 Issue，不包含待审核交付、暂停或失败记录。点击卡片在当前页查看。</p>"
+        "<p id='completed-status' role='status' aria-live='polite'></p>"
+        "<div class='completed-list' id='completed-list'></div></main>"
         "</div>"
         "<div id='shade' onclick='closeDrawer()'></div>"
         "<div id='toast'></div>"
@@ -1543,12 +1834,70 @@ def issues_page():
         data["total"],
         repo_chip,
         SEARCH_ICON,
+        "1" if data.get("writable") else "0",
         "".join(col_html),
     )
     return page(
         "Symphony",
         shell + BOARD,
     )
+
+
+_history_cache = {"repo": None, "at": 0.0, "events": None}
+
+
+def github_history():
+    """Completed issues, not workflow attempts or agent-session endings."""
+    repo, token = load_tracker()
+    if not repo or not token:
+        return [], "GitHub 未配置，无法读取已完成 Issue。"
+    if (_history_cache["repo"] == repo and _history_cache["events"] is not None
+            and time.time() - _history_cache["at"] < ISSUE_CACHE_TTL):
+        return _history_cache["events"], _history_cache.get("warning", "")
+    events = []
+    limited = False
+    try:
+        for page_number in range(1, 11):
+            rows = github_request(
+                "GET", "/repos/%s/issues?state=closed&sort=updated&direction=desc&per_page=100&page=%d"
+                % (repo, page_number), token
+            )
+            if not isinstance(rows, list):
+                raise ValueError("invalid GitHub history response")
+            for row in rows:
+                if "pull_request" in row or row.get("state_reason") == "not_planned":
+                    continue
+                if row.get("state") != "closed" or not row.get("closed_at"):
+                    continue
+                events.append({
+                    "number": row["number"], "title": row.get("title") or "",
+                    "at": row["closed_at"], "url": row.get("html_url") or "",
+                    "body": (row.get("body") or "")[:16000],
+                })
+            if len(rows) < 100:
+                break
+        else:
+            limited = True
+        events.sort(key=lambda event: event["at"], reverse=True)
+        warning = "仅扫描最近更新的 1000 条已关闭条目（含 PR）；更早记录请到 GitHub 查看。" if limited else ""
+        _history_cache.update(repo=repo, at=time.time(), events=events, warning=warning)
+        return events, warning
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
+        old = _history_cache["events"] if _history_cache["repo"] == repo else None
+        return old or [], "GitHub 已完成记录读取失败；显示上次缓存（如有），请稍后重试。"
+
+
+def completed_data():
+    events, warning = github_history()
+    today = datetime.now(CN).date().isoformat()
+    issues = []
+    for event in events:
+        timestamp = parse_ts(event["at"])
+        if timestamp is None:
+            continue
+        issues.append({**event, "day": timestamp.astimezone(CN).date().isoformat(),
+                       "completed_at": fmt_dt(event["at"])})
+    return {"issues": issues, "today": today, "warning": warning}
 
 
 def issue_page(name):
@@ -2248,6 +2597,15 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/tail/"):
             return self.handle_tail(path[len("/api/tail/") :], query)
 
+        if path == "/history":
+            self.send_response(302)
+            self.send_header("Location", "/?view=completed&scope=all")
+            self.end_headers()
+            return
+
+        if path == "/api/completed":
+            return self.send_json(200, completed_data())
+
         if path == "/api/issues":
             return self.handle_issues()
 
@@ -2290,7 +2648,191 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_text(404, "not found")
 
     def do_POST(self):
-        return self.send_json(410, {"error": "看板为只读。请在 GitHub Issue 上使用 agent / merge-approved 标签。"})
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/label":
+            return self.handle_label()
+        if parsed.path == "/api/approve":
+            return self.handle_approve()
+        return self.send_json(404, {"error": "not found"})
+
+    def write_guard(self):
+        origin = self.headers.get("Origin") or ""
+        if origin and urlparse(origin).netloc != (self.headers.get("Host") or ""):
+            self.send_json(403, {"error": "拒绝跨站请求"})
+            return False
+        site = self.headers.get("Sec-Fetch-Site") or ""
+        if site and site not in ("same-origin", "none"):
+            self.send_json(403, {"error": "拒绝跨站请求"})
+            return False
+        return True
+
+    def read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 4096:
+            self.send_json(400, {"error": "请求体为空或过大"})
+            return None
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self.send_json(400, {"error": "请求体不是合法 JSON"})
+            return None
+
+    def issue_number(self, value):
+        issue = str(value or "")
+        if not ISSUE_RE.match(issue) or not issue.startswith(IDENTIFIER_PREFIX):
+            return None
+        number_text = issue[len(IDENTIFIER_PREFIX):]
+        return int(number_text) if number_text.isdigit() else None
+
+    def handle_approve(self):
+        """批准合并：写 merge-approved 标签（先摘掉互斥的 agent），授权入口仍是标签事件。"""
+        if not self.write_guard():
+            return
+        payload = self.read_json_body()
+        if payload is None:
+            return
+        number = self.issue_number(payload.get("issue"))
+        if number is None:
+            return self.send_json(400, {"error": "issue 标识不合法"})
+        repo, token = load_tracker()
+        if not repo or not token:
+            return self.send_json(503, {"error": "GitHub 未配置"})
+        issue = fetch_issue(repo, token, number)
+        if issue is None:
+            return self.send_json(502, {"error": "读取 issue 失败"})
+        if not issue_trusted(issue):
+            return self.send_json(403, {"error": "该 issue 作者不在受信任范围"})
+        if (issue.get("state") or "") != "open":
+            return self.send_json(400, {"error": "issue 不是 open 状态，无法授权合并"})
+        labels = {str(l.get("name") or "").lower() for l in issue.get("labels") or []}
+        pull = github_pulls().get(number)
+        if not pull:
+            return self.send_json(400, {"error": "没有找到关联的 open PR；确认交付评论已发布"})
+        pr_number = pull.get("number")
+        try:
+            pr = github_request("GET", "/repos/%s/pulls/%s" % (repo, pr_number), token)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+            return self.send_json(502, {"error": "读取 PR 失败 GitHub %s: %s" % (exc.code, detail)})
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+            return self.send_json(502, {"error": "读取 PR 失败: %s" % exc})
+        if (pr.get("state") or "") != "open":
+            return self.send_json(400, {"error": "PR 不是 open 状态，无法授权合并"})
+        if pr.get("draft"):
+            return self.send_json(400, {"error": "PR 仍是草稿，先在 GitHub 标记为 ready for review"})
+        head_sha = ((pr.get("head") or {}).get("sha") or "").strip()
+        if "agent" in labels:
+            try:
+                github_request("DELETE", "/repos/%s/issues/%s/labels/agent" % (repo, number), token)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    detail = exc.read().decode("utf-8", "replace")[:200]
+                    return self.send_json(502, {"error": "摘掉 agent 标签失败 GitHub %s: %s" % (exc.code, detail)})
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                return self.send_json(502, {"error": "摘掉 agent 标签失败: %s" % exc})
+        try:
+            github_request(
+                "POST", "/repos/%s/issues/%s/labels" % (repo, number), token, {"labels": ["merge-approved"]}
+            )
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+            return self.send_json(502, {"error": "添加 merge-approved 失败 GitHub %s: %s" % (exc.code, detail)})
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+            return self.send_json(502, {"error": "添加 merge-approved 失败: %s" % exc})
+        clear_github_cache()
+        message = "已加 merge-approved（PR #%s%s），agent 会校验 CI 与交付 head 后执行 squash 合并" % (
+            pr_number,
+            " @ %s" % head_sha[:8] if head_sha else "",
+        )
+        return self.send_json(200, {"ok": True, "pr": pr_number, "sha": head_sha, "message": message})
+
+    def handle_label(self):
+        """加 / 摘 agent 或 merge-approved 标签，可选先发一条 issue 评论。"""
+        if not self.write_guard():
+            return
+        payload = self.read_json_body()
+        if payload is None:
+            return
+        action = payload.get("action")
+        label = str(payload.get("label") or "agent").lower()
+        comment = str(payload.get("comment") or "").strip()
+        if label not in ("agent", "merge-approved"):
+            return self.send_json(400, {"error": "只允许修改 agent / merge-approved 标签"})
+        if action not in ("add", "remove"):
+            return self.send_json(400, {"error": "action 必须是 add 或 remove"})
+        if len(comment) > 4000:
+            return self.send_json(400, {"error": "说明过长（上限 4000 字）"})
+        number = self.issue_number(payload.get("issue"))
+        if number is None:
+            return self.send_json(400, {"error": "issue 标识不合法"})
+        repo, token = load_tracker()
+        if not repo or not token:
+            return self.send_json(503, {"error": "GitHub 未配置"})
+        issue = fetch_issue(repo, token, number)
+        if issue is None:
+            return self.send_json(502, {"error": "读取 issue 失败"})
+        if not issue_trusted(issue):
+            return self.send_json(403, {"error": "该 issue 作者不在受信任范围"})
+        if action == "add" and (issue.get("state") or "") != "open":
+            return self.send_json(400, {"error": "issue 不是 open 状态，调度器不会派发"})
+        labels = {str(l.get("name") or "").lower() for l in issue.get("labels") or []}
+        posted = False
+        if comment:
+            try:
+                github_request("POST", "/repos/%s/issues/%s/comments" % (repo, number), token, {"body": comment})
+                posted = True
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+                return self.send_json(502, {"error": "评论发布失败 GitHub %s: %s" % (exc.code, detail)})
+            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+                return self.send_json(502, {"error": "评论发布失败: %s" % exc})
+        other = "merge-approved" if label == "agent" else "agent"
+        if action == "add" and other in labels:
+            # 两个执行标签互斥：加其中一个前先摘掉另一个。
+            try:
+                github_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, other), token)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    detail = exc.read().decode("utf-8", "replace")[:200]
+                    prefix = "评论已发布，但" if posted else ""
+                    return self.send_json(
+                        502, {"error": "%s摘掉 %s 标签失败 GitHub %s: %s" % (prefix, other, exc.code, detail)}
+                    )
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                prefix = "评论已发布，但" if posted else ""
+                return self.send_json(502, {"error": "%s摘掉 %s 标签失败: %s" % (prefix, other, exc)})
+        try:
+            if action == "add":
+                github_request("POST", "/repos/%s/issues/%s/labels" % (repo, number), token, {"labels": [label]})
+            else:
+                github_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, label), token)
+        except urllib.error.HTTPError as exc:
+            if action == "remove" and exc.code == 404:
+                pass
+            else:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+                prefix = "评论已发布，但标签操作失败：" if posted else ""
+                return self.send_json(502, {"error": prefix + "GitHub %s: %s" % (exc.code, detail)})
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            prefix = "评论已发布，但标签操作失败：" if posted else ""
+            return self.send_json(502, {"error": prefix + "GitHub 请求失败: %s" % exc})
+        clear_github_cache()
+        if action == "add" and label == "agent":
+            message = (
+                "已发布说明并加入 agent 标签，调度器会在下个轮询周期派发"
+                if posted
+                else "已加入 agent 标签，调度器会在下个轮询周期派发"
+            )
+        elif action == "remove" and label == "agent":
+            message = "已移除 agent 标签，调度器会在下个轮询周期停止该任务"
+        elif action == "add":
+            message = "已加入 merge-approved 标签，agent 会校验后执行合并"
+        else:
+            message = "已移除 merge-approved 标签，尚未发出的合并请求会被撤销"
+        return self.send_json(200, {"ok": True, "message": message, "commented": posted})
 
     def handle_tail(self, issue, query):
         if not ISSUE_RE.match(issue or ""):
@@ -2362,7 +2904,7 @@ class Handler(BaseHTTPRequestHandler):
                     "with_runs": data["with_runs"],
                 },
                 "repo": data["repo"],
-                "writable": False,
+                "writable": bool(data.get("writable")),
                 "updated": datetime.now(CN).strftime("%H:%M:%S"),
             },
         )

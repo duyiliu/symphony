@@ -21,7 +21,14 @@ def fixture_cards():
     counts = {key: 0 for key in cols}
     cols["awaiting"] = "<div class='bcard' data-issue='GH-1'>Test issue</div>"
     counts["awaiting"] = 1
-    return {"cols": cols, "counts": counts, "total": 1, "with_runs": 0, "repo": "example/repo"}
+    return {
+        "cols": cols,
+        "counts": counts,
+        "total": 1,
+        "with_runs": 0,
+        "repo": "example/repo",
+        "writable": True,
+    }
 
 
 class LaneParser(HTMLParser):
@@ -117,15 +124,142 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         payload = json.loads(body)
         self.assertEqual(payload["counts"]["awaiting"], 1)
-        self.assertFalse(payload["writable"])
+        self.assertTrue(payload["writable"])
+        self.assertIn("data-writable='1'", self.request("GET", "/")[1])
 
-    def test_legacy_write_endpoints_are_gone_even_with_valid_token(self):
-        with patch.dict(os.environ, {"SYMPHONY_BOARD_TOKEN": "test-secret"}):
-            for endpoint in ("/api/label", "/api/approve"):
-                for headers in ({}, {"X-Board-Token": "test-secret"}):
-                    status, body = self.request("POST", endpoint, "{}", headers)
-                    self.assertEqual(status, 410)
-                    self.assertIn("merge-approved", json.loads(body)["error"])
+    def test_label_rejects_cross_site_requests(self):
+        for endpoint in ("/api/label", "/api/approve"):
+            status, body = self.request(
+                "POST", endpoint, "{}", {"Origin": "http://evil.example"}
+            )
+            self.assertEqual(status, 403)
+            self.assertIn("跨站", json.loads(body)["error"])
+        self.github_mock.assert_not_called()
+
+    def test_label_validates_payload_and_credentials(self):
+        status, body = self.request("POST", "/api/label", "not-json")
+        self.assertEqual(status, 400)
+        bad_payloads = (
+            {"issue": "GH-1", "action": "add", "label": "bug"},
+            {"issue": "GH-1", "action": "toggle", "label": "agent"},
+            {"issue": "jira-1", "action": "add", "label": "agent"},
+            {"issue": "GH-x", "action": "add", "label": "agent"},
+        )
+        for payload in bad_payloads:
+            status, _ = self.request(
+                "POST", "/api/label", json.dumps(payload)
+            )
+            self.assertEqual(status, 400)
+        with patch.object(board, "load_tracker", return_value=("", "")):
+            status, body = self.request(
+                "POST",
+                "/api/label",
+                json.dumps({"issue": "GH-1", "action": "add", "label": "agent"}),
+            )
+        self.assertEqual(status, 503)
+        self.assertIn("GitHub 未配置", json.loads(body)["error"])
+        self.github_mock.assert_not_called()
+
+    def test_write_endpoints_enforce_trust_and_open_pr(self):
+        outsider = {"author_association": "CONTRIBUTOR", "state": "open", "labels": []}
+        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
+            board, "fetch_issue", return_value=outsider
+        ):
+            status, body = self.request(
+                "POST",
+                "/api/label",
+                json.dumps({"issue": "GH-1", "action": "add", "label": "agent"}),
+            )
+            self.assertEqual(status, 403)
+            status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
+            self.assertEqual(status, 403)
+        member = {"author_association": "MEMBER", "state": "open", "labels": []}
+        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
+            board, "fetch_issue", return_value=member
+        ), patch.object(board, "github_pulls", return_value={}):
+            status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
+        self.assertEqual(status, 400)
+        self.assertIn("open PR", json.loads(body)["error"])
+        self.github_mock.assert_not_called()
+
+    def test_label_add_swaps_mutually_exclusive_label(self):
+        member = {
+            "author_association": "MEMBER",
+            "state": "open",
+            "labels": [{"name": "merge-approved"}],
+        }
+        calls = []
+
+        def fake_request(method, path, token, body=None, timeout=10):
+            calls.append((method, path, body))
+            return {}
+
+        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
+            board, "fetch_issue", return_value=member
+        ), patch.object(board, "github_request", side_effect=fake_request):
+            status, body = self.request(
+                "POST",
+                "/api/label",
+                json.dumps({"issue": "GH-1", "action": "add", "label": "agent"}),
+            )
+        self.assertEqual(status, 200)
+        self.assertIn("agent", json.loads(body)["message"])
+        self.assertEqual(
+            calls,
+            [
+                ("DELETE", "/repos/example/repo/issues/1/labels/merge-approved", None),
+                ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["agent"]}),
+            ],
+        )
+        self.assertIsNone(board._cache["issues"])
+
+    def test_approve_posts_merge_approved_after_dropping_agent(self):
+        member = {
+            "author_association": "MEMBER",
+            "state": "open",
+            "labels": [{"name": "agent"}],
+        }
+        pull = {"number": 7, "url": "https://example/pr/7", "draft": False, "title": "t"}
+        pr = {"state": "open", "draft": False, "head": {"sha": "abcd1234e5"}}
+        calls = []
+
+        def fake_request(method, path, token, body=None, timeout=10):
+            calls.append((method, path, body))
+            if path == "/repos/example/repo/pulls/7":
+                return pr
+            return {}
+
+        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
+            board, "fetch_issue", return_value=member
+        ), patch.object(board, "github_pulls", return_value={1: pull}), patch.object(
+            board, "github_request", side_effect=fake_request
+        ):
+            status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["pr"], 7)
+        self.assertEqual(
+            calls,
+            [
+                ("GET", "/repos/example/repo/pulls/7", None),
+                ("DELETE", "/repos/example/repo/issues/1/labels/agent", None),
+                ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["merge-approved"]}),
+            ],
+        )
+        self.assertIn("merge-approved", payload["message"])
+
+    def test_completed_is_inline_and_history_bookmark_redirects(self):
+        with patch.object(board, "github_history", return_value=([], "")):
+            status, body = self.request("GET", "/api/completed")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["issues"], [])
+        self.assertEqual(self.request("GET", "/history")[0], 302)
+        status, document = self.request("GET", "/")
+        self.assertIn("data-view='today'", document)
+        self.assertIn("data-view='history'", document)
+        self.assertIn("id='completed-panel'", document)
+        self.assertNotIn("href='/history'", document)
+        self.assertIn("@media(max-width:640px)", document)
         self.github_mock.assert_not_called()
 
     def test_invalid_run_reference_and_unknown_route(self):
