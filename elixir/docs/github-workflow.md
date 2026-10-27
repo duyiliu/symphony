@@ -18,7 +18,8 @@
 - `agent` 与 `needs-human` 同时出现一律 fail closed：不派发并记录异常日志。
 - 无执行标签不派发；Closed Issue 不再启动任务。
 - 人工恢复执行（移除 `needs-human`、重加 `agent`）**不等于合并授权**；合并前宿主重新核验
-  当前 SHA 的检查与有效 Review Approval。PR head 变更、审批撤销/过期都会重新核验。
+  当前 SHA 的检查与有效 Review Approval。PR head 变更、审批撤销/过期都会重新核验；新周期首次
+  准入时宿主发布恢复评论，记录操作者与上次暂停原因。
 
 ## 核心流程
 
@@ -29,7 +30,7 @@
    **交付后不移除 `agent`**，同一 worker 继续完成合并。
 3. Agent 调用 `github_workflow(action="merge")`，宿主做确定性合并判定（不依赖模型声明"安全"）：
    - 最新 head SHA、目标分支、唯一 closing association 与交付记录一致；
-   - 配置的 `required_checks` 在该 SHA 上真实通过（未完成 → `waiting_checks`；失败 → `needs_repair`）；
+   - 当前 SHA 已报告的 GitHub checks 和 statuses 均通过（未完成 → `waiting_checks`；失败 → `needs_repair`）；没有检查时不单独阻止合并，必需检查由仓库分支保护配置保证；
    - GitHub `mergeStateStatus=CLEAN`、`reviewDecision` 不是 REVIEW_REQUIRED/CHANGES_REQUESTED
      （仓库已有分支保护与强制审核仍然生效；UNKNOWN 等待，DIRTY/BLOCKED/CHANGES_REQUESTED 走返修）；
    - 风险规则（见下）；命中规则或 `high-risk` 标签时，必须有该 PR **当前 head 上的有效
@@ -67,7 +68,6 @@
 | `enabled` | 默认关闭，显式设为 true 启用 |
 | `state_dir` | 宿主 JSON 记录绝对目录，不与 Workspace 重叠 |
 | `base_branch` | 必填，预期 PR 目标分支 |
-| `required_checks` | 必填非空列表，GitHub 实际 check/context 名称 |
 | `max_attempts` | 默认 3，限制同一标签事件的 worker 准入次数 |
 | `risk` | 可选，见上表 |
 
@@ -78,7 +78,7 @@ Pi 使用宿主工具需要启用 `runtime.mcp.enabled: true`。不再加载解�
 
 本实现按受信任环境运行，复用仓库现有标签写权限和 GitHub 凭据。
 不要求独立自动化账号、Agent sandbox 或额外审批人名单；也不要求事先给未保护分支新增保护规则。
-宿主仍检查配置的 CI 和 GitHub 合并状态，不主动绕过、修改或移除已有审核与分支保护规则。
+宿主检查已报告的 CI 和 GitHub 合并状态，不主动绕过、修改或移除已有审核与分支保护规则。
 
 通用 `github_api` 禁止添加授权标签、直接 merge、关闭 Issue 和仓库管理等操作，最终合并走宿主入口。
 这约束了该工具的调用，**不是对 Agent shell 或共享凭据的强隔离**。
@@ -93,7 +93,8 @@ Pi 使用宿主工具需要启用 `runtime.mcp.enabled: true`。不再加载解�
 - worker 启动准入计入预算；交付后 worker 中断会在预算内再次派发收尾合并，
   预算耗尽即暂停转人工。重启和普通评论不清零预算；同一周期重复发布不会重复评论。
 - 暂停后加/摘标签失败，也会进入现有 blocked 集合，停止续跑并释放运行名额。
-  轮询检查新标签事件，读取失败保持暂停；新人工事件可以开启新周期。
+  轮询检查新标签事件，读取失败保持暂停；新人工事件可以开启新周期，宿主在新周期首次准入时
+  发布恢复评论（操作者、上次暂停原因，并声明恢复不是合并授权）。
 - merge 请求前先保存 `pending_merge`。结果不确定时，下次调用先查询真实 PR 状态，不重复发 merge。
   待核实的合并记录不能被新交付覆盖；未确认合并则暂停交给人工。
 - 已关闭 Issue 不在候选集合中，其未完成收尾不会后台自动重放。管理员核对 GitHub 和 JSON 后，
