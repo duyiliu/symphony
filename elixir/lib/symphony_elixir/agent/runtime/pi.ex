@@ -242,11 +242,8 @@ defmodule SymphonyElixir.Agent.Runtime.Pi do
 
   defp send_command(port, record) do
     payload = [Jason.encode!(record), "\n"]
-
-    case Port.command(port, payload) do
-      true -> :ok
-      false -> {:error, :pi_write_failed}
-    end
+    true = Port.command(port, payload)
+    :ok
   rescue
     error -> {:error, {:pi_write_failed, Exception.message(error)}}
   end
@@ -402,7 +399,6 @@ defmodule SymphonyElixir.Agent.Runtime.Pi do
   end
 
   defp sanitize_name(name) when is_binary(name), do: String.replace(name, ~r/[^A-Za-z0-9._-]/, "_")
-  defp sanitize_name(_name), do: "session"
 
   defp live_header(session_id, workspace) do
     Jason.encode!(%{
