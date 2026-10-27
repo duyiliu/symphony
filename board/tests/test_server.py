@@ -88,6 +88,38 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(board.status_of("GH-1", ["agent", "needs-human"], None, True), "blocked")
         self.assertEqual(board.status_of("GH-1", ["merge-approved"], None, True), "awaiting")
 
+    def test_cards_render_pause_state_and_reason_from_labels(self):
+        issues = [
+            {"number": 1, "title": "Paused one", "state": "open", "updated_at": "2026-10-27T01:00:00Z",
+             "html_url": "https://github.com/o/r/issues/1",
+             "labels": [{"name": "needs-human"}]},
+            {"number": 2, "title": "Running one", "state": "open", "updated_at": "2026-10-27T02:00:00Z",
+             "html_url": "https://github.com/o/r/issues/2",
+             "labels": [{"name": "agent"}, {"name": "high-risk"}]},
+            {"number": 3, "title": "Idle one", "state": "open", "updated_at": "2026-10-27T03:00:00Z",
+             "html_url": "https://github.com/o/r/issues/3", "labels": []},
+        ]
+
+        with patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
+            board, "github_issues", return_value=issues
+        ), patch.object(board, "scan_sessions", return_value={}), patch.object(
+            board, "symphony_state", return_value=None
+        ), patch.object(board, "github_pulls", return_value={}), patch.object(
+            board, "pause_reason", side_effect=lambda repo, token, n: "Merge gate not satisfied: merge state DIRTY." if n == 1 else ""
+        ):
+            data = board.build_cards()
+
+        html = "".join(data["cols"].values())
+        self.assertIn("data-paused='1' data-pause-reason='Merge gate not satisfied: merge state DIRTY.'", html)
+        self.assertIn("等待人工处理", html)
+        self.assertIn("data-agent='1'", html)
+        # 未暂停的卡片属性为空而不是缺失，前端 getAttribute 不会报错。
+        self.assertIn("data-paused='0'", html)
+        self.assertEqual(data["counts"]["blocked"], 1)
+        self.assertEqual(data["counts"]["ready"], 1)
+        self.assertEqual(data["counts"]["idle"], 1)
+
+
 
 class HTTPTests(unittest.TestCase):
     def setUp(self):
