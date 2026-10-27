@@ -6,6 +6,7 @@ import json
 import os
 from html.parser import HTMLParser
 from pathlib import Path
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -119,6 +120,54 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(data["counts"]["ready"], 1)
         self.assertEqual(data["counts"]["idle"], 1)
 
+    def test_board_uses_custom_dialog_instead_of_native_popups(self):
+        self.assertNotRegex(board.BOARD, r"\b(?:alert|confirm|prompt)\s*\(")
+        self.assertIn("function openDialog", board.BOARD)
+        with patch.object(board, "build_cards", return_value=fixture_cards()):
+            document = board.issues_page()
+        self.assertIn("id='modal'", document)
+        self.assertIn("id='dlg-ok'", document)
+
+    def test_symphony_state_uses_background_cache(self):
+        cached = {"running": [{"issue_identifier": "GH-1"}]}
+        with patch.object(
+            board, "_state_cache", {"data": cached, "at": 0.0, "started": True}
+        ), patch.object(
+            board, "fetch_state", side_effect=AssertionError("unexpected state request")
+        ):
+            self.assertEqual(board.symphony_state(), cached)
+
+        with patch.object(
+            board, "_state_cache", {"data": None, "at": 0.0, "started": False}
+        ), patch.object(board, "fetch_state", return_value=cached) as fetch:
+            self.assertEqual(board.symphony_state(), cached)
+            fetch.assert_called_once()
+
+    def test_count_messages_caches_incremental_live_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live = os.path.join(tmp, "live.jsonl")
+            with open(live, "wb") as handle:
+                handle.write(b'{"type":"entry_appended","entry":{"type":"message"}}\n')
+            self.assertEqual(board.count_messages(live, True), 1)
+            self.assertEqual(board.count_messages(live, True), 1)
+
+            with open(live, "ab") as handle:
+                handle.write(b'{"type":"entry_appended","entry":{"type":"message"}}\n')
+            self.assertEqual(board.count_messages(live, True), 2)
+
+            with open(live, "ab") as handle:
+                handle.write(b'{"type":"entry_appended","entry":{"type":"mess')
+            self.assertEqual(board.count_messages(live, True), 2)
+
+            with open(live, "ab") as handle:
+                handle.write(b'age"}}\n')
+            self.assertEqual(board.count_messages(live, True), 3)
+
+            legacy = os.path.join(tmp, "legacy.jsonl")
+            with open(legacy, "wb") as handle:
+                handle.write(b'{"type":"message"}\n{"type":"other"}\n')
+            self.assertEqual(board.count_messages(legacy, False), 1)
+            board._message_cache.clear()
 
 
 class HTTPTests(unittest.TestCase):

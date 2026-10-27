@@ -18,6 +18,7 @@ import http.client
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -30,7 +31,8 @@ LIVE_DIR = os.environ.get("SYMPHONY_SESSIONS_LIVE", "/root/symphony/sessions-liv
 HTML_DIR = os.path.join(SESS_DIR, "html")
 WORKFLOW = os.environ.get("SYMPHONY_WORKFLOW", "/root/symphony/config/WORKFLOW.md")
 ENV_FILE = os.environ.get("SYMPHONY_ENV", "/root/symphony/env")
-STATE_URL = "http://127.0.0.1:8320/api/v1/state"
+STATE_URL = os.environ.get("SYMPHONY_STATE_URL", "http://127.0.0.1:8320/api/v1/state")
+STATE_POLL_INTERVAL = 2.0
 IDENTIFIER_PREFIX = "GH-"
 
 MAX_CHUNK = 256 * 1024
@@ -208,9 +210,42 @@ a{color:inherit;text-decoration:none}
 .acmt{display:block;width:100%;margin:0 0 8px;padding:7px 9px;border:1px solid var(--edge2);border-radius:5px;background:var(--sunken);color:var(--fg);font:11px/1.5 var(--sans);outline:none;resize:vertical}
 .acmt:focus{border-color:var(--fg3)}
 .acmt::placeholder{color:var(--fg3)}
-#toast{position:fixed;left:50%;bottom:24px;z-index:60;transform:translateX(-50%);padding:8px 14px;border-radius:6px;border:1px solid var(--edge2);background:var(--panel);color:var(--fg);font-size:12px;box-shadow:0 10px 34px rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:opacity .15s}
-#toast.on{opacity:1}
-#toast.err{color:var(--danger);border-color:rgba(251,113,133,.45)}
+#toast{position:fixed;left:50%;bottom:24px;z-index:60;display:flex;align-items:center;gap:9px;max-width:min(560px,calc(100vw - 32px));padding:10px 14px;border-radius:9px;border:1px solid var(--edge2);background:linear-gradient(180deg,#242424,#1b1b1b);color:var(--fg);font-size:12px;box-shadow:0 16px 44px rgba(0,0,0,.6);opacity:0;transform:translate(-50%,10px);pointer-events:none;transition:opacity .18s,transform .18s}
+#toast.on{opacity:1;transform:translate(-50%,0)}
+#toast .ticon{flex:none;display:inline-flex;width:16px;height:16px;color:var(--ok)}
+#toast .ticon svg{width:16px;height:16px;display:block}
+#toast .tmsg{min-width:0;overflow-wrap:anywhere}
+#toast.err{border-color:rgba(251,113,133,.45);background:linear-gradient(180deg,#2a1c1e,#201618)}
+#toast.err .ticon{color:var(--danger)}
+body.dialog-open{overflow:hidden}
+#modal{position:fixed;inset:0;z-index:70;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(8,8,8,.66);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);opacity:0;visibility:hidden;transition:opacity .16s,visibility .16s}
+#modal.open{opacity:1;visibility:visible}
+.dialog{position:relative;width:min(460px,100%);max-height:calc(100dvh - 40px);overflow-y:auto;background:linear-gradient(180deg,#212121,#1a1a1a);border:1px solid var(--edge2);border-radius:14px;box-shadow:0 32px 90px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,255,255,.04);transform:translateY(12px) scale(.985);opacity:.5;transition:transform .2s cubic-bezier(.2,.8,.2,1),opacity .2s}
+#modal.open .dialog{transform:none;opacity:1}
+.dlg-head{display:flex;gap:12px;padding:20px 20px 0}
+.dlg-icon{flex:none;display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:9px;border:1px solid rgba(56,189,248,.25);background:rgba(56,189,248,.12);color:var(--info)}
+.dlg-icon svg{width:18px;height:18px;display:block}
+.dlg-icon.warn{border-color:rgba(251,191,36,.3);background:rgba(251,191,36,.12);color:var(--warn)}
+.dlg-icon.danger{border-color:rgba(251,113,133,.3);background:rgba(251,113,133,.12);color:var(--danger)}
+.dlg-icon.ok{border-color:rgba(52,211,153,.3);background:rgba(52,211,153,.12);color:var(--ok)}
+.dlg-copy{min-width:0;flex:1}
+.dlg-title{margin:1px 0 0;font-size:14.5px;font-weight:600;line-height:1.4;color:var(--fg);word-break:break-word}
+.dlg-body{margin:5px 0 0;font-size:12px;line-height:1.65;color:var(--fg2);white-space:pre-line;overflow-wrap:anywhere}
+.dlg-field{position:relative;margin:14px 20px 0}
+.dlg-field textarea{display:block;width:100%;min-height:84px;max-height:220px;padding:9px 10px 22px;border:1px solid var(--edge2);border-radius:8px;background:var(--sunken);color:var(--fg);font:12px/1.6 var(--sans);outline:none;resize:vertical;transition:border-color .12s,box-shadow .12s}
+.dlg-field textarea:focus{border-color:rgba(56,189,248,.55);box-shadow:0 0 0 3px rgba(56,189,248,.12)}
+.dlg-field textarea::placeholder{color:var(--fg3)}
+.dlg-count{position:absolute;right:10px;bottom:7px;font:10px var(--mono);color:var(--fg3);pointer-events:none}
+.dlg-count.limit{color:var(--danger)}
+.dlg-actions{display:flex;justify-content:flex-end;gap:8px;padding:18px 20px 20px}
+.dlg-btn{min-width:84px;min-height:34px;padding:6px 14px;border:1px solid var(--edge2);border-radius:7px;background:transparent;color:var(--fg2);font:12px var(--sans);cursor:pointer;transition:background .12s,color .12s,border-color .12s,filter .12s}
+.dlg-btn:hover{background:var(--elev);color:var(--fg);border-color:var(--fg3)}
+.dlg-btn:focus-visible{outline:2px solid var(--info);outline-offset:2px}
+.dlg-btn.primary{background:var(--fg);border-color:var(--fg);color:#111;font-weight:600}
+.dlg-btn.primary:hover{filter:brightness(1.08);background:var(--fg);border-color:var(--fg);color:#111}
+.dlg-btn.primary.ok{background:var(--ok);border-color:var(--ok);color:#04150f}
+.dlg-btn.primary.warn{background:var(--warn);border-color:var(--warn);color:#1f1700}
+.dlg-btn.primary.danger{background:var(--danger);border-color:var(--danger);color:#21060a}
 .mgrid{margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:10px 20px;border:1px solid var(--edge);border-radius:6px;background:var(--card);padding:11px 12px;font-size:11px}
 .mi{display:flex;flex-direction:column;gap:1px;min-width:0}
 .mi span{color:var(--fg3)}
@@ -323,6 +358,12 @@ th{color:var(--fg3);font-weight:500}
  .dbody{padding:12px 10px;padding-bottom:max(24px,env(safe-area-inset-bottom))}.dtitle{font-size:16px}
  .acmt{font-size:16px}.abtns .abtn{flex:1;min-width:100px;font-size:13px}.mgrid{grid-template-columns:repeat(2,minmax(0,1fr))}
  .run-head{flex-wrap:wrap}.run-time{white-space:normal;overflow-wrap:anywhere}.log-body{max-height:55dvh}
+ #modal{padding:12px;align-items:flex-end}
+ .dialog{width:100%;max-height:calc(100dvh - 24px)}
+ .dlg-head{padding:18px 16px 0}
+ .dlg-field{margin:12px 16px 0}.dlg-field textarea{font-size:16px}
+ .dlg-actions{padding:16px;padding-bottom:max(16px,env(safe-area-inset-bottom))}
+ .dlg-actions .dlg-btn{flex:1;min-height:44px;font-size:13px}
 }
 """
 
@@ -355,10 +396,125 @@ let BUSY = false, TOAST_TIMER = null, FORM_OPEN = false, DRAFT_COMMENT = '', WRI
   history.replaceState(null, '', location.pathname + (query ? '?' + query : ''));
 })();
 
+const DIALOG_ICONS = {
+  info: "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round'><circle cx='12' cy='12' r='9'/><path d='M12 10.8v5.4'/><circle cx='12' cy='7.6' r='1.1' fill='currentColor' stroke='none'/></svg>",
+  warn: "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3.6 21 20H3z'/><path d='M12 9.4v4.4'/><circle cx='12' cy='16.7' r='1.05' fill='currentColor' stroke='none'/></svg>",
+  danger: "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8.3 3.2h7.4l5.1 5.1v7.4l-5.1 5.1H8.3l-5.1-5.1V8.3z'/><path d='M12 7.8v5.1'/><circle cx='12' cy='16.2' r='1.05' fill='currentColor' stroke='none'/></svg>",
+  ok: "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='m8 12.2 2.7 2.7L16.2 9.4'/></svg>"
+};
+let DIALOG = null;
+
+function openDialog(opts) {
+  const root = document.getElementById('modal');
+  if (!root) { return Promise.resolve(null); }
+  if (DIALOG) { DIALOG.finish(null); }
+  opts = opts || {};
+  return new Promise(function (resolve) {
+    const tone = opts.tone || 'info';
+    const titleEl = document.getElementById('dlg-title');
+    const bodyEl = document.getElementById('dlg-body');
+    const iconEl = document.getElementById('dlg-icon');
+    const fieldEl = document.getElementById('dlg-field');
+    const inputEl = document.getElementById('dlg-input');
+    const countEl = document.getElementById('dlg-count');
+    const okEl = document.getElementById('dlg-ok');
+    const cancelEl = document.getElementById('dlg-cancel');
+    const prevFocus = document.activeElement;
+    const hasInput = !!opts.input;
+    let done = false;
+
+    titleEl.textContent = opts.title || '确认操作';
+    bodyEl.textContent = opts.body || '';
+    bodyEl.hidden = !opts.body;
+    iconEl.className = 'dlg-icon ' + tone;
+    iconEl.innerHTML = DIALOG_ICONS[tone] || DIALOG_ICONS.info;
+    okEl.className = 'dlg-btn primary ' + tone;
+    okEl.textContent = opts.confirmText || '确认';
+    cancelEl.textContent = opts.cancelText || '取消';
+    cancelEl.hidden = opts.cancel === false;
+    fieldEl.hidden = !hasInput;
+    if (hasInput) {
+      inputEl.value = opts.input.value || '';
+      inputEl.placeholder = opts.input.placeholder || '';
+      inputEl.maxLength = opts.input.maxlength || 4000;
+      inputEl.oninput = function () {
+        countEl.textContent = inputEl.value.length + ' / ' + inputEl.maxLength;
+        countEl.classList.toggle('limit', inputEl.value.length >= inputEl.maxLength);
+      };
+      inputEl.oninput();
+    } else {
+      inputEl.value = '';
+      inputEl.oninput = null;
+    }
+
+    function finish(value) {
+      if (done) { return; }
+      done = true;
+      DIALOG = null;
+      root.classList.remove('open');
+      root.setAttribute('aria-hidden', 'true');
+      document.body.classList.remove('dialog-open');
+      document.removeEventListener('keydown', onKey, true);
+      root.removeEventListener('click', onBackdrop);
+      okEl.removeEventListener('click', onOk);
+      cancelEl.removeEventListener('click', onCancel);
+      inputEl.oninput = null;
+      if (prevFocus && typeof prevFocus.focus === 'function') {
+        try { prevFocus.focus(); } catch (err) { }
+      }
+      resolve(value);
+    }
+    function onOk() { finish(hasInput ? inputEl.value : true); }
+    function onCancel() { finish(null); }
+    function onBackdrop(e) { if (e.target === root) { finish(null); } }
+    function onKey(e) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(null);
+        return;
+      }
+      if (e.key === 'Enter') {
+        if (hasInput) {
+          if (e.ctrlKey || e.metaKey) { e.preventDefault(); onOk(); }
+        } else if (!e.target || e.target.tagName !== 'BUTTON') {
+          e.preventDefault();
+          onOk();
+        }
+        return;
+      }
+      if (e.key === 'Tab') {
+        const items = (hasInput ? [inputEl] : []).concat(cancelEl.hidden ? [] : [cancelEl], [okEl]);
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    }
+
+    okEl.addEventListener('click', onOk);
+    cancelEl.addEventListener('click', onCancel);
+    root.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKey, true);
+    root.classList.add('open');
+    root.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('dialog-open');
+    DIALOG = { finish: finish };
+    setTimeout(function () {
+      if (done) { return; }
+      const focusTarget = hasInput ? inputEl : (tone === 'danger' && !cancelEl.hidden ? cancelEl : okEl);
+      focusTarget.focus();
+    }, 30);
+  });
+}
+
 function toast(message, err) {
   const el = document.getElementById('toast');
   if (!el) { return; }
-  el.textContent = message;
+  const icon = el.querySelector('.ticon');
+  const text = el.querySelector('.tmsg');
+  if (icon) { icon.innerHTML = err ? DIALOG_ICONS.danger : DIALOG_ICONS.ok; }
+  if (text) { text.textContent = message; } else { el.textContent = message; }
   el.className = 'on' + (err ? ' err' : '');
   clearTimeout(TOAST_TIMER);
   TOAST_TIMER = setTimeout(function () { el.className = ''; }, 4200);
@@ -562,10 +718,21 @@ async function interveneAction(op) {
   if (!CUR || BUSY) { return; }
   let comment = '';
   if (op === 'pause') {
-    comment = (prompt('转人工处理 ' + CUR + '？可填写原因（可选，会作为 issue 评论发布）：') || '').trim();
-    if (comment === null) { return; }
-  } else if (!confirm('恢复执行 ' + CUR + '？会移除 needs-human 并重新加 agent；'
-    + '合并前宿主会重新核验当前 SHA 的检查与有效审批，重贴 agent 本身不是合并授权。')) { return; }
+    const reason = await openDialog({
+      tone: 'warn',
+      title: '转人工处理 ' + CUR,
+      body: '可填写原因（可选），会作为 issue 评论发布；不填写也可以直接转人工。',
+      input: { placeholder: '例如：需要人工确认合并范围 / 先暂停观察', maxlength: 4000 },
+      confirmText: '转人工处理'
+    });
+    if (reason === null) { return; }
+    comment = String(reason).trim();
+  } else if (!(await openDialog({
+    tone: 'ok',
+    title: '恢复执行 ' + CUR,
+    body: '会移除 needs-human 并重新加 agent；合并前宿主会重新核验当前 SHA 的检查与有效审批，重贴 agent 本身不是合并授权。',
+    confirmText: '恢复执行'
+  }))) { return; }
   BUSY = true;
   renderActions();
   try {
@@ -595,21 +762,21 @@ async function labelAction(action, label) {
   const input = document.getElementById('acomment');
   const comment = action === 'add' && input ? input.value.trim() : '';
   const running = CARD.state === 'running';
-  let verb;
+  let dialog;
   if (action === 'add' && label === 'agent') {
-    verb = comment
-      ? '发布说明并给 ' + CUR + ' 加上 agent 标签？调度器会在下个轮询周期开始执行（改代码，可能推 PR）。'
-      : '没有填写说明，直接给 ' + CUR + ' 加 agent 标签？agent 可能重复上次的做法。';
+    dialog = comment
+      ? { tone: 'ok', title: '发布说明并开始执行', body: '给 ' + CUR + ' 加上 agent 标签？调度器会在下个轮询周期开始执行（改代码，可能推 PR）。', confirmText: '发布并执行' }
+      : { tone: 'warn', title: '开始执行 ' + CUR, body: '没有填写说明，直接加 agent 标签？agent 可能重复上次的做法。', confirmText: '开始执行' };
   } else if (action === 'add') {
-    verb = '给 ' + CUR + ' 加 needs-human 并摘掉 agent 标签？调度器不会再派发，直到人工恢复。';
+    dialog = { tone: 'warn', title: '转人工处理 ' + CUR, body: '加 needs-human 并摘掉 agent 标签？调度器不会再派发，直到人工恢复。', confirmText: '转人工处理' };
   } else if (label === 'agent') {
-    verb = running
-      ? '摘掉 ' + CUR + ' 的 agent 标签？调度器会在下个轮询周期终止正在运行的任务。'
-      : '摘掉 ' + CUR + ' 的 agent 标签？调度器不会再派发它。';
+    dialog = running
+      ? { tone: 'danger', title: '停止执行 ' + CUR, body: '摘掉 agent 标签？调度器会在下个轮询周期终止正在运行的任务。', confirmText: '停止执行' }
+      : { tone: 'warn', title: '暂停派发 ' + CUR, body: '摘掉 agent 标签？调度器不会再派发它。', confirmText: '暂停派发' };
   } else {
-    verb = '摘掉 ' + CUR + ' 的 needs-human 标签？如需继续执行，请再重新加 agent。';
+    dialog = { tone: 'warn', title: '摘掉 needs-human ' + CUR, body: '摘掉 needs-human 标签？如需继续执行，请再重新加 agent。', confirmText: '摘掉标签' };
   }
-  if (!confirm(verb)) { return; }
+  if (!(await openDialog(dialog))) { return; }
   if (action === 'add') { DRAFT_COMMENT = comment; }
   BUSY = true;
   renderActions();
@@ -1193,25 +1360,69 @@ def ts_epoch(value):
         return None
 
 
+_message_cache = {}
+_message_lock = threading.Lock()
+
+
 def count_messages(path, live):
     try:
-        with open(path, "rb") as handle:
-            if not live:
-                return sum(1 for line in handle if line.startswith(b'{"type":"message"'))
-            n = 0
-            for line in handle:
-                if b"entry_appended" not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                entry = rec.get("entry") or {}
-                if rec.get("type") == "entry_appended" and entry.get("type") == "message":
-                    n += 1
-            return n
+        info = os.stat(path)
     except OSError:
         return 0
+    key = (path, live)
+    with _message_lock:
+        cached = _message_cache.get(key)
+        same_file = (
+            cached
+            and cached["dev"] == info.st_dev
+            and cached["ino"] == info.st_ino
+        )
+        if same_file and cached["mtime_ns"] == info.st_mtime_ns and cached["size"] == info.st_size:
+            return cached["count"]
+        if live and same_file and cached["size"] < info.st_size:
+            offset = cached["offset"]
+            count = cached["count"]
+        else:
+            offset = 0
+            count = 0
+    try:
+        with open(path, "rb") as handle:
+            if offset:
+                handle.seek(offset)
+            if not live:
+                count = sum(1 for line in handle if line.startswith(b'{"type":"message"'))
+                end = handle.tell()
+            else:
+                end = offset
+                while True:
+                    line_start = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        break
+                    if not line.endswith(b"\n"):
+                        end = line_start
+                        break
+                    if b"entry_appended" in line:
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        entry = rec.get("entry") or {}
+                        if rec.get("type") == "entry_appended" and entry.get("type") == "message":
+                            count += 1
+                    end = handle.tell()
+    except OSError:
+        return 0
+    with _message_lock:
+        _message_cache[key] = {
+            "dev": info.st_dev,
+            "ino": info.st_ino,
+            "mtime_ns": info.st_mtime_ns,
+            "size": info.st_size,
+            "offset": end,
+            "count": count,
+        }
+    return count
 
 
 def scan_sessions():
@@ -1471,12 +1682,39 @@ def clear_github_cache():
     _pulls_cache["at"] = 0.0
 
 
-def symphony_state():
+_state_cache = {"data": None, "at": 0.0, "started": False}
+_state_lock = threading.Lock()
+
+
+def fetch_state():
     try:
         with urllib.request.urlopen(STATE_URL, timeout=3) as response:
             return json.load(response)
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
         return None
+
+
+def symphony_state():
+    with _state_lock:
+        data = _state_cache["data"]
+        started = _state_cache["started"]
+    if data is not None or started:
+        return data
+    return fetch_state()
+
+
+def state_poller():
+    announced = False
+    while True:
+        data = fetch_state()
+        if data is not None:
+            with _state_lock:
+                _state_cache["data"] = data
+                _state_cache["at"] = time.time()
+            if not announced:
+                print("state poller ready: %s" % STATE_URL, flush=True)
+                announced = True
+        time.sleep(STATE_POLL_INTERVAL)
 
 
 def agent_status(state):
@@ -1868,7 +2106,19 @@ def issues_page():
         "<div class='completed-list' id='completed-list'></div></main>"
         "</div>"
         "<div id='shade' onclick='closeDrawer()'></div>"
-        "<div id='toast'></div>"
+        "<div id='toast' role='status' aria-live='polite'>"
+        "<span class='ticon' aria-hidden='true'></span><span class='tmsg'></span></div>"
+        "<div id='modal' aria-hidden='true'>"
+        "<div class='dialog' role='dialog' aria-modal='true' aria-labelledby='dlg-title' aria-describedby='dlg-body'>"
+        "<div class='dlg-head'><span class='dlg-icon info' id='dlg-icon' aria-hidden='true'></span>"
+        "<div class='dlg-copy'><h2 class='dlg-title' id='dlg-title'></h2>"
+        "<p class='dlg-body' id='dlg-body'></p></div></div>"
+        "<div class='dlg-field' id='dlg-field' hidden>"
+        "<textarea id='dlg-input' rows='3' maxlength='4000' spellcheck='false'></textarea>"
+        "<span class='dlg-count' id='dlg-count'></span></div>"
+        "<div class='dlg-actions'><button type='button' class='dlg-btn' id='dlg-cancel'>取消</button>"
+        "<button type='button' class='dlg-btn primary' id='dlg-ok'>确认</button></div>"
+        "</div></div>"
         "<aside class='drawer' id='drawer'><div class='dhead' id='dhead'></div>"
         "<div class='dbody' id='dbody'></div></aside>"
     ) % (
@@ -3142,6 +3392,10 @@ def main():
     parser.add_argument("--port", type=int, default=8322)
     parser.add_argument("--bind", default="192.168.1.199")
     args = parser.parse_args()
+
+    with _state_lock:
+        _state_cache["started"] = True
+    threading.Thread(target=state_poller, daemon=True, name="symphony-state").start()
 
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     server.daemon_threads = True
