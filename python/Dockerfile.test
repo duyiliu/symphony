@@ -1,0 +1,16 @@
+# Isolated test image for the Python scheduler.
+#   docker build -f Dockerfile.test -t symphony-python-test .
+#   docker run --rm symphony-python-test
+FROM python:3.10-slim
+
+# Prod target is CentOS-family where /bin/sh is bash; debian's dash lacks `sh -lc`.
+RUN ln -sf /bin/bash /bin/sh
+
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY symphony ./symphony
+COPY tests ./tests
+COPY container_smoke.py ./container_smoke.py
+
+CMD ["python", "-m", "unittest", "discover", "-s", "tests", "-v"]
