@@ -423,6 +423,19 @@ def stop_session(session):
         except subprocess.TimeoutExpired:
             pass
 
+    # Popen.wait() reaps the child but does not close our pipe handles. The
+    # reader has reached EOF once the process group exits; finish it before
+    # releasing the streams so later runs do not leak file descriptors.
+    reader = session.reader
+    if reader is not None and reader is not threading.current_thread():
+        reader.join(timeout=1)
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
 
 def _emit(on_message, event, fields):
     if on_message is None:

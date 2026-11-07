@@ -412,3 +412,6 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+
+The Python implementation supports GitHub + Pi. `deploy/WORKFLOW.md` is an example template; `deploy/WORKFLOW.test.md` targets isolated testing. Editing examples does not change existing deployments. See the fixture README for local setup.

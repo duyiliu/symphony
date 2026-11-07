@@ -30,7 +30,11 @@
    **交付后不移除 `agent`**，同一 worker 继续完成合并。
 3. Agent 调用 `github_workflow(action="merge")`，宿主做确定性合并判定（不依赖模型声明"安全"）：
    - 最新 head SHA、目标分支、唯一 closing association 与交付记录一致；
-   - 当前 SHA 已报告的 GitHub checks 和 statuses 均通过（未完成 → `waiting_checks`；失败 → `needs_repair`）；没有检查时不单独阻止合并，必需检查由仓库分支保护配置保证；
+   - 当前 SHA 已报告的 GitHub checks 和 statuses 均通过（未完成 → `waiting_checks`；失败 → `needs_repair`）；
+     没有检查时不单独阻止合并，必需检查默认由仓库分支保护配置保证；如需宿主强制，
+     用可选的 `checks.required`（见下），必需检查缺失、未完成或 SHA 不符 → `waiting_checks`；
+     可选的 `checks.allow_skipped` 只豁免"所有最新运行均为 `skipped`"的可选名（见下），
+     允许跳过不等于通过；
    - GitHub `mergeStateStatus=CLEAN`、`reviewDecision` 不是 REVIEW_REQUIRED/CHANGES_REQUESTED
      （仓库已有分支保护与强制审核仍然生效；UNKNOWN 等待，DIRTY/BLOCKED/CHANGES_REQUESTED 走返修）；
    - 风险规则（见下）；命中规则或 `high-risk` 标签时，必须有该 PR **当前 head 上的有效
@@ -42,6 +46,66 @@
    同类失败受 `max_attempts` 预算约束，收敛不了则暂停。
 6. 需要人工介入时（Agent 主动 `pause`、预算耗尽、宿主无法核验）：宿主写明原因的评论，
    添加 `needs-human` 并移除 `agent`，receipt 进入 blocked；标签操作失败不会造成派发死循环。
+
+## 显式必需检查（可选 `checks`）
+
+`tracker.github_workflow.checks` 是可选配置。**不写该键时行为完全不变**：任何人都报告了的
+checks/statuses 必须全部通过，跳过（`skipped`）、`neutral`、`cancelled` 都不算通过。
+
+| 字段 | 类型 | 语义 |
+| --- | --- | --- |
+| `required` | 非空字符串列表 | 必须存在并通过的检查名。缺失、未完成、只有其他 SHA 的运行 → `waiting_checks`；失败/跳过/`neutral`/`cancelled` → `needs_repair` |
+| `allow_skipped` | 非空字符串列表 | 明确允许跳过的**可选**检查名。仅当该名字**所有**最新运行结论都是 `skipped`（且同名 commit status 不存在未通过状态）时才不进入返修；不记为通过，也不满足 `required` |
+
+检查名按 GitHub 报告的原样**精确匹配**（区分大小写、空格与括号）。矩阵构建要写全后缀，例如
+`tests (3.12)`，不能只写 `tests`；写错或只写前缀不会报错，而是永远匹配不到、稳定停在
+`waiting_checks`。这是 fail-closed：宁可等待人工，也不会误放行。
+
+```yaml
+github_workflow:
+  enabled: true
+  # ...
+  checks:
+    required: ["tests"]
+```
+
+配置校验（`WorkflowPolicy.validate/1`，启用时生效）拒绝：`required`/`allow_skipped` 重叠（含
+两端带空白的等价名）、空白名、非字符串项、非列表值、未知键，以及非映射的 `checks`；
+统一返回 `:invalid_github_workflow_checks`。`checks: {}` 与显式空列表等价于默认策略。
+WORKFLOW.md 解析沿用既有约定丢弃 null 值，因此留空的 `checks:` 等同于未配置（走默认策略），
+而不是报错；显式写出错误类型才会被拒绝。
+
+### 判定语义（v1 保守规则）
+
+判定仍按同名不同 App 分组（每个 App 只取最新一次运行），head/base、风险规则与 Review 审批
+逻辑不变。检查名放行必须同时满足下列全部条件，否则不得放行：
+
+1. **同名全部通过**：该名字下每个 App 的最新运行结论都是 `success`，且同名 commit status
+   全部为 `success`；或
+2. **全体跳过**：该名字列在 `allow_skipped` 中，**并且**它下面每个 App 的最新运行结论都是
+   `skipped`，同名 commit status 也没有非 `success` 状态。
+
+具体边界（共享夹具逐条锁定）：
+
+- **success/skipped 混合仍返修**：同名多 App 中一个 `success` 一个 `skipped`，即便该名字在
+  `allow_skipped` 中也属于 `needs_repair`。v1 不做"部分跳过视为通过"的推断。
+- **只有 `skipped` 可被豁免**：`failure`、`cancelled`、`neutral`、`timed_out`、`stale`、
+  `action_required`、`startup_failure` 以及任何未完成状态，都不会因为出现在 `allow_skipped`
+  里而被放行；未完成（`queued`/`in_progress`/`pending` status）一律先 `waiting_checks`。
+- **commit status 优先于豁免**：同名提交状态为 `failure`/`pending` 时，即使 check run 是
+  `skipped` 也不能豁免（失败返修、pending 等待）。
+- **全 skip 不等于通过**：允许跳过只表示"不阻断、不返修"，不得在 Workpad、交付评论或任何
+  报告中表述为 CI 实际通过；实际通过必须以该 SHA 上的真实运行结论为证据。
+- **未配置完全保持现状**：不写 `checks` 时仍是"所有已报告的 checks/statuses 必须 success"，
+  `skipped`/`neutral`/`cancelled` 都不算通过，也没有任何豁免。
+
+Python 与 Elixir 共用同一份夹具 `tests/fixtures/github-check-policy.json`（含上述全部边界），
+逐行断言分类与配置校验结果一致：
+
+```bash
+cd elixir && mix test test/symphony_elixir/github_workflow_test.exs
+cd python && python -m unittest tests.test_check_policy
+```
 
 ## 风险规则（第一版：确定性路径规则，无 AI 评分）
 
@@ -69,6 +133,7 @@
 | `state_dir` | 宿主 JSON 记录绝对目录，不与 Workspace 重叠 |
 | `base_branch` | 必填，预期 PR 目标分支 |
 | `max_attempts` | 默认 3，限制同一标签事件的 worker 准入次数 |
+| `checks` | 可选，`required` / `allow_skipped`，见“显式必需检查” |
 | `risk` | 可选，见上表 |
 
 执行标签（`agent` / `needs-human` / `high-risk`）不要放进 `required_labels`；额外标签仍全部匹配。

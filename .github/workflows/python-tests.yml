@@ -1,0 +1,17 @@
+name: Python tests
+on:
+  push:
+    paths: ['python/**', 'deploy/**', 'tests/fixtures/**', '.github/workflows/python-tests.yml']
+  pull_request:
+    paths: ['python/**', 'deploy/**', 'tests/fixtures/**', '.github/workflows/python-tests.yml']
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r python/requirements.txt
+      - run: python -m unittest discover -s python/tests -v
+      - run: python -m unittest discover -s tests/fixtures/test-project -v

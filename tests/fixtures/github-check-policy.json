@@ -1,0 +1,1252 @@
+{
+  "description": "Shared GitHub check-policy fixture: Python and Elixir classify the same inputs identically. Consumed by python/tests/test_check_policy.py and elixir/test/symphony_elixir/github_workflow_test.exs.",
+  "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "other_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "classification": [
+    {
+      "name": "no_policy_all_success",
+      "checks": null,
+      "runs": [
+        {
+          "id": 1,
+          "name": "build",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [],
+      "note": "Unconfigured keeps the current all-must-pass behaviour."
+    },
+    {
+      "name": "no_policy_skipped_fails",
+      "checks": null,
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "Without allow_skipped a skipped check is not a pass."
+    },
+    {
+      "name": "no_policy_neutral_fails",
+      "checks": null,
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "neutral"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "neutral is never treated as success."
+    },
+    {
+      "name": "no_policy_cancelled_fails",
+      "checks": null,
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "cancelled"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "cancelled is never treated as success."
+    },
+    {
+      "name": "no_policy_in_progress_waits",
+      "checks": null,
+      "runs": [
+        {
+          "id": 1,
+          "name": "build",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "in_progress",
+          "conclusion": null
+        }
+      ],
+      "statuses": [],
+      "pending": [
+        "build"
+      ],
+      "failing": [],
+      "note": "An unfinished check waits."
+    },
+    {
+      "name": "no_policy_stale_sha_waits",
+      "checks": null,
+      "runs": [
+        {
+          "id": 1,
+          "name": "build",
+          "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ],
+      "statuses": [],
+      "pending": [
+        "build"
+      ],
+      "failing": [],
+      "note": "A run reported for another SHA is not evidence for this delivery."
+    },
+    {
+      "name": "no_policy_no_reported_checks",
+      "checks": null,
+      "runs": [],
+      "statuses": [],
+      "pending": [],
+      "failing": [],
+      "note": "No checks reported does not block on its own; branch protection still applies."
+    },
+    {
+      "name": "no_policy_status_failure_fails",
+      "checks": null,
+      "runs": [],
+      "statuses": [
+        {
+          "context": "legacy",
+          "state": "failure"
+        }
+      ],
+      "pending": [],
+      "failing": [
+        "legacy"
+      ],
+      "note": "Legacy commit statuses are classified like check runs."
+    },
+    {
+      "name": "no_policy_status_pending_waits",
+      "checks": null,
+      "runs": [],
+      "statuses": [
+        {
+          "context": "legacy",
+          "state": "pending"
+        }
+      ],
+      "pending": [
+        "legacy"
+      ],
+      "failing": [],
+      "note": "A pending commit status waits."
+    },
+    {
+      "name": "no_policy_status_success_passes",
+      "checks": null,
+      "runs": [],
+      "statuses": [
+        {
+          "context": "legacy",
+          "state": "success"
+        }
+      ],
+      "pending": [],
+      "failing": [],
+      "note": "A successful commit status passes."
+    },
+    {
+      "name": "required_success_passes",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [],
+      "note": "A configured required check that passed admits the PR."
+    },
+    {
+      "name": "required_missing_waits",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "build",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ],
+      "statuses": [],
+      "pending": [
+        "tests"
+      ],
+      "failing": [],
+      "note": "A required check that has not reported yet waits."
+    },
+    {
+      "name": "required_in_progress_waits",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "in_progress",
+          "conclusion": null
+        }
+      ],
+      "statuses": [],
+      "pending": [
+        "tests"
+      ],
+      "failing": [],
+      "note": "A required check still running waits."
+    },
+    {
+      "name": "required_stale_sha_waits",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ],
+      "statuses": [],
+      "pending": [
+        "tests"
+      ],
+      "failing": [],
+      "note": "A required check reported for another SHA waits."
+    },
+    {
+      "name": "required_failure_fails",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "failure"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "tests"
+      ],
+      "note": "A failing required check needs repair."
+    },
+    {
+      "name": "required_skipped_fails",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "tests"
+      ],
+      "note": "A skipped required check fails; skip tolerance is only for allow_skipped."
+    },
+    {
+      "name": "required_neutral_fails",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "neutral"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "tests"
+      ],
+      "note": "neutral on a required check fails."
+    },
+    {
+      "name": "required_cancelled_fails",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "cancelled"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "tests"
+      ],
+      "note": "cancelled on a required check fails."
+    },
+    {
+      "name": "required_from_status_success_passes",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [],
+      "statuses": [
+        {
+          "context": "tests",
+          "state": "success"
+        }
+      ],
+      "pending": [],
+      "failing": [],
+      "note": "A required name satisfied by a commit status passes."
+    },
+    {
+      "name": "required_from_status_pending_waits",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": []
+      },
+      "runs": [],
+      "statuses": [
+        {
+          "context": "tests",
+          "state": "pending"
+        }
+      ],
+      "pending": [
+        "tests"
+      ],
+      "failing": [],
+      "note": "A required name with a pending commit status waits."
+    },
+    {
+      "name": "allowed_skip_tolerated",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 2,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [],
+      "note": "An explicitly allowed optional skip does not require repair."
+    },
+    {
+      "name": "allowed_skip_not_counted_as_pass",
+      "checks": {
+        "required": [],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [],
+      "note": "Tolerated skips are absent from both lists: tolerated, never reported as passing."
+    },
+    {
+      "name": "unlisted_skip_still_fails",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 2,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        },
+        {
+          "id": 3,
+          "name": "lint",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "lint"
+      ],
+      "note": "Only names listed in allow_skipped are tolerated."
+    },
+    {
+      "name": "allowed_neutral_still_fails",
+      "checks": {
+        "required": [],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "neutral"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "allow_skipped tolerates skipped only; neutral still fails."
+    },
+    {
+      "name": "allowed_cancelled_still_fails",
+      "checks": {
+        "required": [],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "cancelled"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "allow_skipped tolerates skipped only; cancelled still fails."
+    },
+    {
+      "name": "allowed_failure_still_fails",
+      "checks": {
+        "required": [],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "failure"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "allow_skipped never masks a failure."
+    },
+    {
+      "name": "allowed_skip_conflicting_app_fails",
+      "checks": {
+        "required": [],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped",
+          "app": {
+            "id": 1
+          }
+        },
+        {
+          "id": 2,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "failure",
+          "app": {
+            "id": 2
+          }
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "Per-App grouping is preserved; a failure from another App is not hidden by a skip."
+    },
+    {
+      "name": "same_name_two_apps_success",
+      "checks": null,
+      "runs": [
+        {
+          "id": 1,
+          "name": "build",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success",
+          "app": {
+            "id": 1
+          }
+        },
+        {
+          "id": 2,
+          "name": "build",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success",
+          "app": {
+            "id": 2
+          }
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [],
+      "note": "Same-named checks from different Apps are all required to pass."
+    },
+    {
+      "name": "same_name_latest_run_wins",
+      "checks": null,
+      "runs": [
+        {
+          "id": 1,
+          "name": "build",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "failure",
+          "app": {
+            "id": 1
+          }
+        },
+        {
+          "id": 2,
+          "name": "build",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success",
+          "app": {
+            "id": 1
+          }
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [],
+      "note": "Only the latest run per App decides."
+    },
+    {
+      "name": "allowed_skip_with_missing_required_waits",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [],
+      "pending": [
+        "tests"
+      ],
+      "failing": [],
+      "note": "A tolerated skip does not satisfy a missing required check."
+    },
+    {
+      "name": "allowed_skip_with_failing_required",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "failure"
+        },
+        {
+          "id": 2,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "tests"
+      ],
+      "note": "A tolerated skip cannot offset a failing required check."
+    },
+    {
+      "name": "explicit_empty_policy_matches_default",
+      "checks": {
+        "required": [],
+        "allow_skipped": []
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "An explicit empty policy behaves exactly like the unconfigured default."
+    },
+    {
+      "name": "allowed_skip_same_name_two_apps_all_skipped",
+      "checks": {
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped",
+          "app": {
+            "id": 1
+          }
+        },
+        {
+          "id": 2,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped",
+          "app": {
+            "id": 2
+          }
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [],
+      "note": "v1 conservative rule: with every latest run for the name skipped the check does not block, but it is still not a pass."
+    },
+    {
+      "name": "same_name_mixed_success_and_skip_fails",
+      "checks": {
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success",
+          "app": {
+            "id": 1
+          }
+        },
+        {
+          "id": 2,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped",
+          "app": {
+            "id": 2
+          }
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "v1 conservative rule: a success/skipped mix across Apps must be repaired; only an all-skipped name is tolerated."
+    },
+    {
+      "name": "same_name_mixed_success_and_skip_without_policy_fails",
+      "checks": null,
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success",
+          "app": {
+            "id": 1
+          }
+        },
+        {
+          "id": 2,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped",
+          "app": {
+            "id": 2
+          }
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "Without allow_skipped the mixed name needs repair exactly like any skipped check."
+    },
+    {
+      "name": "allowed_skip_in_progress_waits",
+      "checks": {
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "in_progress",
+          "conclusion": null
+        }
+      ],
+      "statuses": [],
+      "pending": [
+        "docs"
+      ],
+      "failing": [],
+      "note": "allow_skipped never short-circuits waiting: an unfinished run still waits."
+    },
+    {
+      "name": "allowed_skip_with_pending_status_waits",
+      "checks": {
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [
+        {
+          "context": "docs",
+          "state": "pending"
+        }
+      ],
+      "pending": [
+        "docs"
+      ],
+      "failing": [],
+      "note": "A pending commit status with the same name still waits."
+    },
+    {
+      "name": "allowed_timed_out_still_fails",
+      "checks": {
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "timed_out"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "allow_skipped excuses skipped only; timed_out needs repair."
+    },
+    {
+      "name": "allowed_stale_still_fails",
+      "checks": {
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "stale"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "allow_skipped excuses skipped only; a stale conclusion needs repair."
+    },
+    {
+      "name": "allowed_action_required_still_fails",
+      "checks": {
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "action_required"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "allow_skipped excuses skipped only; action_required needs repair."
+    },
+    {
+      "name": "allowed_startup_failure_still_fails",
+      "checks": {
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "startup_failure"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "allow_skipped excuses skipped only; startup_failure needs repair."
+    },
+    {
+      "name": "required_timed_out_fails",
+      "checks": {
+        "required": [
+          "tests"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "timed_out"
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [
+        "tests"
+      ],
+      "note": "A required check that timed out needs repair."
+    },
+    {
+      "name": "allowed_skip_with_failing_status_fails",
+      "checks": {
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped"
+        }
+      ],
+      "statuses": [
+        {
+          "context": "docs",
+          "state": "failure"
+        }
+      ],
+      "pending": [],
+      "failing": [
+        "docs"
+      ],
+      "note": "A failing commit status under the same name defeats the skip tolerance."
+    },
+    {
+      "name": "allowed_skip_two_apps_all_skipped_with_required_success",
+      "checks": {
+        "required": [
+          "tests"
+        ],
+        "allow_skipped": [
+          "docs"
+        ]
+      },
+      "runs": [
+        {
+          "id": 1,
+          "name": "tests",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "id": 2,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped",
+          "app": {
+            "id": 1
+          }
+        },
+        {
+          "id": 3,
+          "name": "docs",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "skipped",
+          "app": {
+            "id": 2
+          }
+        }
+      ],
+      "statuses": [],
+      "pending": [],
+      "failing": [],
+      "note": "Tolerated all-skipped optional checks do not block a satisfied required check; admission continues, it is not a pass claim."
+    }
+  ],
+  "config": {
+    "valid": [
+      {
+        "absent": true,
+        "note": "No checks key at all: fully unchanged behaviour."
+      },
+      {
+        "checks": {},
+        "note": "Explicit empty mapping is allowed."
+      },
+      {
+        "checks": {
+          "required": []
+        },
+        "note": "Empty required list."
+      },
+      {
+        "checks": {
+          "allow_skipped": [
+            "optional"
+          ]
+        },
+        "note": "allow_skipped alone."
+      },
+      {
+        "checks": {
+          "required": [
+            "tests"
+          ],
+          "allow_skipped": [
+            "docs",
+            "spellcheck"
+          ]
+        },
+        "note": "Required and allow_skipped disjoint."
+      },
+      {
+        "checks": {
+          "required": [
+            " tests ",
+            "lint"
+          ]
+        },
+        "note": "Surrounding whitespace is trimmed."
+      },
+      {
+        "checks": {
+          "required": [
+            "tests",
+            "tests"
+          ]
+        },
+        "note": "Duplicate names are harmlessly deduplicated."
+      }
+    ],
+    "invalid": [
+      {
+        "checks": "tests",
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": [
+          "tests"
+        ],
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": null,
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": "tests"
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": null
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "allow_skipped": "docs"
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": [
+            "tests",
+            3
+          ]
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": [
+            "tests",
+            true
+          ]
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": [
+            ""
+          ]
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": [
+            "   "
+          ]
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": [
+            [
+              "tests"
+            ]
+          ]
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": [
+            "tests"
+          ],
+          "unknown": []
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": [
+            "tests"
+          ],
+          "allow_skipped": [
+            "tests"
+          ]
+        },
+        "error": "invalid_github_workflow_checks"
+      },
+      {
+        "checks": {
+          "required": [
+            "tests"
+          ],
+          "allow_skipped": [
+            " tests "
+          ]
+        },
+        "error": "invalid_github_workflow_checks"
+      }
+    ]
+  }
+}

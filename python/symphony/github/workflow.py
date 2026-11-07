@@ -343,7 +343,8 @@ def auto_ready(settings, delivery, pr_data, issue_labels):
         settings,
         "%s/commits/%s/statuses" % (root(settings), delivery["sha"]),
         None)
-    pending, failing = classify_checks(runs, statuses, delivery["sha"])
+    pending, failing = classify_checks(
+        runs, statuses, delivery["sha"], policy.check_policy(settings))
     gate = merge_gate(settings, delivery["pr"])
     ensure(
         gate.get("headRefOid") == delivery["sha"]
@@ -383,7 +384,24 @@ def _final_gate(gate, approval_missing):
     return ("ready",)
 
 
-def classify_checks(runs, statuses, sha):
+def classify_checks(runs, statuses, sha, checks=None):
+    """Split reported checks into ``(pending, failed)`` names.
+
+    ``checks`` is the normalized optional policy from
+    :func:`workflow_policy.check_policy`. Without it every reported check must
+    pass (the original behaviour). With it:
+
+    - a ``required`` name that never reported, is unfinished or only has a run
+      for another SHA waits; a failing/skipped/neutral/cancelled required check
+      fails;
+    - a name listed in ``allow_skipped`` whose latest runs are all ``skipped``
+      is tolerated (it is *not* reported as passing, it simply does not block);
+      neutral/cancelled/failure are never tolerated;
+    - any other reported check keeps the default all-must-pass rule.
+    """
+    checks = checks or {}
+    required = list(checks.get("required") or [])
+    allowed_skipped = set(checks.get("allow_skipped") or [])
     seen_contexts = set()
     uniq_statuses = []
     for status in statuses:
@@ -424,9 +442,22 @@ def classify_checks(runs, statuses, sha):
                     status.get("state") == "success"
                     for status in context_statuses)):
             pass
+        elif _tolerated_skip(latest, context_statuses, name, allowed_skipped):
+            pass
         else:
             failing.append(name)
+    pending.extend(name for name in required if name not in names)
     return pending, failing
+
+
+def _tolerated_skip(latest, context_statuses, name, allowed_skipped):
+    """Only an explicitly allowed, genuinely skipped optional check is excused."""
+    return (
+        name in allowed_skipped
+        and bool(latest)
+        and all(run.get("conclusion") == "skipped" for run in latest)
+        and all(status.get("state") == "success" for status in context_statuses)
+    )
 
 
 def _risk_required(settings, delivery, issue_labels):
@@ -675,7 +706,7 @@ def _inspect(value):
     if isinstance(value, list):
         return "[%s]" % ", ".join(_inspect(item) for item in value)
     if isinstance(value, dict):
-        return "%{%s}" % ", ".join(
+        return "%%{%s}" % ", ".join(
             "%s => %s" % (json.dumps(str(key), ensure_ascii=False),
                           _inspect(item))
             for key, item in sorted(

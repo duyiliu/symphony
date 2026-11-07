@@ -327,3 +327,6 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 
 - <only include when something was confusing during execution>
 ````
+
+
+The Python implementation supports GitHub + Pi. `deploy/WORKFLOW.md` is an example template; `deploy/WORKFLOW.test.md` targets isolated testing. Editing examples does not change existing deployments. See the fixture README for local setup.

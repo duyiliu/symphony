@@ -28,6 +28,8 @@ DEFAULT_REVIEW_REQUIRED_PATHS = [
 
 DEFAULT_MAX_AUTO_FILES = 100
 
+CHECK_POLICY_KEYS = ("required", "allow_skipped")
+
 
 def config(settings):
     value = getattr(settings, "github_workflow", None)
@@ -54,6 +56,8 @@ def validate(settings):
         raise WorkflowError("invalid_github_workflow_max_attempts")
     if not _risk_config(cfg.get("risk")):
         raise WorkflowError("invalid_github_workflow_risk")
+    if "checks" in cfg and not _checks_config(cfg["checks"]):
+        raise WorkflowError("invalid_github_workflow_checks")
     if any(
         label in (AGENT_LABEL, PAUSE_LABEL, HIGH_RISK_LABEL, "merge-approved")
         for label in required
@@ -100,6 +104,50 @@ def _risk_config(risk):
     ):
         return False
     return all(key in ("review_required_paths", "max_auto_files") for key in risk)
+
+
+def _checks_config(checks):
+    """Optional check policy: ``{required: [name], allow_skipped: [name]}``.
+
+    Absent means the unchanged default (every reported check must pass). Once
+    present the mapping is strict: only the two known keys, lists of non-blank
+    strings, and no name in both lists (a required check may never be excused).
+    """
+    if not isinstance(checks, dict):
+        return False
+    if any(key not in CHECK_POLICY_KEYS for key in checks):
+        return False
+    names = {}
+    for key in CHECK_POLICY_KEYS:
+        value = checks.get(key, [])
+        if not isinstance(value, list):
+            return False
+        if any(not present_string(item) for item in value):
+            return False
+        names[key] = [item.strip() for item in value]
+    return not (set(names["required"]) & set(names["allow_skipped"]))
+
+
+def check_policy(settings):
+    """Normalized check policy; empty lists keep the pre-policy default."""
+    checks = config(settings).get("checks")
+    if not isinstance(checks, dict):
+        return {"required": [], "allow_skipped": []}
+    return {
+        key: _check_names(checks.get(key))
+        for key in CHECK_POLICY_KEYS
+    }
+
+
+def _check_names(value):
+    if not isinstance(value, list):
+        return []
+    names = []
+    for item in value:
+        name = item.strip() if isinstance(item, str) else ""
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def phase(labels):

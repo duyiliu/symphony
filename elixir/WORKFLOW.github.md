@@ -14,6 +14,15 @@ tracker:
     state_dir: "/var/lib/symphony-github/receipts"
     base_branch: "main"
     max_attempts: 3
+    # Optional explicit check policy (default: every reported check must pass):
+    # checks:
+    #   required: ["tests"]        # missing/pending/other-SHA -> waiting_checks
+    #   allow_skipped: ["docs"]    # only an all-skipped latest name is tolerated,
+    #                              # success+skipped mix, timed_out/stale/
+    #                              # action_required/startup_failure still repair;
+    #                              # tolerated is not a passing check
+    # Names match exactly as GitHub reports them, matrix suffix included
+    # ("tests (3.12)"); a wrong name never matches -> waiting_checks.
     # Optional deterministic risk policy (defaults shown):
     # risk:
     #   review_required_paths: ["**/*.sql", "**/migrations/**", ".github/workflows/**"]
@@ -76,8 +85,8 @@ Never claim CI success without reading checks for the current SHA. Clearly disti
 After a successful `deliver`, finish the issue without waiting for a human:
 
 1. Call `github_workflow(action="merge", issue="123")`. The host deterministically re-validates the label, the recorded SHA, reported checks, the GitHub merge gate and branch protection, the project risk rules, and — for risky changes — a real review Approval on the current head. Only then does it squash-merge, close the Issue and clear labels.
-2. `waiting_checks` (with pending names): reported checks have not finished or mergeability is unknown. Inspect them with `github_api` GET `repos/OWNER/REPO/commits/<sha>/check-runs`, wait with reasonable intervals, then call `merge` again. Do not spin or merge anything yourself.
-3. `needs_repair` (with a reason): CI failed, the branch is dirty/blocked or a reviewer requested changes. Fix the SAME PR, push, re-run relevant tests, then call `deliver` again with the new evidence; the host freezes the new SHA and you re-enter merge monitoring. Do NOT weaken tests, skip checks or bypass review requirements.
+2. `waiting_checks` (with pending names): reported checks have not finished or mergeability is unknown. With `github_workflow.checks.required` configured, a required check that has not reported (or only reported for another SHA) also lands here. Inspect them with `github_api` GET `repos/OWNER/REPO/commits/<sha>/check-runs`, wait with reasonable intervals, then call `merge` again. Do not spin or merge anything yourself.
+3. `needs_repair` (with a reason): CI failed, a required check was skipped, the branch is dirty/blocked or a reviewer requested changes. Only a name listed in `github_workflow.checks.allow_skipped` whose latest runs are all `skipped` may be skipped without repair; a success/skipped mix across Apps, `timed_out`, `stale`, `action_required`, `startup_failure`, `neutral` and `cancelled` are always repaired, and a tolerated skip is not a passing check — never describe it as CI passing. Fix the SAME PR, push, re-run relevant tests, then call `deliver` again with the new evidence; the host freezes the new SHA and you re-enter merge monitoring. Do NOT weaken tests, skip checks or bypass review requirements.
 4. `waiting_review`: a human review Approval is required (risky change or repository branch protection). Wait with reasonable intervals and re-call `merge`; the host re-reads the review state for the current SHA every time.
 5. If checks or reviews stay unresolved, converge on nothing, or the change is high-risk/irreversible beyond your mandate (data, credentials, auth, workflows, deployments), update the Workpad with evidence and call `github_workflow(action="pause", issue="123", reason="…")`. The host adds `needs-human` and removes `agent`; a human resumes by removing `needs-human` and re-adding `agent`.
 6. Never merge the PR or close the Issue directly. Only the host performs the final squash merge and post-merge confirmation.

@@ -2339,3 +2339,8 @@ Linear workflow or the all-required-labels routing contract.
   rechecks interrupted merges on the next call; finalization outside label-based polling requires
   explicit host-side recovery. No background recovery service or workflow database is required.
 - Board actions MUST NOT substitute for a required review approval.
+
+
+### Optional GitHub check policy
+
+When configured, `tracker.github_workflow.checks.required` names must report for the delivered SHA; missing, unfinished or mismatched-SHA checks wait. `allow_skipped` names only permit optional checks to be skipped; skipped checks are not reported as passing. For the same name across multiple Apps, all latest runs must succeed, or all must be explicitly tolerated skips; mixed success/skip still requires repair. The lists must not overlap. Omitting this policy preserves existing behavior and all other merge gates.

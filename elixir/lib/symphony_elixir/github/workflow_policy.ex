@@ -25,6 +25,8 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
 
   @default_max_auto_files 100
 
+  @check_policy_keys ["required", "allow_skipped"]
+
   @spec config(map()) :: map()
   def config(settings), do: Map.get(settings, :github_workflow, %{}) || %{}
 
@@ -51,6 +53,7 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
       {present?(cfg["base_branch"]), :missing_github_workflow_base_branch},
       {positive?(Map.get(cfg, "max_attempts", 3)), :invalid_github_workflow_max_attempts},
       {risk_config?(cfg["risk"]), :invalid_github_workflow_risk},
+      {not Map.has_key?(cfg, "checks") or checks_config?(cfg["checks"]), :invalid_github_workflow_checks},
       {not Enum.any?(required_labels, &(&1 in [@agent_label, @pause_label, @high_risk_label, "merge-approved"])), :execution_labels_must_not_be_required_labels}
     ]
 
@@ -88,6 +91,27 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
       @agent_label in labels and @pause_label in labels -> :invalid
       @agent_label in labels -> :develop
       true -> :waiting
+    end
+  end
+
+  @doc """
+  Normalized optional check policy `%{required: [...], allow_skipped: [...]}`.
+
+  An absent `checks` key yields two empty lists, which is exactly the default
+  behaviour: every check GitHub reports for the delivery SHA must pass. The
+  policy is validated by `validate/1` before any merge admission runs.
+  """
+  @spec check_policy(map()) :: %{required: [String.t()], allow_skipped: [String.t()]}
+  def check_policy(settings) do
+    case config(settings)["checks"] do
+      checks when is_map(checks) ->
+        %{
+          required: normalized_check_names(checks["required"]),
+          allow_skipped: normalized_check_names(checks["allow_skipped"])
+        }
+
+      _ ->
+        %{required: [], allow_skipped: []}
     end
   end
 
@@ -197,6 +221,37 @@ defmodule SymphonyElixir.GitHub.WorkflowPolicy do
   end
 
   defp risk_config?(_risk), do: false
+
+  # Optional check policy: only the two known keys, lists of non-blank strings,
+  # and disjoint required/allow_skipped sets (a required check is never excused).
+  defp checks_config?(checks) when is_map(checks) do
+    with {:ok, required} <- check_names(Map.get(checks, "required", [])),
+         {:ok, allowed} <- check_names(Map.get(checks, "allow_skipped", [])) do
+      Enum.all?(Map.keys(checks), &(&1 in @check_policy_keys)) and
+        MapSet.disjoint?(MapSet.new(required), MapSet.new(allowed))
+    else
+      :error -> false
+    end
+  end
+
+  defp checks_config?(_checks), do: false
+
+  defp normalized_check_names(names) do
+    case check_names(names) do
+      {:ok, trimmed} -> trimmed
+      :error -> []
+    end
+  end
+
+  defp check_names(names) when is_list(names) do
+    if Enum.all?(names, &present?/1) do
+      {:ok, names |> Enum.map(&String.trim/1) |> Enum.uniq()}
+    else
+      :error
+    end
+  end
+
+  defp check_names(_names), do: :error
 
   defp absolute_private_path?(path) when is_binary(path) do
     Path.type(path) == :absolute and length(Path.split(path)) >= 3

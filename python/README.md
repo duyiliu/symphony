@@ -110,3 +110,8 @@ sudo systemctl start symphony-python
 ```
 
 注意两个服务不能同时运行（共享 8320 端口与同一批 issue）。
+
+
+The Python implementation supports GitHub + Pi. `deploy/WORKFLOW.md` is an example template; `deploy/WORKFLOW.test.md` targets isolated testing. Editing examples does not change existing deployments. See the fixture README for local setup.
+
+`python -m unittest discover -s python/tests -v` runs the Linux scheduler integration; on Windows the process integration is explicitly skipped. `board/**` has its own `.github/workflows/board-tests.yml` CI trigger.

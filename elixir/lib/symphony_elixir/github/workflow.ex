@@ -295,7 +295,7 @@ defmodule SymphonyElixir.GitHub.Workflow do
   defp auto_ready?(settings, d, pr, issue_labels, opts) do
     runs = WorkflowAPI.pages(settings, "#{WorkflowAPI.root(settings)}/commits/#{d["sha"]}/check-runs", "check_runs", opts)
     statuses = WorkflowAPI.pages(settings, "#{WorkflowAPI.root(settings)}/commits/#{d["sha"]}/statuses", nil, opts)
-    {pending, failing} = classify_checks(runs, statuses, d["sha"])
+    {pending, failing} = classify_checks(runs, statuses, d["sha"], WorkflowPolicy.check_policy(settings))
     gate = WorkflowAPI.merge_gate(settings, d["pr"], opts)
     ensure(gate["headRefOid"] == d["sha"] and gate["baseRefName"] == d["base"], :delivery_changed)
 
@@ -344,7 +344,25 @@ defmodule SymphonyElixir.GitHub.Workflow do
     end
   end
 
-  defp classify_checks(runs, statuses, sha) do
+  @doc """
+  Splits reported checks into `{pending, failing}` names.
+
+  `checks` is the normalized optional policy from `WorkflowPolicy.check_policy/1`.
+  With empty lists every reported check must pass (the original behaviour).
+  With a policy, a `required` name that never reported, is unfinished, or only
+  has a run for another SHA waits; a failing/skipped/neutral/cancelled required
+  check fails; a name in `allow_skipped` whose latest runs are all `skipped` is
+  tolerated (never reported as passing, it just does not block).
+  """
+  @spec classify_checks(
+          [map()],
+          [map()],
+          String.t(),
+          %{required: [String.t()], allow_skipped: [String.t()]}
+        ) :: {[String.t()], [String.t()]}
+  def classify_checks(runs, statuses, sha, checks) do
+    required = Map.get(checks, :required, [])
+    allowed_skipped = MapSet.new(Map.get(checks, :allow_skipped, []))
     statuses = statuses |> Enum.uniq_by(& &1["context"])
     names = Enum.uniq(Enum.map(runs, & &1["name"]) ++ Enum.map(statuses, & &1["context"]))
 
@@ -371,12 +389,22 @@ defmodule SymphonyElixir.GitHub.Workflow do
           Enum.all?(latest, &(&1["conclusion"] == "success")) and Enum.all?(context_statuses, &(&1["state"] == "success")) ->
             {pending, failing}
 
+          tolerated_skip?(latest, context_statuses, name, allowed_skipped) ->
+            {pending, failing}
+
           true ->
             {pending, [name | failing]}
         end
       end)
 
-    {Enum.reverse(pending), Enum.reverse(failing)}
+    missing = Enum.reject(required, &(&1 in names))
+    {Enum.reverse(pending) ++ missing, Enum.reverse(failing)}
+  end
+
+  defp tolerated_skip?(latest, context_statuses, name, allowed_skipped) do
+    MapSet.member?(allowed_skipped, name) and latest != [] and
+      Enum.all?(latest, &(&1["conclusion"] == "skipped")) and
+      Enum.all?(context_statuses, &(&1["state"] == "success"))
   end
 
   defp risk_required?(settings, d, issue_labels, opts) do

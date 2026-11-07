@@ -185,6 +185,108 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     assert {:ok, %{"status" => "merged"}} = call(ctx.settings, "merge", ctx.opts)
   end
 
+  test "configured check policy gates merge admission on the delivery SHA", ctx do
+    settings = check_settings(ctx.settings, %{"required" => ["tests"], "allow_skipped" => []})
+    assert :ok = Workflow.begin_run(issue(), settings, ctx.opts)
+    assert {:ok, _} = deliver(ctx, settings)
+
+    # A required check that never reported waits and never merges.
+    Agent.update(ctx.remote, &%{&1 | checks: [check(1, "build", "success")]})
+    assert {:ok, %{"status" => "waiting_checks", "pending" => ["tests"]}} = call(settings, "merge", ctx.opts)
+    assert_no_merge(ctx)
+
+    # A required check reported for another SHA is not evidence for this delivery.
+    Agent.update(ctx.remote, &%{&1 | checks: [check(2, "tests", "success", @new_sha)]})
+    assert {:ok, %{"status" => "waiting_checks", "pending" => ["tests"]}} = call(settings, "merge", ctx.opts)
+    assert_no_merge(ctx)
+
+    # A failing required check needs repair.
+    Agent.update(ctx.remote, &%{&1 | checks: [check(3, "tests", "failure")]})
+    assert {:ok, %{"status" => "needs_repair", "reason" => reason}} = call(settings, "merge", ctx.opts)
+    assert reason =~ "tests"
+    assert_no_merge(ctx)
+
+    # A skipped required check is never a pass, even though it is "not failing CI".
+    Agent.update(ctx.remote, &%{&1 | checks: [check(4, "tests", "skipped")]})
+    assert {:ok, %{"status" => "needs_repair"}} = call(settings, "merge", ctx.opts)
+    assert_no_merge(ctx)
+
+    Agent.update(ctx.remote, &%{&1 | checks: [check(5, "tests", "success")]})
+    assert {:ok, %{"status" => "merged"}} = call(settings, "merge", ctx.opts)
+    assert Agent.get(ctx.remote, & &1.merged)
+  end
+
+  test "allow_skipped tolerates only explicitly listed optional skips", ctx do
+    settings = check_settings(ctx.settings, %{"required" => ["tests"], "allow_skipped" => ["docs"]})
+    assert :ok = Workflow.begin_run(issue(), settings, ctx.opts)
+    assert {:ok, _} = deliver(ctx, settings)
+
+    Agent.update(ctx.remote, &%{&1 | checks: [check(1, "tests", "success"), check(2, "docs", "skipped")]})
+    assert {:ok, %{"status" => "merged"}} = call(settings, "merge", ctx.opts)
+    assert Agent.get(ctx.remote, & &1.merged)
+  end
+
+  test "allow_skipped never covers neutral, cancelled or unlisted skips", ctx do
+    settings = check_settings(ctx.settings, %{"required" => [], "allow_skipped" => ["docs"]})
+    assert :ok = Workflow.begin_run(issue(), settings, ctx.opts)
+    assert {:ok, _} = deliver(ctx, settings)
+
+    for {id, conclusion, name} <- [{1, "neutral", "docs"}, {2, "cancelled", "docs"}, {3, "failure", "docs"}, {4, "skipped", "lint"}] do
+      Agent.update(ctx.remote, &%{&1 | checks: [check(id, name, conclusion), check(10 + id, "tests", "success")]})
+      assert {:ok, %{"status" => "needs_repair"}} = call(settings, "merge", ctx.opts)
+      assert_no_merge(ctx)
+    end
+  end
+
+  test "without a checks key skipped optional checks still need repair", ctx do
+    assert :ok = Workflow.begin_run(issue(), ctx.settings, ctx.opts)
+    assert {:ok, _} = deliver(ctx)
+    Agent.update(ctx.remote, &%{&1 | checks: [check(1, "docs", "skipped")]})
+    assert {:ok, %{"status" => "needs_repair"}} = call(ctx.settings, "merge", ctx.opts)
+    assert_no_merge(ctx)
+  end
+
+  test "shared check fixture classifies and validates identically", ctx do
+    fixture = load_check_fixture()
+    sha = fixture["sha"]
+
+    Enum.each(fixture["classification"], fn case_row ->
+      checks = fixture_checks(case_row["checks"])
+      actual = Workflow.classify_checks(case_row["runs"], case_row["statuses"], sha, checks)
+      expected = {case_row["pending"], case_row["failing"]}
+
+      assert actual == expected, "classification mismatch for #{case_row["name"]}"
+    end)
+
+    Enum.each(fixture["config"]["valid"], fn case_row ->
+      settings =
+        if case_row["absent"] == true do
+          ctx.settings
+        else
+          %{ctx.settings | github_workflow: Map.put(ctx.settings.github_workflow, "checks", case_row["checks"])}
+        end
+
+      assert :ok = WorkflowPolicy.validate(settings)
+    end)
+
+    Enum.each(fixture["config"]["invalid"], fn case_row ->
+      settings = %{ctx.settings | github_workflow: Map.put(ctx.settings.github_workflow, "checks", case_row["checks"])}
+
+      assert {:error, error} = WorkflowPolicy.validate(settings)
+      assert Atom.to_string(error) == case_row["error"]
+    end)
+
+    assert %{required: [], allow_skipped: []} = WorkflowPolicy.check_policy(ctx.settings)
+
+    checks = %{"required" => [" tests ", "tests", "lint"], "allow_skipped" => [" docs ", "docs"]}
+    configured = %{ctx.settings | github_workflow: Map.put(ctx.settings.github_workflow, "checks", checks)}
+
+    assert %{required: ["tests", "lint"], allow_skipped: ["docs"]} = WorkflowPolicy.check_policy(configured)
+
+    invalid = %{ctx.settings | github_workflow: Map.put(ctx.settings.github_workflow, "checks", %{"required" => "tests"})}
+    assert %{required: [], allow_skipped: []} = WorkflowPolicy.check_policy(invalid)
+  end
+
   test "dirty merge states and requested changes are repaired; unknown waits; reviews are awaited", ctx do
     assert :ok = Workflow.begin_run(issue(), ctx.settings, ctx.opts)
     assert {:ok, _} = deliver(ctx)
@@ -545,10 +647,36 @@ defmodule SymphonyElixir.GitHub.WorkflowTest do
     ]
   end
 
+  defp check_settings(settings, checks) do
+    %{settings | github_workflow: Map.put(settings.github_workflow, "checks", checks)}
+  end
+
+  defp check(id, name, conclusion, sha \\ @sha) do
+    %{"id" => id, "name" => name, "head_sha" => sha, "status" => "completed", "conclusion" => conclusion}
+  end
+
+  defp fixture_checks(nil), do: %{required: [], allow_skipped: []}
+
+  defp fixture_checks(map) do
+    %{required: map["required"] || [], allow_skipped: map["allow_skipped"] || []}
+  end
+
+  defp load_check_fixture do
+    "../../../tests/fixtures/github-check-policy.json" |> Path.expand(__DIR__) |> File.read!() |> Jason.decode!()
+  end
+
   defp call(settings, action, opts \\ []), do: Workflow.execute(settings, %{"action" => action, "issue" => "1"}, opts)
   defp issue(labels \\ ["agent"]), do: %Issue{id: "1", identifier: "GH-1", state: "open", labels: labels, dispatchable: true}
 
-  defp deliver(ctx), do: Workflow.execute(ctx.settings, %{"action" => "deliver", "issue" => "1", "pr" => 2, "tests" => "mix test: passed"}, ctx.opts)
+  defp deliver(ctx), do: deliver(ctx, ctx.settings)
+
+  defp deliver(ctx, settings) do
+    Workflow.execute(
+      settings,
+      %{"action" => "deliver", "issue" => "1", "pr" => 2, "tests" => "mix test: passed"},
+      ctx.opts
+    )
+  end
 
   defp human_label(remote, label, login \\ "human") do
     Agent.update(remote, fn s ->
