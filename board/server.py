@@ -209,6 +209,18 @@ body.resizing{user-select:none;cursor:col-resize}
 .actions .at{margin:0;font-size:11px;font-weight:500;color:var(--fg)}
 .actions .an{margin:3px 0 8px;font-size:10.5px;line-height:1.5;color:var(--fg3)}
 .abtns{display:flex;flex-wrap:wrap;gap:6px}
+.action-toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.action-toolbar>.abtns{flex:1;min-width:0}
+.action-more{position:relative;flex:none}
+.action-more>summary{display:flex;align-items:center;gap:8px;list-style:none;min-height:28px;box-sizing:border-box;padding:4px 8px;color:var(--fg2);font:11px var(--sans);cursor:pointer;border:1px solid transparent;border-radius:5px}
+.action-more>summary::-webkit-details-marker{display:none}
+.action-more>summary::after{content:'';width:5px;height:5px;border-right:1px solid currentColor;border-bottom:1px solid currentColor;transform:rotate(45deg);margin-top:-3px}
+.action-more[open]>summary::after{transform:rotate(225deg);margin-top:3px}
+.action-more>summary:hover,.action-more[open]>summary{background:var(--elev);color:var(--fg)}
+.action-more>summary:focus-visible{outline:2px solid var(--info);outline-offset:2px}
+.action-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:20;width:min(260px,calc(100vw - 56px));box-sizing:border-box;padding:6px;border:1px solid var(--edge2);border-radius:6px;background:var(--elev);box-shadow:0 8px 24px #0005}
+.action-menu .abtn{display:block;width:100%;text-align:left;border-color:transparent;min-height:34px}
+.actions .action-menu .an{margin:2px 10px 6px;line-height:1.6}
 .abtn{min-height:28px;padding:4px 10px;border-radius:5px;border:1px solid var(--edge2);background:transparent;color:var(--fg2);font:11px var(--sans);cursor:pointer;transition:background .12s,color .12s,border-color .12s}
 .abtn:hover:not([disabled]){color:var(--fg);border-color:var(--fg3)}
 .abtn[disabled]{opacity:.45;cursor:default}
@@ -381,14 +393,14 @@ th{color:var(--fg3);font-weight:500}
 
 BOARD = """
 <script>
-const COLS = ['running', 'blocked', 'retrying', 'ready', 'awaiting', 'idle', 'done'];
+const COLS = ['idle', 'ready', 'running', 'retrying', 'blocked', 'awaiting', 'done'];
 const EMPTY = {
-  running: '没有正在执行的 Issue',
-  blocked: '没有异常状态',
-  retrying: '没有等待重试的 Issue',
-  ready: '没有等待派发的 Issue',
-  awaiting: '没有等待合并的 PR',
   idle: '没有空闲的 Issue',
+  ready: '没有等待派发的 Issue',
+  running: '没有正在执行的 Issue',
+  retrying: '没有等待重试的 Issue',
+  blocked: '没有异常状态',
+  awaiting: '没有等待合并的 PR',
   done: '没有已完成记录'
 };
 const MAX_MSGS = 400;
@@ -396,7 +408,7 @@ const MAX_MSGS = 400;
 let CUR = null, CARD = null, RUNS = [], AGENT = null, TROUBLE = null, LOG = null;
 let SHOW_EMPTY = localStorage.getItem('sb-show-empty') !== '0';
 let PENDING_RUN = new URLSearchParams(location.search).get('run');
-let BUSY = false, TOAST_TIMER = null, FORM_OPEN = false, DRAFT_COMMENT = '', WRITABLE = false;
+let BUSY = false, TOAST_TIMER = null, WRITABLE = false;
 const PENDING_OPERATIONS = new Map();
 
 function trackOperation(issue, op, phase = 'confirmed') {
@@ -472,7 +484,9 @@ function operationView(pending, current) {
     case 'pause': return {state: 'blocked', text: pending.wasRunning
       ? '已转人工 · 正在停止执行' : '等待人工处理'};
     case 'resume': return {state: current.mergePending ? 'awaiting' : 'ready', text: '已恢复 · 等待调度器核对'};
-    case 'stop': return {state: current.state === 'running' ? 'blocked' : 'idle', text: '已取消执行 · 等待调度器核对'};
+    case 'start': return {state: 'ready', text: '已加入队列 · 等待调度器领取'};
+    case 'stop': return {state: pending.wasRunning ? 'blocked' : 'idle', text: pending.wasRunning
+      ? '暂停已提交 · 正在停止执行' : '已暂停 · 等待调度器核对'};
     default: return {text: '标签已更新 · 等待同步'};
   }
 }
@@ -483,10 +497,12 @@ function operationNotice(issue) {
   const delayed = Date.now() - pending.at > 60000;
   return (pending.phase === 'uncertain' ? '请求结果不确定，正在重新读取 GitHub；请勿重复提交'
     : pending.phase === 'partial' ? '操作未完整完成，正在重新读取 GitHub 标签'
+    : pending.op === 'start' ? '开始执行已提交，等待调度器领取；不代表 AI 已启动'
     : pending.op === 'resume' ? '恢复已提交，等待调度器核对；不代表 AI 已启动'
     : pending.op === 'pause' ? '暂停标签已更新，运行中的任务仍需等待停止确认'
     : pending.op === 'approve' ? '批准已提交；宿主仍需核验当前 SHA、检查和有效审批'
     : pending.op === 'revoke' ? '批准已撤销；若合并已发生则不能撤回'
+    : pending.op === 'stop' ? '暂停已提交；调度器确认停止前，任务可能仍在运行'
     : '标签已更新，等待状态同步')
     + (delayed ? '；同步延迟，请检查调度器状态。' : '。');
 }
@@ -502,14 +518,14 @@ function confirmOperations(data) {
       PENDING_OPERATIONS.delete(issue);
       continue;
     }
-    const labelMatches = pending.op === 'resume' ? labels.includes('agent') && !labels.includes('needs-human')
+    const labelMatches = ['start', 'resume'].includes(pending.op) ? labels.includes('agent') && !labels.includes('needs-human')
       : pending.op === 'pause' ? labels.includes('needs-human') && !labels.includes('agent')
       : pending.op === 'approve' ? labels.includes('merge-approved')
       : pending.op === 'revoke' ? !labels.includes('merge-approved')
       : pending.op === 'stop' ? !labels.includes('agent') : true;
     if (!labelMatches) { continue; }
     const runtime = (data.runtime || {})[issue];
-    const expected = pending.op === 'resume'
+    const expected = ['start', 'resume'].includes(pending.op)
       ? runtime !== 'blocked'
       : pending.op === 'pause' || pending.op === 'stop' ? runtime !== 'running' && runtime !== 'retrying' : true;
     if (expected && (['approve', 'revoke', 'labels'].includes(pending.op)
@@ -775,13 +791,25 @@ boardEl.addEventListener('click', function (e) {
 });
 
 document.addEventListener('keydown', function (e) {
+  const menu = document.querySelector('.action-more[open]');
+  if (e.key === 'Escape' && menu) {
+    menu.open = false;
+    menu.querySelector('summary').focus();
+    e.preventDefault();
+    return;
+  }
   if (e.key === 'Escape' && CUR) { closeDrawer(); }
+});
+
+document.addEventListener('click', function (e) {
+  document.querySelectorAll('.action-more[open]').forEach(menu => {
+    if (!menu.contains(e.target)) { menu.open = false; }
+  });
 });
 
 function openIssue(name) {
   CUR = name;
   RUNS = []; AGENT = null; LOG = null; TROUBLE = null;
-  FORM_OPEN = false; DRAFT_COMMENT = '';
   markSel();
   syncUrl(name);
   const card = (VIEW === 'active' ? boardEl : document.getElementById('completed-list')).querySelector(".bcard[data-issue='" + name + "']");
@@ -858,6 +886,13 @@ function refreshCard() {
   CARD.prNum = card.getAttribute('data-pr-num') || '';
 }
 
+function moreActionsHtml() {
+  return "<details class='action-more'" + (BUSY ? ' inert' : '') + "><summary>更多操作</summary>"
+    + "<div class='action-menu'><button class='abtn warn' data-intervene='pause'"
+    + (BUSY ? ' disabled' : '') + ">转人工处理</button>"
+    + "<p class='an'>暂停自动处理，并标记需要人工介入。</p></div></details>";
+}
+
 function actionsHtml() {
   if (!CARD) { return ''; }
   if (PENDING_OPERATIONS.has(CUR)) {
@@ -887,51 +922,34 @@ function actionsHtml() {
   } else if (CARD.agent && CARD.mergePending) {
     inner = CARD.approved
       ? "<p class='an'>已挂 merge-approved；宿主会在下一轮合并评估时放行冻结的交付 SHA。</p>"
-        + "<div class='abtns'>"
+        + "<div class='action-toolbar'><div class='abtns'>"
         + "<button class='abtn warn' data-act='remove' data-label='merge-approved'" + (BUSY ? ' disabled' : '') + ">"
         + (BUSY ? '正在提交…' : '撤销批准') + "</button></div>"
       : "<p class='an'>交付已发布，宿主会定期检查合并条件。请先查看 PR，再决定是否批准。</p>"
-        + "<div class='abtns'>"
+        + "<div class='action-toolbar'><div class='abtns'>"
         + "<button class='abtn ok' data-act='add' data-label='merge-approved'" + (BUSY ? ' disabled' : '') + ">"
         + (BUSY ? '正在提交…' : '批准合并') + "</button>"
         + (CARD.pr ? "<a class='abtn' href='" + escHtml(CARD.pr) + "' target='_blank' rel='noopener noreferrer'>查看 PR</a>" : '')
         + "</div>";
-    inner += "<details><summary>更多操作</summary>"
-      + "<p class='an'>暂停后不会自动合并，恢复执行后才会继续处理。</p>"
-      + "<div class='abtns'><button class='abtn warn' data-intervene='pause'" + (BUSY ? ' disabled' : '') + ">暂停自动处理</button></div></details>";
+    inner += moreActionsHtml() + "</div>";
   } else if (CARD.agent) {
-    const running = CARD.state === 'running';
-    const label = running ? '停止' : '取消派发';
-    const tone = running ? 'danger' : 'warn';
-    inner = "<p class='an'>操作直接写 GitHub 标签；摘标签会在下个轮询周期终止正在运行的任务。</p>"
-      + "<div class='abtns'>"
-      + "<button class='abtn warn' data-intervene='pause'" + (BUSY ? ' disabled' : '') + ">转人工处理</button>"
-      + "<button class='abtn " + tone + "' data-act='remove' data-label='agent'"
-      + (BUSY ? ' disabled' : '') + ">" + (BUSY ? '正在提交…' : label) + "</button></div>";
-  } else if (FORM_OPEN) {
-    inner = "<p class='an'>重新执行前建议留一条说明：agent 启动后会读取 issue 评论，知道这次要做什么、上次为何失败。</p>"
-      + "<textarea id='acomment' class='acmt' rows='3' maxlength='4000' "
-      + "placeholder='可选：这次要做什么 / 上次的问题是什么'>" + escHtml(DRAFT_COMMENT) + "</textarea>"
+    inner = "<p class='an'>暂停后不再自动执行；运行中的任务需要等待调度器确认停止。</p>"
+      + "<div class='action-toolbar'><div class='abtns'>"
+      + "<button class='abtn warn' data-act='remove' data-label='agent'"
+      + (BUSY ? ' disabled' : '') + ">" + (BUSY ? '正在提交…' : '暂停执行') + "</button></div>"
+      + moreActionsHtml() + "</div>";
+  } else {
+    inner = "<p class='an'>给此 Issue 加上 agent 标签，调度器会按 Issue 内容领取任务。</p>"
       + "<div class='abtns'>"
       + "<button class='abtn ok' data-act='add' data-label='agent'" + (BUSY ? ' disabled' : '') + ">"
-      + (BUSY ? '正在提交…' : '发布并执行') + "</button>"
-      + "<button class='abtn' data-cancel='1'" + (BUSY ? ' disabled' : '') + ">取消</button>"
-      + "</div>";
-  } else {
-    const openLabel = CARD.state === 'awaiting' ? '重新执行…' : '开始执行…';
-    inner = "<p class='an'>加 agent 标签后，agent 会开发、交付，宿主自动校验 CI/风险规则并完成合并；"
-      + "高风险或收敛不了时会暂停并标记 needs-human，到时在这里恢复。</p>"
-      + "<div class='abtns'>"
-      + "<button class='abtn ok' data-open='1'" + (BUSY ? ' disabled' : '') + ">" + openLabel + "</button></div>";
+      + (BUSY ? '正在提交…' : '开始执行') + "</button></div>";
   }
-  return "<section class='actions' id='actions'><p class='at'>在看板操作 GitHub 标签</p>" + inner + "</section>";
+  return "<section class='actions' id='actions'><p class='at'>任务操作</p>" + inner + "</section>";
 }
 
 function renderActions() {
   const el = document.getElementById('actions');
   if (!el) { return; }
-  const active = document.activeElement;
-  if (active && active.id === 'acomment') { return; }
   el.outerHTML = actionsHtml();
 }
 
@@ -941,10 +959,10 @@ async function interveneAction(op) {
   if (op === 'pause') {
     const reason = await openDialog({
       tone: 'warn',
-      title: (CARD && CARD.mergePending ? '暂停自动处理 ' : '转人工处理 ') + CUR,
+      title: '转人工处理 ' + CUR,
       body: '暂停后不会自动合并，恢复执行后才会继续处理。可填写原因（可选），会作为 issue 评论发布。',
       input: { placeholder: '例如：需要人工确认合并范围 / 先暂停观察', maxlength: 4000 },
-      confirmText: CARD && CARD.mergePending ? '暂停自动处理' : '转人工处理'
+      confirmText: '转人工处理'
     });
     if (reason === null) { return; }
     comment = String(reason).trim();
@@ -975,14 +993,11 @@ async function interveneAction(op) {
 async function labelAction(action, label) {
   if (!CUR || BUSY) { return; }
   label = label || 'agent';
-  const input = document.getElementById('acomment');
-  const comment = action === 'add' && input ? input.value.trim() : '';
+  const comment = '';
   const running = CARD.state === 'running';
   let dialog;
   if (action === 'add' && label === 'agent') {
-    dialog = comment
-      ? { tone: 'ok', title: '发布说明并开始执行', body: '给 ' + CUR + ' 加上 agent 标签？调度器会在下个轮询周期开始执行（改代码，可能推 PR）。', confirmText: '发布并执行' }
-      : { tone: 'warn', title: '开始执行 ' + CUR, body: '没有填写说明，直接加 agent 标签？agent 可能重复上次的做法。', confirmText: '开始执行' };
+    dialog = null;
   } else if (action === 'add' && label === 'merge-approved') {
     dialog = { tone: 'ok', title: '批准合并 ' + CUR, body: '挂 merge-approved 标签？宿主会在下一轮合并评估放行当前冻结的交付 SHA——此操作视同人工批准，请先确认 PR 内容。', confirmText: '批准合并' };
   } else if (action === 'add') {
@@ -991,24 +1006,21 @@ async function labelAction(action, label) {
     dialog = { tone: 'warn', title: '撤销批准 ' + CUR, body: '摘掉 merge-approved 标签？宿主下轮评估会把该交付重新判为未批准，不再自动合并（若已放行则无法撤回）。', confirmText: '撤销批准' };
   } else if (label === 'agent') {
     dialog = running
-      ? { tone: 'danger', title: '停止执行 ' + CUR, body: '摘掉 agent 标签？调度器会在下个轮询周期终止正在运行的任务。', confirmText: '停止执行' }
-      : { tone: 'warn', title: '取消派发 ' + CUR, body: '摘掉 agent 标签？该 issue 将退出自动化队列，重新挂回会按新周期重新派发（不会续跑）。', confirmText: '取消派发' };
+      ? { tone: 'warn', title: '暂停执行 ' + CUR, body: '暂停此任务？会移除 agent 标签，运行中的任务需要等待调度器确认停止。', confirmText: '暂停执行' }
+      : { tone: 'warn', title: '暂停执行 ' + CUR, body: '暂停后，此任务不再被自动领取。之后可点击开始执行重新加入队列。', confirmText: '暂停执行' };
   } else {
     dialog = { tone: 'warn', title: '摘掉 needs-human ' + CUR, body: '摘掉 needs-human 标签？如需继续执行，请再重新加 agent。', confirmText: '摘掉标签' };
   }
-  if (!(await openDialog(dialog))) { return; }
-  if (action === 'add') { DRAFT_COMMENT = comment; }
+  if (dialog && !(await openDialog(dialog))) { return; }
   const issue = CUR;
   const operation = label === 'merge-approved' ? (action === 'add' ? 'approve' : 'revoke')
-    : label === 'agent' ? (action === 'add' ? 'resume' : 'stop')
+    : label === 'agent' ? (action === 'add' ? 'start' : 'stop')
     : action === 'add' ? 'pause' : 'labels';
   BUSY = true;
   renderActions();
   try {
     const data = await postGithubOperation('/api/label', {issue, action, label, comment}, issue, operation);
     toast(data.message || '已提交');
-    FORM_OPEN = false;
-    DRAFT_COMMENT = '';
     await refreshIssues(true);
     refreshCard();
     await loadRuns(true);
@@ -1305,19 +1317,6 @@ dbodyEl.addEventListener('click', function (e) {
   if (iv) { interveneAction(iv.getAttribute('data-intervene')); return; }
   const act = e.target.closest('[data-act]');
   if (act) { labelAction(act.getAttribute('data-act'), act.getAttribute('data-label')); return; }
-  if (e.target.closest('[data-open]')) {
-    FORM_OPEN = true;
-    renderActions();
-    const input = document.getElementById('acomment');
-    if (input) { input.focus(); }
-    return;
-  }
-  if (e.target.closest('[data-cancel]')) {
-    FORM_OPEN = false;
-    DRAFT_COMMENT = '';
-    renderActions();
-    return;
-  }
   const fb = e.target.closest('[data-follow]');
   if (fb) {
     if (LOG) {
@@ -1336,10 +1335,6 @@ dbodyEl.addEventListener('click', function (e) {
     if (LOG && LOG.short === short) { closeLog(short); LOG = null; }
     else { openLog(short); }
   }
-});
-
-dbodyEl.addEventListener('input', function (e) {
-  if (e.target && e.target.id === 'acomment') { DRAFT_COMMENT = e.target.value; }
 });
 
 dbodyEl.addEventListener('wheel', function (e) {
@@ -2129,34 +2124,34 @@ def page(title, body, refresh=None):
 
 
 STATUS_UI = {
-    "running": ("运行中", "running"),
-    "blocked": ("阻塞", "blocked"),
-    "retrying": ("重试中", "retrying"),
-    "ready": ("待处理", "ready"),
-    "awaiting": ("待合并", "awaiting"),
     "idle": ("空闲", "idle"),
+    "ready": ("待处理", "ready"),
+    "running": ("运行中", "running"),
+    "retrying": ("重试中", "retrying"),
+    "blocked": ("阻塞", "blocked"),
+    "awaiting": ("待合并", "awaiting"),
     "done": ("已完成", "done"),
 }
 
 COLUMNS = [
-    ("running", "运行中", "执行中 · 运行状态只在本机记录"),
-    ("blocked", "阻塞", "失败或需要人工处理"),
-    ("retrying", "重试中", "等待下一次重试"),
-    ("ready", "待处理", "等待调度器领取 · agent 标签"),
-    ("awaiting", "待合并", "PR 已开 · 等待人工 review / 合并"),
     ("idle", "空闲", "既无 agent 标签也无 open PR"),
+    ("ready", "待处理", "等待调度器领取 · agent 标签"),
+    ("running", "运行中", "执行中 · 运行状态只在本机记录"),
+    ("retrying", "重试中", "等待下一次重试"),
+    ("blocked", "阻塞", "失败或需要人工处理"),
+    ("awaiting", "待合并", "PR 已开 · 等待人工 review / 合并"),
     ("done", "已完成", "最近关闭的 Issue · 同步自 GitHub"),
 ]
 
 STATUS_TEXT = {key: value[0] for key, value in STATUS_UI.items()}
 
 EMPTY_TEXT = {
-    "running": "没有正在执行的 Issue",
-    "blocked": "没有异常状态",
-    "retrying": "没有等待重试的 Issue",
-    "ready": "没有等待派发的 Issue",
-    "awaiting": "没有等待合并的 PR",
     "idle": "没有空闲的 Issue",
+    "ready": "没有等待派发的 Issue",
+    "running": "没有正在执行的 Issue",
+    "retrying": "没有等待重试的 Issue",
+    "blocked": "没有异常状态",
+    "awaiting": "没有等待合并的 PR",
     "done": "没有已完成记录",
 }
 
