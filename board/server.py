@@ -51,6 +51,8 @@ TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 ISSUE_CACHE_TTL = 60.0
 DONE_COL_LIMIT = 8
 SESSION_CACHE_TTL = 20.0
+PAUSE_CACHE_TTL = 120.0
+GITHUB_POLL_INTERVAL = float(os.environ.get("SYMPHONY_GITHUB_POLL_S", "30"))
 _cache = {"issues": None, "issues_at": 0.0, "sessions": None, "sessions_at": 0.0}
 _github_cache_lock = threading.Lock()
 _github_generation = 0
@@ -1827,7 +1829,10 @@ BOARD_PAUSE_PREFIX = "[board] 人工暂停（needs-human）："
 DEFAULT_PAUSE_NOTE = "看板转人工处理，请补充原因后恢复执行"
 
 
-def pause_reason(repo, token, number):
+_pause_cache = {}
+
+
+def fetch_pause_reason(repo, token, number):
     """Latest pause reason for an issue (host or board initiated), best effort."""
     if not repo or not token:
         return ""
@@ -1849,6 +1854,19 @@ def pause_reason(repo, token, number):
                 reason = re.sub(r"^[(（]\s*needs-human\s*[)）]\s*[:：]?\s*", "", reason)
                 return reason.strip(" \n-：:")[:600]
     return ""
+
+
+def pause_reason(repo, token, number):
+    """Cached pause reason; the github_poller keeps entries warm."""
+    if not repo or not token:
+        return ""
+    now = time.time()
+    cached = _pause_cache.get(number)
+    if cached is not None and now - cached["at"] < PAUSE_CACHE_TTL:
+        return cached["reason"]
+    reason = fetch_pause_reason(repo, token, number)
+    _pause_cache[number] = {"reason": reason, "at": now}
+    return reason
 
 
 def github_issues():
@@ -1987,6 +2005,7 @@ def clear_github_cache():
         _cache["issues_at"] = 0.0
         _pulls_cache["data"] = None
         _pulls_cache["at"] = 0.0
+        _pause_cache.clear()
 
 
 def request_scheduler_refresh():
@@ -2036,6 +2055,29 @@ def state_poller():
                 print("state poller ready: %s" % STATE_URL, flush=True)
                 announced = True
         time.sleep(STATE_POLL_INTERVAL)
+
+
+def github_poller():
+    """Keeps tracker caches warm so request threads never wait on api.github.com."""
+    announced = False
+    while True:
+        started = time.time()
+        try:
+            issues = github_issues()
+            github_pulls()
+            github_history()
+            repo, token = load_tracker()
+            for issue in issues or []:
+                labels = [l.get("name", "") for l in issue.get("labels") or []]
+                if any(label.lower() == "needs-human" for label in labels):
+                    pause_reason(repo, token, issue.get("number"))
+            scan_sessions()
+        except Exception:
+            pass
+        if not announced:
+            print("github poller ready", flush=True)
+            announced = True
+        time.sleep(max(1.0, GITHUB_POLL_INTERVAL - (time.time() - started)))
 
 
 def agent_status(state):
@@ -3878,6 +3920,7 @@ def main():
     with _state_lock:
         _state_cache["started"] = True
     threading.Thread(target=state_poller, daemon=True, name="symphony-state").start()
+    threading.Thread(target=github_poller, daemon=True, name="symphony-github").start()
 
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     server.daemon_threads = True
