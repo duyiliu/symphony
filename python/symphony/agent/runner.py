@@ -19,6 +19,8 @@ log = logging.getLogger("symphony.runner")
 # Run results pushed back to the orchestrator.
 DONE_NORMAL = "normal"
 DONE_WAITING = "github_workflow_waiting"  # blocked receipt; human must relabel
+DONE_AWAIT_MERGE = "await_merge"          # host polls the merge gate itself
+DONE_NEEDS_WORKER = "needs_worker"        # admission needs an agent slot
 DONE_CANCELLED = "cancelled"
 
 
@@ -82,8 +84,14 @@ def run(issue, settings, on_update, on_done, handle, opts=None):
         if admission == "waiting":
             on_done(issue.id, DONE_WAITING)
             return
+        if admission == "await_merge":
+            on_done(issue.id, DONE_AWAIT_MERGE)
+            return
         if admission == "skip":
             on_done(issue.id, DONE_NORMAL)
+            return
+        if opts.get("admission_only"):
+            on_done(issue.id, DONE_NEEDS_WORKER)
             return
         _run_on_worker_host(
             issue, settings, on_update, on_done, handle, worker_host,
@@ -202,6 +210,24 @@ def _continue_with_issue(issue, settings):
         and tracker_adapter.routable(refreshed, settings.tracker)
         and tracker_adapter.same_workflow_phase(issue, refreshed, settings.tracker)
     ):
+        # A blocked receipt ends the run even if the pause-time label swap
+        # failed to land (issue still looks routable). Without this the
+        # continuation loop re-enters with a stale cycle and every
+        # deliver/merge call is rejected as no_active_workflow_run.
+        if tracker_adapter.issue_blocked(refreshed, settings.tracker):
+            log.info(
+                "Ending run for %s: workflow receipt is blocked",
+                _issue_context(refreshed))
+            return False
+        # Once a delivery is published the merge gate belongs to the host:
+        # end the run instead of letting the agent burn turns polling checks.
+        # The next admission evaluates the gate inline and re-dispatches a
+        # worker only when the gate says repair is needed.
+        if tracker_adapter.host_owns_merge(refreshed, settings.tracker):
+            log.info(
+                "Ending run for %s: delivery published; host owns the "
+                "merge gate", _issue_context(refreshed))
+            return False
         return refreshed
     return False
 

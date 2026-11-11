@@ -62,6 +62,10 @@ def issue_blocked(issue, tracker_settings):
     return workflow.waiting(issue, tracker_settings)
 
 
+def host_owns_merge(issue, tracker_settings):
+    return workflow.merge_pending(issue, tracker_settings)
+
+
 def same_workflow_phase(before, after, tracker_settings):
     return workflow_policy.same_phase(before, after, tracker_settings)
 

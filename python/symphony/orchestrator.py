@@ -29,6 +29,9 @@ log = logging.getLogger("symphony.orchestrator")
 
 CONTINUATION_RETRY_DELAY_MS = 1_000
 FAILURE_RETRY_BASE_MS = 10_000
+# Cadence for host-side merge gate evaluation while a delivery awaits
+# merge — the worker is released so each poll is just a few API reads.
+MERGE_POLL_DELAY_MS = 30_000
 
 _EMPTY_TOTALS = {
     "input_tokens": 0,
@@ -91,6 +94,7 @@ class Orchestrator:
         self.retry_attempts = {}
         self.codex_totals = dict(_EMPTY_TOTALS)
         self.codex_rate_limits = None
+        self._published = None
 
     # -- lifecycle ------------------------------------------------------
 
@@ -128,6 +132,14 @@ class Orchestrator:
     # -- public API (thread-safe) -----------------------------------------
 
     def snapshot(self, timeout_s=15):
+        # Fast path: the loop publishes an immutable snapshot after every
+        # handled message, so readers never queue behind a long poll cycle.
+        # Before the first publish (or if the loop is wedged entirely) fall
+        # back to the mailbox call.
+        published = self._published
+        if published is not None:
+            return published
+
         def handler(state):
             self._refresh_runtime_config()
             return self._snapshot(state)
@@ -159,6 +171,15 @@ class Orchestrator:
                 self._handle(message)
             except Exception:  # noqa: BLE001 - the loop must survive
                 log.exception("Orchestrator failed handling message=%r", message)
+            self._publish_snapshot()
+
+    def _publish_snapshot(self):
+        try:
+            import copy
+
+            self._published = copy.deepcopy(self._snapshot(self))
+        except Exception:  # noqa: BLE001 - publishing must never kill the loop
+            log.exception("snapshot publish failed")
 
     def _handle(self, message):
         kind = message[0]
@@ -286,7 +307,8 @@ class Orchestrator:
     # -- dispatch ----------------------------------------------------------
 
     def _available_slots(self):
-        return max(self.max_concurrent_agents - len(self.running), 0)
+        used = sum(1 for entry in self.running.values() if not entry.get("merge_eval"))
+        return max(self.max_concurrent_agents - used, 0)
 
     def _active_state_set(self, settings):
         return {
@@ -348,7 +370,7 @@ class Orchestrator:
         normalized = normalize_issue_state(issue.state)
         used = sum(
             1 for entry in self.running.values()
-            if entry.get("issue") is not None
+            if not entry.get("merge_eval") and entry.get("issue") is not None
             and normalize_issue_state(entry["issue"].state or "") == normalized
         )
         return limit > used
@@ -378,7 +400,7 @@ class Orchestrator:
     def _running_on_host(self, host):
         return sum(
             1 for entry in self.running.values()
-            if entry.get("worker_host") == host)
+            if not entry.get("merge_eval") and entry.get("worker_host") == host)
 
     def _dispatch_issue(self, issue, settings, attempt=None, preferred_host=None):
         refreshed = self._refresh_issue_for_dispatch(issue, settings)
@@ -419,7 +441,7 @@ class Orchestrator:
             return ("skip", refreshed)
         return refreshed
 
-    def _spawn_issue(self, issue, settings, attempt, worker_host):
+    def _spawn_issue(self, issue, settings, attempt, worker_host, merge_eval=False):
         ref = self._new_token()
         handle = agent_runner.RunHandle()
 
@@ -439,7 +461,8 @@ class Orchestrator:
             try:
                 agent_runner.run(
                     issue, settings, on_update, on_done, handle,
-                    opts={"worker_host": worker_host, "attempt": attempt})
+                    opts={"worker_host": worker_host, "attempt": attempt,
+                          "admission_only": merge_eval})
             except Exception as error:  # noqa: BLE001 - last-resort isolation
                 log.exception("Agent runner crashed for %s", _issue_context(issue))
                 on_done(issue.id, error)
@@ -467,6 +490,7 @@ class Orchestrator:
             "codex_last_reported_total_tokens": 0,
             "turn_count": 0,
             "retry_attempt": attempt if isinstance(attempt, int) and attempt > 0 else 0,
+            "merge_eval": merge_eval,
             "started_at": _now(),
         }
         try:
@@ -482,7 +506,7 @@ class Orchestrator:
             return
 
         log.info(
-            "Dispatching issue to agent: %s attempt=%r worker_host=%s",
+            "Runner spawned for issue: %s attempt=%r worker_host=%s",
             _issue_context(issue), attempt, worker_host or "local")
         self.running[issue.id] = entry
         self.claimed.add(issue.id)
@@ -502,6 +526,25 @@ class Orchestrator:
                 issue_id, entry,
                 "GitHub workflow paused; waiting for a new label event",
                 github_workflow_waiting=True)
+        elif reason == agent_runner.DONE_AWAIT_MERGE:
+            # A published delivery is waiting on the merge gate (checks,
+            # review, approval). The worker slot was released; the next
+            # retry tick re-runs admission which evaluates the gate
+            # host-side and merges / re-polls / dispatches a repair worker.
+            self._schedule_issue_retry(issue_id, 1, {
+                "identifier": entry.get("identifier"),
+                "issue_url": entry["issue"].url if entry.get("issue") else None,
+                "delay_type": "merge_poll",
+                "worker_host": entry.get("worker_host"),
+                "workspace_path": entry.get("workspace_path"),
+            })
+        elif reason == agent_runner.DONE_NEEDS_WORKER:
+            self._schedule_issue_retry(issue_id, 1, {
+                "identifier": entry.get("identifier"),
+                "issue_url": entry["issue"].url if entry.get("issue") else None,
+                "delay_type": "continuation",
+                "worker_host": entry.get("worker_host"),
+            })
         elif reason == agent_runner.DONE_NORMAL:
             if self._input_required_blocker(entry):
                 self._block_input_required(issue_id, entry, session_id, "normal")
@@ -618,6 +661,7 @@ class Orchestrator:
             "timer": None,
             "retry_token": token,
             "due_at_ms": due_at_ms,
+            "delay_type": metadata.get("delay_type") or previous.get("delay_type"),
             "identifier": metadata.get("identifier")
                 or previous.get("identifier") or issue_id,
             "issue_url": metadata.get("issue_url") or previous.get("issue_url"),
@@ -640,6 +684,8 @@ class Orchestrator:
     def _retry_delay(self, attempt, metadata, settings):
         if metadata.get("delay_type") == "continuation" and attempt == 1:
             return CONTINUATION_RETRY_DELAY_MS
+        if metadata.get("delay_type") == "merge_poll":
+            return MERGE_POLL_DELAY_MS
         return self._failure_retry_delay(attempt, settings)
 
     @staticmethod
@@ -660,6 +706,7 @@ class Orchestrator:
             "error": entry.get("error"),
             "worker_host": entry.get("worker_host"),
             "workspace_path": entry.get("workspace_path"),
+            "delay_type": entry.get("delay_type"),
         }
         self.retry_attempts.pop(issue_id, None)
         settings = self._store.settings()
@@ -701,12 +748,11 @@ class Orchestrator:
     def _handle_active_retry(self, issue, attempt, metadata, settings):
         terminal = self._terminal_state_set(settings)
         active = self._active_state_set(settings)
-        slots = (
-            self._candidate_issue(issue, active, terminal, settings)
-            and self._available_slots() > 0
+        merge_eval = metadata.get("delay_type") == "merge_poll"
+        slots = self._candidate_issue(issue, active, terminal, settings) and (
+            merge_eval or (self._available_slots() > 0
             and self._state_slots_available(issue, settings)
-            and self._worker_slots_available(settings, metadata.get("worker_host"))
-        )
+            and self._worker_slots_available(settings, metadata.get("worker_host"))))
         if slots:
             refreshed = self._refresh_issue_for_dispatch(issue, settings)
             if isinstance(refreshed, tuple) and refreshed[0] == "error":
@@ -729,13 +775,17 @@ class Orchestrator:
         self._schedule_issue_retry(issue.id, attempt + 1, metadata, settings)
 
     def _dispatch_refreshed(self, issue, settings, attempt, metadata):
+        if metadata.get("delay_type") == "merge_poll":
+            self._spawn_issue(issue, settings, attempt, None, merge_eval=True)
+            return
         worker_host = self._select_worker_host(settings, metadata.get("worker_host"))
         if worker_host == "no_worker_capacity":
             metadata["identifier"] = issue.identifier
             metadata["error"] = "no available orchestrator slots"
             self._schedule_issue_retry(issue.id, attempt + 1, metadata, settings)
             return
-        self._spawn_issue(issue, settings, attempt, worker_host)
+        self._spawn_issue(issue, settings, attempt, worker_host,
+                        merge_eval=metadata.get("delay_type") == "merge_poll")
 
     def _release_issue_claim(self, issue_id):
         self.claimed.discard(issue_id)
@@ -1108,6 +1158,7 @@ class Orchestrator:
                 "codex_output_tokens": entry.get("codex_output_tokens", 0),
                 "codex_total_tokens": entry.get("codex_total_tokens", 0),
                 "turn_count": entry.get("turn_count", 0),
+                "merge_eval": bool(entry.get("merge_eval")),
                 "started_at": entry.get("started_at"),
                 "last_codex_timestamp": entry.get("last_codex_timestamp"),
                 "last_codex_message": entry.get("last_codex_message"),
@@ -1120,6 +1171,7 @@ class Orchestrator:
                 "issue_id": issue_id,
                 "attempt": retry.get("attempt"),
                 "due_in_ms": max(0, retry.get("due_at_ms", 0) - now_ms),
+                "delay_type": retry.get("delay_type"),
                 "identifier": retry.get("identifier"),
                 "issue_url": retry.get("issue_url"),
                 "error": retry.get("error"),

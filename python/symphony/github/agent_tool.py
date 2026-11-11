@@ -37,7 +37,8 @@ _GITHUB_API_SPEC = {
                 "additionalProperties": True,
             },
             "body": {
-                "description": "Optional JSON request body.",
+                "type": ["object", "null"],
+                "description": "Optional JSON request body (object, not a JSON string).",
             },
         },
     },
@@ -145,7 +146,7 @@ def _normalize_arguments(arguments):
     method = _normalize_method(arguments.get("method"))
     path = _normalize_path(arguments.get("path"))
     params = _normalize_params(arguments.get("params"))
-    return method, path, params, arguments.get("body")
+    return method, path, params, _normalize_body(arguments.get("body"))
 
 
 def _normalize_method(method):
@@ -172,7 +173,34 @@ def _normalize_params(params):
         return {}
     if isinstance(params, dict):
         return params
+    if isinstance(params, str):
+        parsed = _json_object(params)
+        if parsed is not None:
+            return parsed
     raise GateError("invalid_params")
+
+
+def _normalize_body(body):
+    """Models sometimes send the JSON body as a serialized string.
+
+    The policy layer requires a dict, so a string body silently reads as a
+    denied request; coerce it (or fail with a clear reason) instead.
+    """
+    if body is None or isinstance(body, dict):
+        return body
+    if isinstance(body, str):
+        parsed = _json_object(body)
+        if parsed is not None:
+            return parsed
+    raise GateError("invalid_body")
+
+
+def _json_object(raw):
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _rest_response(status, body):

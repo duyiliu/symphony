@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import time
 
+from . import util
 from .paths import PathSafetyError, canonicalize, expand_workspace_root, safe_join
 from .workflow import WorkflowError
 
@@ -99,9 +100,32 @@ def create_for_issue(settings, issue, workflow_path=None, worker_host=None):
     return path
 
 
+def _rmtree_compat(path):
+    """``shutil.rmtree`` that survives read-only files.
+
+    Git object files are read-only; on Windows deleting them fails with
+    WinError 5. Chmod-and-retry handles it (a no-op on already-writable
+    trees). ``onexc`` replaced ``onerror`` in Python 3.12.
+    """
+    import stat
+    import sys
+
+    def _force_writeable(func, target, _exc_info):
+        try:
+            os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+        func(target)
+
+    kwargs = ({"onexc": _force_writeable}
+              if sys.version_info >= (3, 12)
+              else {"onerror": _force_writeable})
+    shutil.rmtree(path, **kwargs)
+
+
 def _cleanup_failed_new_workspace(path):
     try:
-        shutil.rmtree(path)
+        _rmtree_compat(path)
     except OSError as error:
         log.warning(
             "workspace cleanup after failed create failed path=%s error=%s",
@@ -204,7 +228,7 @@ def _remove_local(settings, path):
                 "before_remove hook failed workspace=%s error=%s", path, error)
     try:
         if os.path.isdir(path) and not os.path.islink(path):
-            shutil.rmtree(path)
+            _rmtree_compat(path)
         else:
             os.remove(path)
         return True
@@ -265,7 +289,7 @@ def _run_hook(command, name, cwd, timeout_ms):
     env["SYMPHONY_WORKSPACE"] = cwd
     try:
         process = subprocess.Popen(
-            ["sh", "-lc", command],
+            [util.posix_shell(), "-lc", command],
             cwd=cwd,
             env=env,
             stdout=subprocess.PIPE,
@@ -317,23 +341,14 @@ def _truncate(text, limit=2048):
 def _kill_process(process):
     import signal
 
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        try:
-            process.terminate()
-        except OSError:
-            return
+    from . import util
+
+    util.signal_process_tree(process, signal.SIGTERM)
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            try:
-                process.kill()
-            except OSError:
-                pass
+        util.signal_process_tree(
+            process, getattr(signal, "SIGKILL", signal.SIGTERM))
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:

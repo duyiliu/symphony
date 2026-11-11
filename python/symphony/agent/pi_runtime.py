@@ -21,6 +21,7 @@ import subprocess
 import threading
 import time
 
+from .. import util
 from ..workflow import WorkflowError
 
 log = logging.getLogger("symphony.pi")
@@ -97,7 +98,7 @@ def _open_session(workspace, config, settings):
         workspace, session_id, config.command)
     try:
         process = subprocess.Popen(
-            ["bash", "-lc", script],
+            [util.posix_shell(), "-lc", script],
             cwd=workspace,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -144,9 +145,37 @@ def _mirror_line(session, chunk):
         pass
 
 
+_TOOLS_RE = re.compile(r"--tools(?:=|\s+)(\"[^\"\n]*\"|'[^'\n]*'|[^\s]+)")
+_MCP_TOOL_PATTERN = "mcp__*"
+
+
+def _inject_mcp_args(command, config):
+    """Keep MCP reachable on pi >= 1.5 when the loopback bridge is enabled.
+
+    pi 1.5 implements MCP as a builtin extension, so ``--no-extensions``
+    disables it unless ``-e builtin:mcp`` is passed explicitly; and a plain
+    ``--tools`` allowlist drops ``mcp__``-prefixed tool names unless the
+    pattern is listed. Injecting here keeps WORKFLOW.md commands identical
+    across pi versions instead of carrying version-specific flags in config.
+    """
+    mcp_cfg = getattr(config, "mcp", None)
+    if not isinstance(mcp_cfg, dict) or mcp_cfg.get("enabled") is not True:
+        return command
+    if "builtin:mcp" not in command:
+        command += " -e builtin:mcp"
+    match = _TOOLS_RE.search(command)
+    if match is not None and _MCP_TOOL_PATTERN not in match.group(1):
+        raw = match.group(1)
+        value = raw[1:-1] if raw[:1] in ("'", '"') and raw.endswith(raw[0]) else raw
+        command = (command[:match.start()]
+                   + "--tools '%s,%s'" % (value, _MCP_TOOL_PATTERN)
+                   + command[match.end():])
+    return command
+
+
 def _build_script(config, secret_names, session_id):
     unsets = "".join("unset %s;" % name for name in secret_names or [])
-    parts = [config.command]
+    parts = [_inject_mcp_args(config.command, config)]
     if not re.search(r"--session[\s=]|--session-id[\s=]", config.command or ""):
         parts.append("--session-id %s" % _shell_quote(session_id))
     if config.model:
@@ -401,23 +430,13 @@ def stop_session(session):
     process = session.process
     if process is None:
         return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        try:
-            process.terminate()
-        except OSError:
-            pass
+    from ..util import signal_process_tree
+
+    signal_process_tree(process, signal.SIGTERM)
     try:
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            try:
-                process.kill()
-            except OSError:
-                pass
+        signal_process_tree(process, getattr(signal, "SIGKILL", signal.SIGTERM))
         try:
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:

@@ -1,6 +1,9 @@
 """Shared helpers: time, ISO-8601, shell quoting, state normalisation."""
 
+import os
 import re
+import shutil
+import signal
 import time
 from datetime import datetime, timezone
 
@@ -70,3 +73,77 @@ def shell_quote(value):
 
 def sanitize_name(name):
     return re.sub(r"[^A-Za-z0-9._-]", "_", str(name))
+
+
+def posix_shell():
+    """Resolve a real POSIX shell for ``-lc`` scripts.
+
+    On Windows, ``bash``/``sh`` on PATH can resolve to a WSL launcher stub
+    (``%WINDIR%\\System32\\bash.exe`` or the ``WindowsApps`` app-execution
+    alias) which exits immediately when WSL has no installed distro —
+    spawning it yields a broken pipe on the first write. Prefer a real
+    Git for Windows install, then any PATH hit outside the stub dirs.
+    """
+    if os.name != "nt":
+        return "bash"
+    for path in (
+        os.path.expandvars(r"%ProgramFiles%\Git\bin\bash.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Git\bin\bash.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\bin\bash.exe"),
+    ):
+        if os.path.isfile(path):
+            return path
+    stub_dirs = [
+        os.path.join(
+            os.environ.get("WINDIR", r"C:\Windows"), "System32").lower(),
+        os.path.join(
+            os.environ.get("LOCALAPPDATA", ""),
+            "Microsoft", "WindowsApps").lower(),
+    ]
+    for name in ("bash", "sh"):
+        found = shutil.which(name)
+        if found and not any(
+                os.path.normcase(found).startswith(
+                    os.path.normcase(d) + os.sep)
+                for d in stub_dirs):
+            return found
+    return "bash"  # last resort: let the OS report the failure
+
+
+def signal_process_tree(process, sig):
+    """Send ``sig`` to the child's process group.
+
+    POSIX uses ``os.killpg``. On Windows the TERM path calls
+    ``process.terminate()`` (best effort) while the KILL path escalates to
+    ``taskkill /T /F`` so wrapped grandchildren (sh → node) do not survive
+    as orphans — ``process.kill()`` alone only reaps the direct child.
+    """
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        try:
+            killpg(process.pid, sig)
+            return
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        if sig == getattr(signal, "SIGKILL", -1):
+            if os.name == "nt":
+                _taskkill_tree(process.pid)
+                return
+            process.kill()
+        else:
+            process.terminate()
+    except OSError:
+        pass
+
+
+def _taskkill_tree(pid):
+    import subprocess
+
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False)
+    except OSError:
+        pass

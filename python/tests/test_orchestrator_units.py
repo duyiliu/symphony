@@ -2,6 +2,7 @@ import datetime
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -59,6 +60,34 @@ class SortTest(unittest.TestCase):
 
 
 class CandidateTest(unittest.TestCase):
+    def test_merge_evaluation_does_not_consume_agent_capacity(self):
+        orch = _orchestrator()
+        orch.max_concurrent_agents = 1
+        orch.running["1"] = {"merge_eval": True, "issue": _issue("1")}
+        self.assertEqual(orch._available_slots(), 1)
+        self.assertTrue(orch._state_slots_available(_issue("2"), orch._store.settings()))
+
+    def test_gate_repair_waits_for_agent_dispatch(self):
+        from symphony.agent import runner
+        orch = _orchestrator()
+        orch.running["1"] = {"ref": 7, "issue": _issue("1"), "identifier": "GH-1"}
+        with patch.object(orch, "_schedule_issue_retry") as schedule:
+            orch._on_worker_done("1", 7, runner.DONE_NEEDS_WORKER)
+        self.assertEqual(schedule.call_args.args[2]["delay_type"], "continuation")
+        self.assertNotIn("1", orch.running)
+
+    def test_admission_only_never_starts_worker(self):
+        from symphony.agent import runner
+        issue = _issue()
+        done = []
+        with patch.object(runner.tracker_adapter, "begin_run_issue", return_value="ok"), \
+             patch.object(runner, "_run_on_worker_host") as worker:
+            runner.run(issue, _settings(), lambda *args: None,
+                       lambda *args: done.append(args), runner.RunHandle(),
+                       {"admission_only": True})
+        worker.assert_not_called()
+        self.assertEqual(done, [(issue.id, runner.DONE_NEEDS_WORKER)])
+
     def test_candidate(self):
         orch = _orchestrator()
         settings = orch._store.settings()

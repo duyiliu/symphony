@@ -43,6 +43,19 @@ class CompletedTests(unittest.TestCase):
             self.assertEqual(data["issues"][0]["number"], 101)
             self.assertIn("page=2", api.call_args.args[1])
 
+    def test_merged_pr_is_distinguished_from_closed_unmerged_pr(self):
+        rows = [self.closed,
+                {**self.closed, "number": 2},
+                {"number": 153, "body": "Closes #1", "html_url": "https://github.com/o/r/pull/153",
+                 "pull_request": {"merged_at": self.now}},
+                {"number": 154, "body": "Closes #2", "pull_request": {"merged_at": None}}]
+        with patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
+            board, "github_request", return_value=rows
+        ):
+            issues = {e["number"]: e for e in board.completed_data()["issues"]}
+        self.assertEqual(issues[1]["merged_pr"]["number"], 153)
+        self.assertNotIn("merged_pr", issues[2])
+
     def test_api_failure_preserves_cache_and_shows_warning(self):
         board._history_cache.update(repo="o/r", events=[{"number": 1, "at": self.now}], at=0)
         with patch.object(board, "load_tracker", return_value=("o/r", "secret")), patch.object(

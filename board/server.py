@@ -43,12 +43,17 @@ TEXT_LIMIT = 4000
 THINK_LIMIT = 1500
 ISSUE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 REPO_RE = re.compile(r'^\s*repo:\s*"([^"]+)"', re.M)
+MODEL_RE = re.compile(r'^\s*model:\s*"?([^"\s]+)"?\s*$', re.M)
+THINKING_RE = re.compile(r'^\s*thinking:\s*"?([^"\s]+)"?\s*$', re.M)
 CN = timezone(timedelta(hours=8))
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 ISSUE_CACHE_TTL = 60.0
+DONE_COL_LIMIT = 8
 SESSION_CACHE_TTL = 20.0
 _cache = {"issues": None, "issues_at": 0.0, "sessions": None, "sessions_at": 0.0}
+_github_cache_lock = threading.Lock()
+_github_generation = 0
 
 STYLE = """
 :root{--canvas:#161616;--panel:#191919;--card:#1f1f1f;--elev:#272727;--sunken:#101010;
@@ -75,6 +80,8 @@ a{color:inherit;text-decoration:none}
 .brand svg{width:14px;height:14px;color:var(--fg2)}
 .health{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--fg2);min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .health .dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--ok);animation:pulse 1.5s infinite}
+.runtime{flex:none;display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--fg3);border:1px solid var(--edge);border-radius:10px;padding:2px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px}
+.runtime b{color:var(--fg2);font-weight:500}
 .auto{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:11px;color:var(--fg3);white-space:nowrap}
 .auto svg{width:12px;height:12px}
 .auto a{color:var(--fg2)}
@@ -115,8 +122,6 @@ a{color:inherit;text-decoration:none}
 .board{flex:1;min-height:0;display:flex;gap:12px;padding:12px 16px 16px;overflow-x:auto;overflow-y:hidden}
 .col{display:flex;flex-direction:column;flex:1 1 0;min-width:232px;min-height:0;border:1px solid var(--edge);border-radius:8px;background:var(--panel)}
 .col[hidden]{display:none}
-.col.is-empty{flex:0 0 232px;align-self:flex-start;max-height:100%}
-.col.is-empty .col-body{flex:none;padding-bottom:0}
 .col.is-empty .empty-col{padding:14px 10px}
 .col-head{flex:none;display:flex;align-items:flex-start;gap:8px;padding:10px 12px 8px}
 .cdot{flex:none;width:6px;height:6px;border-radius:50%;margin-top:6px;background:var(--fg3)}
@@ -126,6 +131,7 @@ a{color:inherit;text-decoration:none}
 .cdot.ready{background:var(--info)}
 .cdot.awaiting{background:var(--info)}
 .cdot.idle{background:var(--fg3)}
+.cdot.done{background:var(--ok)}
 .chead{min-width:0;flex:1}
 .cline{display:flex;align-items:baseline;gap:6px}
 .clabel{font-size:12px;font-weight:500;color:var(--fg)}
@@ -162,10 +168,15 @@ a{color:inherit;text-decoration:none}
 .tone-ready{color:var(--info)}
 .tone-awaiting{color:var(--info)}
 .tone-idle{color:var(--fg2)}
+.tone-done{color:var(--ok)}
 #shade{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:opacity .15s}
 #shade.open{opacity:1;pointer-events:auto}
-.drawer{position:fixed;top:0;right:0;bottom:0;z-index:41;display:flex;flex-direction:column;width:620px;max-width:94vw;background:var(--panel);border-left:1px solid var(--edge);box-shadow:-24px 0 70px rgba(0,0,0,.55);opacity:0;transform:translateX(28px);pointer-events:none;transition:opacity .18s,transform .18s ease-out}
+.drawer{position:fixed;top:0;right:0;bottom:0;z-index:41;display:flex;flex-direction:column;width:720px;max-width:94vw;background:var(--panel);border-left:1px solid var(--edge);box-shadow:-24px 0 70px rgba(0,0,0,.55);opacity:0;transform:translateX(28px);pointer-events:none;transition:opacity .18s,transform .18s ease-out}
 .drawer.open{opacity:1;transform:none;pointer-events:auto}
+.dgrip{position:absolute;top:0;left:-5px;bottom:0;width:11px;cursor:col-resize;touch-action:none;z-index:2}
+.dgrip::after{content:'';position:absolute;top:0;left:5px;bottom:0;width:2px;background:transparent;transition:background .12s}
+.dgrip:hover::after,body.resizing .dgrip::after{background:rgba(56,189,248,.5)}
+body.resizing{user-select:none;cursor:col-resize}
 .dhead{flex:none;display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-bottom:1px solid var(--edge)}
 .dclose{flex:none;display:flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:5px;border:none;background:transparent;color:var(--fg2);font-size:16px;line-height:1;cursor:pointer}
 .dclose:hover{background:var(--elev);color:var(--fg)}
@@ -343,17 +354,18 @@ th{color:var(--fg3);font-weight:500}
 #feed{padding:12px 16px 40px;background:var(--canvas)}
 @media(max-width:640px){
  .app{height:100dvh}
- .topbar{padding:0 10px;gap:8px}.auto{gap:4px}.auto>a{max-width:100px;overflow:hidden;text-overflow:ellipsis}.auto>svg,.auto>span{display:none}
+ .topbar{padding:0 10px;gap:8px}.auto{gap:4px}.auto>a{max-width:100px;overflow:hidden;text-overflow:ellipsis}.auto>svg,.auto>span{display:none}.runtime{display:none}
  .head{padding:10px}.head h1{font-size:16px}.head .note{font-size:11px;line-height:1.4}
  .tools{padding:8px 10px;gap:8px}.tools>.chips{display:none}
  .view-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%;order:-1;gap:6px}
  .view-tabs .chip{justify-content:center;padding:8px 4px;font-size:13px;min-height:44px}
  .search{flex:1;min-width:0;width:auto;max-width:none}.search input{font-size:16px;min-height:44px}
  .chk{min-height:44px}.chip,.abtn,.logbtn,.fbtn{min-height:44px}
- .board{padding:10px;gap:10px;scroll-snap-type:x proximity}.col{min-width:min(84vw,340px);scroll-snap-align:start}.col.is-empty{flex-basis:232px}
+ .board{padding:10px;gap:10px;scroll-snap-type:x proximity}.col{min-width:min(84vw,340px);scroll-snap-align:start}
  .completed-panel{padding:12px 10px;padding-bottom:max(16px,env(safe-area-inset-bottom))}
  .completed-list{grid-template-columns:minmax(0,1fr);gap:10px}.completed-card{padding:14px}.completed-card .btitle{font-size:15px}
- .drawer{width:100vw;max-width:100vw;height:100dvh;border-left:0}
+ .drawer{width:100vw !important;max-width:100vw;height:100dvh;border-left:0}
+ .dgrip{display:none}
  .dhead{padding:10px;padding-top:max(10px,env(safe-area-inset-top))}.dclose,.dext{min-width:44px;min-height:44px}
  .dbody{padding:12px 10px;padding-bottom:max(24px,env(safe-area-inset-bottom))}.dtitle{font-size:16px}
  .acmt{font-size:16px}.abtns .abtn{flex:1;min-width:100px;font-size:13px}.mgrid{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -369,14 +381,15 @@ th{color:var(--fg3);font-weight:500}
 
 BOARD = """
 <script>
-const COLS = ['running', 'blocked', 'retrying', 'ready', 'awaiting', 'idle'];
+const COLS = ['running', 'blocked', 'retrying', 'ready', 'awaiting', 'idle', 'done'];
 const EMPTY = {
   running: '没有正在执行的 Issue',
   blocked: '没有异常状态',
   retrying: '没有等待重试的 Issue',
   ready: '没有等待派发的 Issue',
   awaiting: '没有等待合并的 PR',
-  idle: '没有空闲的 Issue'
+  idle: '没有空闲的 Issue',
+  done: '没有已完成记录'
 };
 const MAX_MSGS = 400;
 
@@ -384,6 +397,151 @@ let CUR = null, CARD = null, RUNS = [], AGENT = null, TROUBLE = null, LOG = null
 let SHOW_EMPTY = localStorage.getItem('sb-show-empty') !== '0';
 let PENDING_RUN = new URLSearchParams(location.search).get('run');
 let BUSY = false, TOAST_TIMER = null, FORM_OPEN = false, DRAFT_COMMENT = '', WRITABLE = false;
+const PENDING_OPERATIONS = new Map();
+
+function trackOperation(issue, op, phase = 'confirmed') {
+  const card = boardEl.querySelector(".bcard[data-issue='" + issue + "']");
+  PENDING_OPERATIONS.set(issue, {op: op, phase: phase, at: Date.now(),
+    wasRunning: card && card.getAttribute('data-state') === 'running'});
+  renderPendingCards();
+  renderActions();
+}
+
+function renderPendingCards() {
+  boardEl.querySelectorAll('.pending-sync').forEach(el => el.remove());
+  boardEl.querySelectorAll('.bcard').forEach(card => {
+    if (card.getAttribute('data-closed') === '1') { return; }
+    const message = operationNotice(card.getAttribute('data-issue'));
+    if (message) {
+      const pending = PENDING_OPERATIONS.get(card.getAttribute('data-issue'));
+      const view = operationView(pending, {
+        state: card.getAttribute('data-state'),
+        mergePending: card.getAttribute('data-mg') === '1'
+      });
+      if (view.state) {
+        const before = card.getAttribute('data-state');
+        card.classList.remove(before);
+        card.classList.add(view.state);
+        card.setAttribute('data-state', view.state);
+        const lane = document.getElementById('col-' + view.state);
+        if (lane) { lane.appendChild(card); }
+      }
+      card.setAttribute('data-state-text', view.text);
+      const stat = card.querySelector('.bstat');
+      if (stat) {
+        stat.textContent = view.text;
+        if (view.state) { stat.className = 'bstat tone-' + view.state; }
+      }
+      if (pending.phase === 'confirmed') {
+        if (pending.op === 'pause' || pending.op === 'resume') {
+          card.setAttribute('data-paused', pending.op === 'pause' ? '1' : '0');
+          card.setAttribute('data-agent', pending.op === 'resume' ? '1' : '0');
+        }
+        if (pending.op === 'approve' || pending.op === 'revoke') {
+          card.setAttribute('data-approved', pending.op === 'approve' ? '1' : '0');
+        }
+      }
+      const notice = document.createElement('div');
+      notice.className = 'pending-sync an';
+      notice.textContent = message;
+      card.appendChild(notice);
+    }
+  });
+  applyFilter();
+  if (ISSUES_READY) {
+    const summary = [];
+    for (const key of COLS) {
+      const col = document.querySelector(".col[data-col='" + key + "']");
+      if (!col) { continue; }
+      const count = col.querySelectorAll('.bcard').length;
+      if (count) { summary.push(count + ' ' + col.querySelector('.clabel').textContent); }
+    }
+    const sum = document.getElementById('sum');
+    if (sum) { sum.textContent = summary.join(' · ') || '当前没有任务'; }
+  }
+  if (CUR) { refreshCard(); }
+}
+
+function operationView(pending, current) {
+  if (pending.phase === 'uncertain') { return {text: '操作结果待确认'}; }
+  if (pending.phase === 'partial') { return {text: '操作未完整完成 · 正在核对'}; }
+  if (pending.phase === 'submitting') { return {text: '正在提交操作'}; }
+  switch (pending.op) {
+    case 'approve': return {state: 'awaiting', text: '已批准 · 等待核验'};
+    case 'revoke': return {state: 'awaiting', text: '批准已撤销 · 等待核验'};
+    case 'pause': return {state: 'blocked', text: pending.wasRunning
+      ? '已转人工 · 正在停止执行' : '等待人工处理'};
+    case 'resume': return {state: current.mergePending ? 'awaiting' : 'ready', text: '已恢复 · 等待调度器核对'};
+    case 'stop': return {state: current.state === 'running' ? 'blocked' : 'idle', text: '已取消执行 · 等待调度器核对'};
+    default: return {text: '标签已更新 · 等待同步'};
+  }
+}
+
+function operationNotice(issue) {
+  const pending = PENDING_OPERATIONS.get(issue);
+  if (!pending) { return ''; }
+  const delayed = Date.now() - pending.at > 60000;
+  return (pending.phase === 'uncertain' ? '请求结果不确定，正在重新读取 GitHub；请勿重复提交'
+    : pending.phase === 'partial' ? '操作未完整完成，正在重新读取 GitHub 标签'
+    : pending.op === 'resume' ? '恢复已提交，等待调度器核对；不代表 AI 已启动'
+    : pending.op === 'pause' ? '暂停标签已更新，运行中的任务仍需等待停止确认'
+    : pending.op === 'approve' ? '批准已提交；宿主仍需核验当前 SHA、检查和有效审批'
+    : pending.op === 'revoke' ? '批准已撤销；若合并已发生则不能撤回'
+    : '标签已更新，等待状态同步')
+    + (delayed ? '；同步延迟，请检查调度器状态。' : '。');
+}
+
+function confirmOperations(data) {
+  for (const [issue, pending] of PENDING_OPERATIONS) {
+    const facts = (data.facts || {})[issue];
+    if (facts && facts.closed) { PENDING_OPERATIONS.delete(issue); continue; }
+    if (!facts || data.github_observed_after * 1000 < pending.at) { continue; }
+    const labels = facts.labels || [];
+    if (pending.phase === 'submitting') { continue; }
+    if (pending.phase === 'partial') {
+      PENDING_OPERATIONS.delete(issue);
+      continue;
+    }
+    const labelMatches = pending.op === 'resume' ? labels.includes('agent') && !labels.includes('needs-human')
+      : pending.op === 'pause' ? labels.includes('needs-human') && !labels.includes('agent')
+      : pending.op === 'approve' ? labels.includes('merge-approved')
+      : pending.op === 'revoke' ? !labels.includes('merge-approved')
+      : pending.op === 'stop' ? !labels.includes('agent') : true;
+    if (!labelMatches) { continue; }
+    const runtime = (data.runtime || {})[issue];
+    const expected = pending.op === 'resume'
+      ? runtime !== 'blocked'
+      : pending.op === 'pause' || pending.op === 'stop' ? runtime !== 'running' && runtime !== 'retrying' : true;
+    if (expected && (['approve', 'revoke', 'labels'].includes(pending.op)
+        || data.state_observed_after * 1000 >= pending.at)) {
+      PENDING_OPERATIONS.delete(issue);
+    }
+  }
+}
+
+async function postGithubOperation(url, payload, issue, op) {
+  let res;
+  try {
+    res = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)});
+  } catch (err) {
+    trackOperation(issue, op, 'uncertain');
+    throw new Error('连接中断，操作结果待确认；请勿重复提交');
+  }
+  let data;
+  try { data = await res.json(); } catch (err) {
+    trackOperation(issue, op, 'uncertain');
+    throw new Error('无法确认服务端结果，正在核对 GitHub');
+  }
+  if (!res.ok) {
+    if (data.outcome === 'partial' || data.outcome === 'uncertain' || (res.status >= 500 && !data.outcome)) {
+      trackOperation(issue, op, data.outcome === 'partial' ? 'partial' : 'uncertain');
+    }
+    throw new Error(data.error || ('HTTP ' + res.status));
+  }
+  trackOperation(issue, op);
+  return data;
+}
 
 // Legacy board credentials are no longer used. Strip old token links without
 // storing their credentials; all authorization now happens through GitHub labels.
@@ -525,7 +683,43 @@ const shadeEl = document.getElementById('shade');
 const drawerEl = document.getElementById('drawer');
 const dheadEl = document.getElementById('dhead');
 const dbodyEl = document.getElementById('dbody');
+const dgripEl = document.getElementById('dgrip');
 WRITABLE = boardEl.getAttribute('data-writable') === '1';
+
+const DRAWER_W_KEY = 'sym.drawer.w';
+const drawerWClamp = function (w) {
+  return Math.min(Math.max(w, 420), Math.floor(window.innerWidth * 0.94));
+};
+(function () {
+  const saved = parseInt(localStorage.getItem(DRAWER_W_KEY) || '', 10);
+  if (saved >= 420) { drawerEl.style.width = drawerWClamp(saved) + 'px'; }
+  window.addEventListener('resize', function () {
+    if (drawerEl.style.width) {
+      drawerEl.style.width = drawerWClamp(parseInt(drawerEl.style.width, 10)) + 'px';
+    }
+  });
+})();
+if (dgripEl) {
+  dgripEl.addEventListener('pointerdown', function (e) {
+    if (e.button !== 0) { return; }
+    e.preventDefault();
+    dgripEl.setPointerCapture(e.pointerId);
+    document.body.classList.add('resizing');
+    const move = function (ev) {
+      drawerEl.style.width = drawerWClamp(window.innerWidth - ev.clientX) + 'px';
+    };
+    const up = function () {
+      dgripEl.removeEventListener('pointermove', move);
+      dgripEl.removeEventListener('pointerup', up);
+      dgripEl.removeEventListener('pointercancel', up);
+      document.body.classList.remove('resizing');
+      localStorage.setItem(DRAWER_W_KEY, String(Math.round(drawerEl.getBoundingClientRect().width)));
+    };
+    dgripEl.addEventListener('pointermove', move);
+    dgripEl.addEventListener('pointerup', up);
+    dgripEl.addEventListener('pointercancel', up);
+  });
+}
 
 const ICON = {
   running: "<svg viewBox='0 0 16 16'><circle cx='8' cy='8' r='5.6' fill='none' stroke='currentColor' stroke-width='1.6' opacity='.35'/><circle class='spin' cx='8' cy='8' r='5.6' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-dasharray='26 35.2' transform='rotate(-90 8 8)' style='transform-origin:8px 8px'/></svg>",
@@ -534,6 +728,7 @@ const ICON = {
   ready: "<svg viewBox='0 0 16 16'><circle cx='8' cy='8' r='5.6' fill='none' stroke='currentColor' stroke-width='1.6'/></svg>",
   awaiting: "<svg viewBox='0 0 16 16'><circle cx='4.6' cy='4.2' r='1.6' fill='none' stroke='currentColor' stroke-width='1.6'/><circle cx='4.6' cy='11.8' r='1.6' fill='none' stroke='currentColor' stroke-width='1.6'/><circle cx='11.4' cy='8' r='1.6' fill='none' stroke='currentColor' stroke-width='1.6'/><path d='M4.6 5.8v4.4M6.2 8h3.6' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round'/></svg>",
   idle: "<svg viewBox='0 0 16 16'><circle cx='8' cy='8' r='5.6' fill='none' stroke='currentColor' stroke-width='1.4' opacity='.55'/></svg>",
+  done: "<svg viewBox='0 0 16 16'><circle cx='8' cy='8' r='5.6' fill='none' stroke='currentColor' stroke-width='1.6'/><path d='M5.6 8.2l1.7 1.7 3.2-3.5' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>",
   ext: "<svg viewBox='0 0 16 16'><path fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round' d='M6.5 3.5h-3v9h9v-3M9.5 3.5h3v3M12 4 8 8'/></svg>",
   file: "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2'><path d='M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z'/><path d='M14 3v5h5'/></svg>"
 };
@@ -597,6 +792,8 @@ function openIssue(name) {
     state: card.getAttribute('data-state') || 'idle',
     text: card.getAttribute('data-state-text') || '',
     agent: card.getAttribute('data-agent') === '1',
+    mergePending: card.getAttribute('data-mg') === '1',
+    approved: card.getAttribute('data-approved') === '1',
     paused: card.getAttribute('data-paused') === '1',
     pauseReason: card.getAttribute('data-pause-reason') || '',
     closed: card.getAttribute('data-closed') === '1',
@@ -648,10 +845,13 @@ function refreshCard() {
   if (!CUR) { return; }
   const card = (VIEW === 'active' ? boardEl : document.getElementById('completed-list')).querySelector(".bcard[data-issue='" + CUR + "']");
   if (!card) { return; }
+  CARD.closed = card.getAttribute('data-closed') === '1';
   CARD.state = card.getAttribute('data-state') || CARD.state;
   CARD.text = card.getAttribute('data-state-text') || CARD.text;
   CARD.title = card.getAttribute('data-title') || CARD.title;
   CARD.agent = card.getAttribute('data-agent') === '1';
+  CARD.mergePending = card.getAttribute('data-mg') === '1';
+  CARD.approved = card.getAttribute('data-approved') === '1';
   CARD.paused = card.getAttribute('data-paused') === '1';
   CARD.pauseReason = card.getAttribute('data-pause-reason') || '';
   CARD.pr = card.getAttribute('data-pr') || '';
@@ -660,6 +860,12 @@ function refreshCard() {
 
 function actionsHtml() {
   if (!CARD) { return ''; }
+  if (PENDING_OPERATIONS.has(CUR)) {
+    return "<section class='actions' id='actions'><p class='an'>" + escHtml(operationNotice(CUR))
+      + "</p><button class='abtn' data-sync-check>重新核对</button>"
+      + (Date.now() - PENDING_OPERATIONS.get(CUR).at > 60000
+        ? "<button class='abtn warn' data-sync-dismiss>已人工核对，返回操作</button>" : '') + "</section>";
+  }
   let inner;
   if (CARD.closed) {
     return "<section class='actions' id='actions'><p class='an'>Issue 已完成，可在此查看详情和本地日志。无需再次派发或批准。</p></section>";
@@ -678,9 +884,24 @@ function actionsHtml() {
       + "<div class='abtns'>"
       + "<button class='abtn ok' data-intervene='resume'" + (BUSY ? ' disabled' : '') + ">"
       + (BUSY ? '正在提交…' : '恢复执行') + "</button></div>";
+  } else if (CARD.agent && CARD.mergePending) {
+    inner = CARD.approved
+      ? "<p class='an'>已挂 merge-approved；宿主会在下一轮合并评估时放行冻结的交付 SHA。</p>"
+        + "<div class='abtns'>"
+        + "<button class='abtn warn' data-act='remove' data-label='merge-approved'" + (BUSY ? ' disabled' : '') + ">"
+        + (BUSY ? '正在提交…' : '撤销批准') + "</button></div>"
+      : "<p class='an'>交付已发布，宿主会定期检查合并条件。请先查看 PR，再决定是否批准。</p>"
+        + "<div class='abtns'>"
+        + "<button class='abtn ok' data-act='add' data-label='merge-approved'" + (BUSY ? ' disabled' : '') + ">"
+        + (BUSY ? '正在提交…' : '批准合并') + "</button>"
+        + (CARD.pr ? "<a class='abtn' href='" + escHtml(CARD.pr) + "' target='_blank' rel='noopener noreferrer'>查看 PR</a>" : '')
+        + "</div>";
+    inner += "<details><summary>更多操作</summary>"
+      + "<p class='an'>暂停后不会自动合并，恢复执行后才会继续处理。</p>"
+      + "<div class='abtns'><button class='abtn warn' data-intervene='pause'" + (BUSY ? ' disabled' : '') + ">暂停自动处理</button></div></details>";
   } else if (CARD.agent) {
     const running = CARD.state === 'running';
-    const label = running ? '停止' : '暂停派发';
+    const label = running ? '停止' : '取消派发';
     const tone = running ? 'danger' : 'warn';
     inner = "<p class='an'>操作直接写 GitHub 标签；摘标签会在下个轮询周期终止正在运行的任务。</p>"
       + "<div class='abtns'>"
@@ -720,10 +941,10 @@ async function interveneAction(op) {
   if (op === 'pause') {
     const reason = await openDialog({
       tone: 'warn',
-      title: '转人工处理 ' + CUR,
-      body: '可填写原因（可选），会作为 issue 评论发布；不填写也可以直接转人工。',
+      title: (CARD && CARD.mergePending ? '暂停自动处理 ' : '转人工处理 ') + CUR,
+      body: '暂停后不会自动合并，恢复执行后才会继续处理。可填写原因（可选），会作为 issue 评论发布。',
       input: { placeholder: '例如：需要人工确认合并范围 / 先暂停观察', maxlength: 4000 },
-      confirmText: '转人工处理'
+      confirmText: CARD && CARD.mergePending ? '暂停自动处理' : '转人工处理'
     });
     if (reason === null) { return; }
     comment = String(reason).trim();
@@ -733,23 +954,18 @@ async function interveneAction(op) {
     body: '会移除 needs-human 并重新加 agent；合并前宿主会重新核验当前 SHA 的检查与有效审批，重贴 agent 本身不是合并授权。',
     confirmText: '恢复执行'
   }))) { return; }
+  const issue = CUR;
   BUSY = true;
   renderActions();
   try {
-    const res = await fetch('/api/intervene', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ issue: CUR, op: op, comment: comment })
-    });
-    let data = {};
-    try { data = await res.json(); } catch (err) { }
-    if (!res.ok) { throw new Error(data.error || ('HTTP ' + res.status)); }
+    const data = await postGithubOperation('/api/intervene', {issue, op, comment}, issue, op);
     toast(data.message || '已提交');
-    await refreshIssues();
+    await refreshIssues(true);
     refreshCard();
     await loadRuns(true);
   } catch (err) {
     toast(err.message || '操作失败', true);
+    await refreshIssues(true);
   } finally {
     BUSY = false;
     renderActions();
@@ -767,36 +983,38 @@ async function labelAction(action, label) {
     dialog = comment
       ? { tone: 'ok', title: '发布说明并开始执行', body: '给 ' + CUR + ' 加上 agent 标签？调度器会在下个轮询周期开始执行（改代码，可能推 PR）。', confirmText: '发布并执行' }
       : { tone: 'warn', title: '开始执行 ' + CUR, body: '没有填写说明，直接加 agent 标签？agent 可能重复上次的做法。', confirmText: '开始执行' };
+  } else if (action === 'add' && label === 'merge-approved') {
+    dialog = { tone: 'ok', title: '批准合并 ' + CUR, body: '挂 merge-approved 标签？宿主会在下一轮合并评估放行当前冻结的交付 SHA——此操作视同人工批准，请先确认 PR 内容。', confirmText: '批准合并' };
   } else if (action === 'add') {
     dialog = { tone: 'warn', title: '转人工处理 ' + CUR, body: '加 needs-human 并摘掉 agent 标签？调度器不会再派发，直到人工恢复。', confirmText: '转人工处理' };
+  } else if (action === 'remove' && label === 'merge-approved') {
+    dialog = { tone: 'warn', title: '撤销批准 ' + CUR, body: '摘掉 merge-approved 标签？宿主下轮评估会把该交付重新判为未批准，不再自动合并（若已放行则无法撤回）。', confirmText: '撤销批准' };
   } else if (label === 'agent') {
     dialog = running
       ? { tone: 'danger', title: '停止执行 ' + CUR, body: '摘掉 agent 标签？调度器会在下个轮询周期终止正在运行的任务。', confirmText: '停止执行' }
-      : { tone: 'warn', title: '暂停派发 ' + CUR, body: '摘掉 agent 标签？调度器不会再派发它。', confirmText: '暂停派发' };
+      : { tone: 'warn', title: '取消派发 ' + CUR, body: '摘掉 agent 标签？该 issue 将退出自动化队列，重新挂回会按新周期重新派发（不会续跑）。', confirmText: '取消派发' };
   } else {
     dialog = { tone: 'warn', title: '摘掉 needs-human ' + CUR, body: '摘掉 needs-human 标签？如需继续执行，请再重新加 agent。', confirmText: '摘掉标签' };
   }
   if (!(await openDialog(dialog))) { return; }
   if (action === 'add') { DRAFT_COMMENT = comment; }
+  const issue = CUR;
+  const operation = label === 'merge-approved' ? (action === 'add' ? 'approve' : 'revoke')
+    : label === 'agent' ? (action === 'add' ? 'resume' : 'stop')
+    : action === 'add' ? 'pause' : 'labels';
   BUSY = true;
   renderActions();
   try {
-    const res = await fetch('/api/label', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ issue: CUR, action: action, label: label, comment: comment })
-    });
-    let data = {};
-    try { data = await res.json(); } catch (err) { }
-    if (!res.ok) { throw new Error(data.error || ('HTTP ' + res.status)); }
+    const data = await postGithubOperation('/api/label', {issue, action, label, comment}, issue, operation);
     toast(data.message || '已提交');
     FORM_OPEN = false;
     DRAFT_COMMENT = '';
-    await refreshIssues();
+    await refreshIssues(true);
     refreshCard();
     await loadRuns(true);
   } catch (err) {
     toast(err.message || '操作失败', true);
+    await refreshIssues(true);
   } finally {
     BUSY = false;
     renderActions();
@@ -834,7 +1052,9 @@ function noteBoxHtml() {
     body = '调度器会在退避窗口结束后重新尝试。' + troubleHtml();
   } else if (st === 'awaiting') {
     title = '等待合并';
-    body = 'PR 已开；agent 交付后宿主会自动校验检查与风险规则并完成合并，高风险或需人工审批时会等待 Review / 暂停转人工。';
+    body = CARD.mergePending
+      ? '交付已发布，宿主每 30 秒自评合并门禁。低风险 CI 绿即自动合；命中风险路径需人工批准——' + (CARD.approved ? '已批准，等待宿主放行。' : '可先点下方"批准合并"挂 merge-approved。')
+      : 'PR 已开；agent 交付后宿主会自动校验检查与风险规则并完成合并，高风险或需人工审批时会等待 Review / 暂停转人工。';
   } else if (st === 'ready') {
     title = '等待派发';
     body = 'Issue 带有 agent 标签，调度器会在下个轮询周期领取。';
@@ -853,12 +1073,14 @@ function metaGridHtml() {
   const items = [
     ['Issue', escHtml(CARD.name)],
     ['状态', escHtml(CARD.text)],
-    ['运行次数', String(RUNS.length)],
-    ['最近运行', escHtml(latest ? latest.started : '—')],
-    ['最近结束', escHtml(latest ? (latest.active ? '运行中' : (latest.ended || '—')) : '—')],
+    ['已记录会话', String(RUNS.length)],
+    ['最近开始', escHtml(latest ? latest.started : '—')],
+    ['日志最后更新', escHtml(latest ? (latest.ended || '—') : '—')],
     ['日志大小', escHtml(latest ? latest.size : '—')]
   ];
   if (AGENT && AGENT.tokens) { items.push(['tokens', escHtml(String(AGENT.tokens))]); }
+  if (AGENT && AGENT.model) { items.push(['模型', escHtml(String(AGENT.model))]); }
+  if (AGENT && AGENT.thinking) { items.push(['思考级别', escHtml(String(AGENT.thinking))]); }
   if (CARD.pr) {
     items.push(['PR', "<a class='mpr' href='" + escHtml(CARD.pr) + "' target='_blank' rel='noopener noreferrer'>#"
       + escHtml(CARD.prNum) + "</a>"]);
@@ -882,10 +1104,10 @@ function runHtml(r, n) {
   const text = r.active ? '运行中' : '已结束';
   const sh = escHtml(r.short);
   return "<section class='run' data-short='" + sh + "'>"
-    + "<div class='run-head'><span class='run-idx'>第 " + n + " 次</span>"
+    + "<div class='run-head'><span class='run-idx'>会话 " + n + "</span>"
     + "<span class='run-sha'>" + sh + "</span>"
     + "<span class='run-stat tone-" + state + "'>" + ICON[state] + text + "</span>"
-    + "<span class='run-time'>" + escHtml(r.started) + " → " + escHtml(r.active ? '运行中' : (r.ended || '—')) + "</span></div>"
+    + "<span class='run-time'>开始 " + escHtml(r.started) + " · " + escHtml(r.active ? '运行中' : ('日志更新 ' + (r.ended || '—'))) + "</span></div>"
     + "<div class='run-meta'><span>" + escHtml(r.size) + "</span><span>" + r.messages + " 条消息</span>"
     + (r.live ? "<span>live</span>" : "")
     + "<span class='grow'></span>"
@@ -898,7 +1120,7 @@ function runHtml(r, n) {
 
 function renderRuns() {
   dbodyEl.innerHTML = noteBoxHtml() + actionsHtml() + metaGridHtml()
-    + "<p class='dnote'>以下为本地执行记录（运行、日志），不构成 Issue 业务状态。</p>"
+    + "<p class='dnote'>以下为已记录的 Agent 会话；领取次数可能更多，历史派发记录不完整。结束时间以日志最后更新时间近似。</p>"
     + "<div id='runs'>" + (RUNS.length
       ? RUNS.map(function (r, i) { return runHtml(r, RUNS.length - i); }).join('')
       : "<div class='dnote'>该 issue 还没有运行记录。</div>") + "</div>";
@@ -930,7 +1152,7 @@ function updateRunStates() {
       stat.innerHTML = ICON[state] + (r.active ? '运行中' : '已结束');
     }
     const t = sec.querySelector('.run-time');
-    if (t) { t.textContent = r.started + ' → ' + (r.active ? '运行中' : (r.ended || '—')); }
+    if (t) { t.textContent = '开始 ' + r.started + ' · ' + (r.active ? '运行中' : ('日志更新 ' + (r.ended || '—'))); }
   });
 }
 
@@ -1074,6 +1296,10 @@ dheadEl.addEventListener('click', function (e) {
 });
 
 dbodyEl.addEventListener('click', function (e) {
+  if (e.target.closest('[data-sync-check]')) { refreshIssues(true); return; }
+  if (e.target.closest('[data-sync-dismiss]')) {
+    PENDING_OPERATIONS.delete(CUR); refreshIssues(true).then(renderActions); return;
+  }
   if (e.target.closest('#dclose')) { closeDrawer(); return; }
   const iv = e.target.closest('[data-intervene]');
   if (iv) { interveneAction(iv.getAttribute('data-intervene')); return; }
@@ -1149,13 +1375,17 @@ function renderCompleted() {
     + '已完成 ' + visible.length + ' 个 Issue（北京时间）';
   list.innerHTML = visible.map(function (issue) {
     const name = 'GH-' + issue.number;
+    const result = issue.merged_pr ? '已合并' : '已关闭';
+    const pr = issue.merged_pr || {};
     return "<article class='bcard idle completed-card' tabindex='0' role='button' data-issue='" + name
       + "' data-title='" + escHtml(issue.title) + "' data-url='" + escHtml(issue.url)
-      + "' data-state='idle' data-state-text='已完成' data-closed='1' data-completed-at='"
+      + "' data-state='done' data-state-text='" + result + "' data-pr='" + escHtml(pr.url || '')
+      + "' data-pr-num='" + escHtml(String(pr.number || '')) + "' data-closed='1' data-completed-at='"
       + escHtml(issue.completed_at) + "' data-description='" + escHtml(issue.body || '') + "'>"
-      + "<div class='completed-card-head'><span class='bid'>" + name + "</span><span class='completed-badge'>已完成</span></div>"
+      + "<div class='completed-card-head'><span class='bid'>" + name + "</span><span class='completed-badge'>" + result + "</span></div>"
       + "<div class='btitle'>" + escHtml(issue.title) + "</div><div class='completed-time'>完成于 "
-      + escHtml(issue.completed_at) + "</div><div class='completed-hint'>查看详情与运行日志 ›</div></article>";
+      + escHtml(issue.completed_at) + (pr.number ? ' · PR #' + escHtml(String(pr.number)) : '')
+      + "</div><div class='completed-hint'>查看详情与运行日志 ›</div></article>";
   }).join('') || (COMPLETED_LOADING ? '' : "<div class='empty-col'>" + (COMPLETED_WARNING ? '暂无可显示数据，请重试。' : '当前筛选没有已完成的 Issue。') + "</div>");
   markSel();
 }
@@ -1220,7 +1450,9 @@ document.getElementById('completed-list').addEventListener('keydown', function (
 });
 setInterval(function () { if (VIEW !== 'active') { loadCompleted(false); } }, 60000);
 
+let ISSUES_READY = false;
 function applyFilter() {
+  if (!ISSUES_READY && VIEW === 'active') { return; }
   if (VIEW !== 'active') { renderCompleted(); }
   const q = (document.getElementById('q').value || '').trim().toLowerCase().replace(/^#/, '');
   COLS.forEach(function (k) {
@@ -1258,11 +1490,26 @@ function applyShowEmpty() {
   });
 }
 
-async function refreshIssues() {
+let ISSUES_REQUEST = null;
+function refreshIssues(force = false) {
+  if (ISSUES_REQUEST) {
+    // A write must be followed by a read started after that write, even when
+    // an older periodic read is still in flight.
+    return force === true
+      ? ISSUES_REQUEST.then(() => refreshIssues(true))
+      : ISSUES_REQUEST;
+  }
+  ISSUES_REQUEST = fetchIssues().finally(() => { ISSUES_REQUEST = null; });
+  return ISSUES_REQUEST;
+}
+async function fetchIssues(retried = false) {
   try {
     const res = await fetch('/api/issues');
-    if (!res.ok) { return; }
+    if (res.status === 409 && !retried) { return fetchIssues(true); }
+    if (!res.ok) { throw new Error('HTTP ' + res.status); }
     const data = await res.json();
+    confirmOperations(data);
+    ISSUES_READY = true;
     WRITABLE = data.writable === true;
     for (const k of COLS) {
       const body = document.getElementById('col-' + k);
@@ -1278,8 +1525,14 @@ async function refreshIssues() {
     if (sum) { sum.textContent = data.summary || sum.textContent; }
     markSel();
     applyFilter();
+    renderPendingCards();
     if (CUR) { refreshCard(); updateNoteBox(); }
-  } catch (err) { }
+  } catch (err) {
+    const health = document.getElementById('health');
+    if (health) { health.textContent = '数据加载失败，稍后自动重试'; }
+    const sum = document.getElementById('sum');
+    if (sum && sum.textContent === '正在加载任务…') { sum.textContent = '数据加载失败，稍后自动重试'; }
+  }
 }
 setInterval(refreshIssues, 15000);
 
@@ -1304,7 +1557,10 @@ if (initialView && initialView !== 'active') {
   Promise.resolve(switchView(initialView === 'completed' ? 'history' : initialView)).then(function () {
     if (fromUrl) { openIssue(fromUrl); }
   });
-} else if (fromUrl) { openIssue(fromUrl); }
+}
+refreshIssues().then(function () {
+  if (fromUrl && (!initialView || initialView === 'active')) { openIssue(fromUrl); }
+});
 </script>
 """
 
@@ -1522,6 +1778,53 @@ def load_tracker():
     return repo, token
 
 
+def load_runtime():
+    """Configured runtime model/thinking level from the WORKFLOW frontmatter."""
+    try:
+        with open(WORKFLOW, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return {}
+    model = MODEL_RE.search(text)
+    thinking = THINKING_RE.search(text)
+    return {
+        "model": model.group(1) if model else "",
+        "thinking": thinking.group(1) if thinking else "",
+    }
+
+
+def runtime_badge():
+    rt = load_runtime()
+    parts = []
+    if rt.get("model"):
+        parts.append("<b>%s</b>" % esc(rt["model"]))
+    if rt.get("thinking"):
+        parts.append("思考 %s" % esc(rt["thinking"]))
+    if not parts:
+        return ""
+    return "<div class='runtime' title='WORKFLOW 配置的 runtime 模型与思考级别'>%s</div>" % " · ".join(parts)
+
+
+def live_model(path, limit=65536):
+    """Best-effort: the first assistant message_start in a live log carries provider/model."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(limit)
+    except OSError:
+        return "", ""
+    for line in head.split(b"\n")[:400]:
+        if b'"message_start"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        message = record.get("message") or {}
+        if message.get("role") == "assistant" and message.get("model"):
+            return message.get("provider") or "", message.get("model") or ""
+    return "", ""
+
+
 # Host pauses are written by the workflow as "[agent] Paused (needs-human): …";
 # a board-initiated pause writes its own marker so the reason is still visible.
 PAUSE_COMMENT_PREFIXES = ("[agent] Paused", "[board] 人工暂停")
@@ -1554,6 +1857,7 @@ def pause_reason(repo, token, number):
 
 
 def github_issues():
+    generation = _github_generation
     now = time.time()
     if _cache["issues"] is not None and now - _cache["issues_at"] < ISSUE_CACHE_TTL:
         return _cache["issues"]
@@ -1582,8 +1886,10 @@ def github_issues():
         if "pull_request" not in i
         and (i.get("author_association") or "").upper() in TRUSTED_ASSOCIATIONS
     ]
-    _cache["issues"] = issues
-    _cache["issues_at"] = now
+    with _github_cache_lock:
+        if generation == _github_generation:
+            _cache["issues"] = issues
+            _cache["issues_at"] = now
     return issues
 
 
@@ -1603,6 +1909,7 @@ def issue_number_from_pr(pr):
 
 
 def github_pulls():
+    generation = _github_generation
     now = time.time()
     if _pulls_cache["data"] is not None and now - _pulls_cache["at"] < ISSUE_CACHE_TTL:
         return _pulls_cache["data"]
@@ -1639,8 +1946,10 @@ def github_pulls():
             "draft": bool(pr.get("draft")),
             "title": pr.get("title") or "",
         }
-    _pulls_cache["data"] = pulls
-    _pulls_cache["at"] = now
+    with _github_cache_lock:
+        if generation == _github_generation:
+            _pulls_cache["data"] = pulls
+            _pulls_cache["at"] = now
     return pulls
 
 
@@ -1676,10 +1985,25 @@ def issue_trusted(issue):
 
 
 def clear_github_cache():
-    _cache["issues"] = None
-    _cache["issues_at"] = 0.0
-    _pulls_cache["data"] = None
-    _pulls_cache["at"] = 0.0
+    global _github_generation
+    with _github_cache_lock:
+        _github_generation += 1
+        _cache["issues"] = None
+        _cache["issues_at"] = 0.0
+        _pulls_cache["data"] = None
+        _pulls_cache["at"] = 0.0
+
+
+def request_scheduler_refresh():
+    """Best effort: a tracker write remains successful if refresh is unavailable."""
+    parts = urlparse(STATE_URL)
+    url = parts._replace(path="/api/v1/refresh", query="", fragment="").geturl()
+    try:
+        request = urllib.request.Request(url, data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return bool(json.load(response).get("queued"))
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
 
 
 _state_cache = {"data": None, "at": 0.0, "started": False}
@@ -1706,11 +2030,13 @@ def symphony_state():
 def state_poller():
     announced = False
     while True:
+        observed_after = time.time()
         data = fetch_state()
         if data is not None:
             with _state_lock:
                 _state_cache["data"] = data
                 _state_cache["at"] = time.time()
+                _state_cache["observed_after"] = observed_after
             if not announced:
                 print("state poller ready: %s" % STATE_URL, flush=True)
                 announced = True
@@ -1740,6 +2066,16 @@ def agent_detail(state):
     return entries
 
 
+def session_active(run, agent, state, now=None):
+    """Only associate an active worker with its own recorded session."""
+    if state is not None:
+        if not agent or agent.get("merge_eval"):
+            return False
+        session_id = agent.get("session_id")
+        return bool(session_id and session_id == run.get("id"))
+    return (time.time() if now is None else now) - run["mtime"] < LIVE_WINDOW
+
+
 def agent_errors(state):
     if not state:
         return {}
@@ -1754,6 +2090,7 @@ def agent_errors(state):
                     "error": entry.get("error") or "",
                     "short": short_error(entry.get("error") or ""),
                     "due_at": entry.get("due_at") or "",
+                    "delay_type": entry.get("delay_type") or "",
                 }
     return errors
 
@@ -1798,6 +2135,7 @@ STATUS_UI = {
     "ready": ("待处理", "ready"),
     "awaiting": ("待合并", "awaiting"),
     "idle": ("空闲", "idle"),
+    "done": ("已完成", "done"),
 }
 
 COLUMNS = [
@@ -1807,6 +2145,7 @@ COLUMNS = [
     ("ready", "待处理", "等待调度器领取 · agent 标签"),
     ("awaiting", "待合并", "PR 已开 · 等待人工 review / 合并"),
     ("idle", "空闲", "既无 agent 标签也无 open PR"),
+    ("done", "已完成", "最近关闭的 Issue · 同步自 GitHub"),
 ]
 
 STATUS_TEXT = {key: value[0] for key, value in STATUS_UI.items()}
@@ -1818,6 +2157,7 @@ EMPTY_TEXT = {
     "ready": "没有等待派发的 Issue",
     "awaiting": "没有等待合并的 PR",
     "idle": "没有空闲的 Issue",
+    "done": "没有已完成记录",
 }
 
 ACTIVITY_ICON = (
@@ -1870,6 +2210,12 @@ ICONS = {
         '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6" fill="none" '
         'stroke="currentColor" stroke-width="1.4" opacity=".55"/></svg>'
     ),
+    "done": (
+        '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6" fill="none" '
+        'stroke="currentColor" stroke-width="1.6"/><path d="M5.6 8.2l1.7 1.7 3.2-3.5" '
+        'fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" '
+        'stroke-linejoin="round"/></svg>'
+    ),
 }
 
 EXT_ICON = (
@@ -1879,12 +2225,12 @@ EXT_ICON = (
 
 
 def status_of(issue, labels, agent, has_pr=False):
-    if agent in ("running", "blocked", "retrying"):
-        return agent
     lower = {label.lower() for label in labels}
     # needs-human pauses execution and conflicts with the execution label.
     if "needs-human" in lower:
         return "blocked"
+    if agent in ("running", "blocked", "retrying"):
+        return agent
     if "agent" in lower:
         return "ready"
     if has_pr:
@@ -1905,6 +2251,7 @@ def build_cards():
     pulls = github_pulls()
 
     rendered = []
+    facts = {}
     counts = {"running": 0, "blocked": 0, "retrying": 0, "ready": 0, "awaiting": 0, "idle": 0}
 
     for issue in issues:
@@ -1915,6 +2262,18 @@ def build_cards():
         agent = status.get(name)
         pull = pulls.get(number)
         st = status_of(name, labels, agent, pull is not None)
+        merge_eval = bool((agents.get(name) or {}).get("merge_eval"))
+        merge_pending = (
+            merge_eval
+            or (
+                st == "retrying"
+                and (errors.get(name) or {}).get("delay_type") == "merge_poll"
+            )
+        )
+        if any(label.lower() == "needs-human" for label in labels):
+            merge_pending = False
+        if merge_pending:
+            st = "awaiting"
         counts[st] = counts.get(st, 0) + 1
 
         detail = agents.get(name) or {}
@@ -1927,7 +2286,7 @@ def build_cards():
         elif st in ("retrying", "blocked") and trouble:
             right = "<span class='bright'>第 %d 次重试</span>" % (trouble.get("attempt") or 0)
         elif runs:
-            right = "<span class='bright'>%d 次运行 · %s</span>" % (runs, esc(latest[5:16]))
+            right = "<span class='bright'>%d 个会话 · %s</span>" % (runs, esc(latest[5:16]))
         else:
             right = "<span class='bright'>未运行</span>"
 
@@ -1940,11 +2299,23 @@ def build_cards():
             )
 
         title = issue.get("title") or ""
-        gen = "<span class='bgen'>%d 次</span>" % runs if runs else ""
+        gen = "<span class='bgen'>%d 个会话</span>" % runs if runs else ""
         has_agent = any(label.lower() == "agent" for label in labels)
         has_paused = any(label.lower() == "needs-human" for label in labels)
+        has_approved = any(label.lower() == "merge-approved" for label in labels)
+        facts[name] = {"labels": sorted(label.lower() for label in labels)}
         pause_note = pause_reason(repo, token, number) if has_paused else ""
         state_text = "等待人工处理" if has_paused else STATUS_TEXT[st]
+        if has_paused and has_agent:
+            state_text = "标签冲突 · 等待人工处理"
+        elif has_paused and agent == "running" and not merge_eval:
+            state_text = "已转人工 · 正在停止执行"
+        elif st == "awaiting" and not merge_pending:
+            state_text = "有关联 PR · 交付待确认"
+        if merge_pending:
+            state_text = "已批准 · 等待核验" if has_approved else "待合并 · 等待门禁"
+            if merge_eval:
+                state_text += " · 评估中"
         pr_html = ""
         pr_url = ""
         pr_number = ""
@@ -1967,6 +2338,7 @@ def build_cards():
                     "<div class='bcard %(state)s%(live)s' data-issue='%(name)s' "
                     "data-title='%(title)s' data-url='%(url)s' data-state='%(state)s' "
                     "data-state-text='%(text)s' data-agent='%(agent)s' "
+                    "data-mg='%(mg)s' data-approved='%(approved)s' "
                     "data-paused='%(paused)s' data-pause-reason='%(pause)s' "
                     "data-pr='%(prurl)s' data-pr-num='%(prnum)s' data-search='%(search)s'>"
                     "<div class='btitle'>%(title)s</div>"
@@ -1986,6 +2358,8 @@ def build_cards():
                     "url": esc(issue.get("html_url")),
                     "text": esc(state_text),
                     "agent": "1" if has_agent else "0",
+                    "mg": "1" if merge_pending else "0",
+                    "approved": "1" if has_approved else "0",
                     "paused": "1" if has_paused else "0",
                     "pause": esc(pause_note),
                     "prurl": esc(pr_url),
@@ -2006,6 +2380,59 @@ def build_cards():
     cols = {}
     for key in STATUS_UI:
         cols[key] = "".join(r["html"] for r in rendered if r["state"] == key)
+
+    done_events, _done_warn = github_history()
+    open_numbers = {issue.get("number") for issue in issues}
+    done_cards = []
+    for event in done_events:
+        number = event.get("number")
+        if number in open_numbers:
+            continue
+        name = "%s%d" % (IDENTIFIER_PREFIX, number)
+        entries = sessions.get(name) or []
+        gen = "<span class='bgen'>%d 个会话</span>" % len(entries) if entries else ""
+        facts[name] = {"closed": True}
+        merged_pr = event.get("merged_pr") or {}
+        result_text = "已合并" if merged_pr else "已关闭"
+        pr_html = ("<a class='bpr' href='%s' target='_blank' rel='noopener noreferrer'>PR #%s</a>"
+                   % (esc(merged_pr.get("url")), esc(merged_pr.get("number")))) if merged_pr else ""
+        closed_at = fmt_dt(event.get("at"))
+        search = ("%s %s %s" % (name, event.get("title") or "", repo or "")).lower()
+        done_cards.append(
+            "<div class='bcard done' data-issue='%(name)s' data-title='%(title)s' "
+            "data-url='%(url)s' data-state='done' data-state-text='%(result)s' "
+            "data-pr='%(prurl)s' data-pr-num='%(prnum)s' "
+            "data-closed='1' data-completed-at='%(at)s' data-description='%(desc)s' "
+            "data-search='%(search)s'>"
+            "<div class='btitle'>%(title)s</div>"
+            "<div class='bmeta'>"
+            "<div class='brow'><span class='bid'>%(name)s</span>%(gen)s%(pr)s"
+            "<a class='ext' href='%(url)s' target='_blank' rel='noopener noreferrer' "
+            "title='在 GitHub 打开'>%(ext)s</a></div>"
+            "<div class='brow'><span class='bstat tone-done'>%(icon)s%(result)s</span>"
+            "<span class='bright'>%(clock)s</span></div>"
+            "</div></div>"
+            % {
+                "name": esc(name),
+                "title": esc(event.get("title") or ""),
+                "url": esc(event.get("url") or ""),
+                "at": esc(closed_at),
+                "desc": esc(event.get("body") or ""),
+                "search": esc(search),
+                "gen": gen,
+                "ext": EXT_ICON,
+                "icon": ICONS["done"],
+                "clock": esc(closed_at[5:16]),
+                "result": result_text,
+                "pr": pr_html,
+                "prurl": esc(merged_pr.get("url") or ""),
+                "prnum": esc(merged_pr.get("number") or ""),
+            }
+        )
+        if len(done_cards) >= DONE_COL_LIMIT:
+            break
+    cols["done"] = "".join(done_cards)
+    counts["done"] = len(done_cards)
     return {
         "cols": cols,
         "counts": counts,
@@ -2013,11 +2440,13 @@ def build_cards():
         "with_runs": with_runs,
         "repo": repo or "-",
         "writable": bool(repo and token),
+        "facts": facts,
     }
 
 
 def issues_page():
-    data = build_cards()
+    repo, _token = load_tracker()
+    data = {"counts": {}, "cols": {}, "repo": repo or "-", "total": 0, "writable": False}
     if data is None:
         sessions = scan_sessions()
         cards = []
@@ -2035,13 +2464,13 @@ def issues_page():
         body = (
             "<div class='app'><header class='topbar'><div class='brand'>%s<span>Symphony</span></div>"
             "<div class='health'><span class='dot'></span>"
-            "<span>GitHub 不可用 · 仅显示本地记录</span></div></header>"
+            "<span>GitHub 不可用 · 仅显示本地记录</span></div>%s</header>"
             "<div class='head'><div class='hrow'><h1>Issue 工作台</h1>"
             "<span class='sum'>%d 个有记录的 issue</span></div>"
             "<div class='note'>GitHub issues unavailable; showing recorded runs only · <a href='/history'>今日完成 / 历史记录</a></div></div>"
             "<div class='tools'><div class='chips'><span class='chip on'>全部 <b>%d</b></span></div></div>"
             "<main class='board' id='board'>%s</main></div>"
-            % (ACTIVITY_ICON, len(sessions), len(sessions),
+            % (ACTIVITY_ICON, runtime_badge(), len(sessions), len(sessions),
                "".join(cards) or "<div class='empty-col'>no runs recorded yet</div>")
         )
         return page("Symphony", body)
@@ -2051,19 +2480,19 @@ def issues_page():
         "%d %s" % (counts.get(key, 0), label)
         for key, label, _sub in COLUMNS
         if counts.get(key, 0)
-    ) or "当前没有任务"
+    ) or "正在加载任务…"
     col_html = []
     for key, label, sub in COLUMNS:
         cards = data["cols"].get(key) or ""
-        inner = cards or "<div class='empty-col'>%s</div>" % EMPTY_TEXT[key]
+        inner = cards or "<div class='empty-col'>正在加载…</div>"
         col_html.append(
             "<section class='col%s' data-col='%s'>"
             "<header class='col-head'><span class='cdot %s'></span>"
             "<div class='chead'><div class='cline'><span class='clabel'>%s</span>"
-            "<span class='ccount' id='cc-%s'>%d</span></div>"
+            "<span class='ccount' id='cc-%s'>%s</span></div>"
             "<div class='csub'>%s</div></div></header>"
             "<div class='col-body' id='col-%s'>%s</div></section>"
-            % ("" if cards else " is-empty", key, key, label, key, counts.get(key, 0), sub, key, inner)
+            % ("" if cards else " is-empty", key, key, label, key, "—", sub, key, inner)
         )
 
     repo = data["repo"]
@@ -2079,7 +2508,8 @@ def issues_page():
         "<header class='topbar'>"
         "<div class='brand'>%s<span>Symphony</span></div>"
         "<div class='health'><span class='dot'></span>"
-        "<span id='health'>运行中 %d · 更新于 %s</span></div>"
+        "<span id='health'>正在加载数据…</span></div>"
+        "%s"
         "<div class='auto'>%s<span>自动刷新 15 秒</span>"
         "<a href='%s' target='_blank' rel='noopener noreferrer'>%s</a></div>"
         "</header>"
@@ -2119,12 +2549,12 @@ def issues_page():
         "<div class='dlg-actions'><button type='button' class='dlg-btn' id='dlg-cancel'>取消</button>"
         "<button type='button' class='dlg-btn primary' id='dlg-ok'>确认</button></div>"
         "</div></div>"
-        "<aside class='drawer' id='drawer'><div class='dhead' id='dhead'></div>"
+        "<aside class='drawer' id='drawer'><div class='dgrip' id='dgrip' title='拖动调整宽度'></div>"
+        "<div class='dhead' id='dhead'></div>"
         "<div class='dbody' id='dbody'></div></aside>"
     ) % (
         ACTIVITY_ICON,
-        counts.get("running", 0),
-        datetime.now(CN).strftime("%H:%M:%S"),
+        runtime_badge(),
         REFRESH_ICON,
         esc(repo_url),
         esc(repo),
@@ -2153,6 +2583,7 @@ def github_history():
             and time.time() - _history_cache["at"] < ISSUE_CACHE_TTL):
         return _history_cache["events"], _history_cache.get("warning", "")
     events = []
+    merged_prs = {}
     limited = False
     try:
         for page_number in range(1, 11):
@@ -2163,6 +2594,14 @@ def github_history():
             if not isinstance(rows, list):
                 raise ValueError("invalid GitHub history response")
             for row in rows:
+                pr_meta = row.get("pull_request") or {}
+                if pr_meta.get("merged_at"):
+                    for match in re.finditer(r"\b(?:closes?|closed|fix(?:es|ed)?|resolves?|resolved)\s+#(\d+)\b", row.get("body") or "", re.I):
+                        target = int(match.group(1))
+                        previous = merged_prs.get(target) or {}
+                        if pr_meta["merged_at"] > previous.get("at", ""):
+                            merged_prs[target] = {"number": row["number"], "url": row.get("html_url") or "",
+                                                 "at": pr_meta["merged_at"]}
                 if "pull_request" in row or row.get("state_reason") == "not_planned":
                     continue
                 if row.get("state") != "closed" or not row.get("closed_at"):
@@ -2176,6 +2615,9 @@ def github_history():
                 break
         else:
             limited = True
+        for event in events:
+            if event["number"] in merged_prs:
+                event["merged_pr"] = merged_prs[event["number"]]
         events.sort(key=lambda event: event["at"], reverse=True)
         warning = "仅扫描最近更新的 1000 条已关闭条目（含 PR）；更早记录请到 GitHub 查看。" if limited else ""
         _history_cache.update(repo=repo, at=time.time(), events=events, warning=warning)
@@ -2788,8 +3230,9 @@ def live_page(issue, entries):
     fragment = chunk["html"]
     if chunk["truncated"]:
         fragment = "<div class='meta'>… 更早的记录已省略，仅显示最近部分 …</div>" + fragment
-    alive = agent_detail(symphony_state()).get(issue) is not None
-    state = "live" if alive or (time.time() - run["mtime"]) < LIVE_WINDOW else "idle"
+    current = symphony_state()
+    alive = session_active(run, agent_detail(current).get(issue), current)
+    state = "live" if alive else "idle"
 
     body = """
 <h1>%(issue)s <span id='status' class='%(state)s'>%(label)s</span></h1>
@@ -2946,6 +3389,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_text(404, "not found")
 
     def do_POST(self):
+        self._completed_writes = 0
+        self._mutation_outcome = "not_applied"
         parsed = urlparse(self.path)
         try:
             self.route_post(parsed)
@@ -3021,8 +3466,9 @@ class Handler(BaseHTTPRequestHandler):
         action = payload.get("action")
         label = str(payload.get("label") or "agent").lower()
         comment = str(payload.get("comment") or "").strip()
-        if label not in ("agent", "needs-human"):
-            return self.send_json(400, {"error": "只允许修改 agent / needs-human 标签"})
+        if label not in ("agent", "needs-human", "merge-approved"):
+            return self.send_json(
+                400, {"error": "只允许修改 agent / needs-human / merge-approved 标签"})
         if action not in ("add", "remove"):
             return self.send_json(400, {"error": "action 必须是 add 或 remove"})
         if len(comment) > 4000:
@@ -3044,19 +3490,21 @@ class Handler(BaseHTTPRequestHandler):
         posted = False
         if comment:
             try:
-                github_request("POST", "/repos/%s/issues/%s/comments" % (repo, number), token, {"body": comment})
+                self.mutation_request("POST", "/repos/%s/issues/%s/comments" % (repo, number), token, {"body": comment})
                 posted = True
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")[:200]
                 return self.send_json(502, {"error": "评论发布失败 GitHub %s: %s" % (exc.code, detail)})
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
                 return self.send_json(502, {"error": "评论发布失败: %s" % exc})
-        others = [name for name in ("agent", "needs-human") if name != label]
+        # 执行/暂停标签互斥；merge-approved 是独立的合并授权标签，不参与互斥。
+        others = ([name for name in ("agent", "needs-human") if name != label]
+                  if label in ("agent", "needs-human") else [])
         if action == "add":
             # 执行/暂停标签互斥：加其中一个前先摘掉已在的其他标签。
             for other in [name for name in others if name in labels]:
                 try:
-                    github_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, other), token)
+                    self.mutation_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, other), token)
                 except urllib.error.HTTPError as exc:
                     if exc.code != 404:
                         detail = exc.read().decode("utf-8", "replace")[:200]
@@ -3069,9 +3517,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(502, {"error": "%s摘掉 %s 标签失败: %s" % (prefix, other, exc)})
         try:
             if action == "add":
-                github_request("POST", "/repos/%s/issues/%s/labels" % (repo, number), token, {"labels": [label]})
+                self.mutation_request("POST", "/repos/%s/issues/%s/labels" % (repo, number), token, {"labels": [label]})
             else:
-                github_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, label), token)
+                self.mutation_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, label), token)
         except urllib.error.HTTPError as exc:
             if action == "remove" and exc.code == 404:
                 pass
@@ -3083,6 +3531,7 @@ class Handler(BaseHTTPRequestHandler):
             prefix = "评论已发布，但标签操作失败：" if posted else ""
             return self.send_json(502, {"error": prefix + "GitHub 请求失败: %s" % exc})
         clear_github_cache()
+        refresh_queued = request_scheduler_refresh()
         if action == "add" and label == "agent":
             message = (
                 "已发布说明并加入 agent 标签，调度器会在下个轮询周期派发"
@@ -3091,11 +3540,16 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif action == "remove" and label == "agent":
             message = "已移除 agent 标签，调度器会在下个轮询周期停止该任务"
+        elif action == "add" and label == "merge-approved":
+            message = "已挂 merge-approved；宿主会在下一轮合并评估放行当前交付 SHA"
+        elif action == "remove" and label == "merge-approved":
+            message = "已移除 merge-approved 标签"
         elif action == "add":
             message = "已加入 needs-human 并移除执行标签；该 issue 暂停等待人工"
         else:
             message = "已移除 needs-human 标签"
-        return self.send_json(200, {"ok": True, "message": message, "commented": posted})
+        return self.send_json(200, {"ok": True, "message": message, "commented": posted,
+                                    "refresh_queued": refresh_queued})
 
     def handle_intervene(self):
         """人工介入：pause 加 needs-human 并摘 agent；resume 反向恢复。"""
@@ -3137,7 +3591,7 @@ class Handler(BaseHTTPRequestHandler):
             note = comment
         if note:
             try:
-                github_request("POST", "/repos/%s/issues/%s/comments" % (repo, number), token, {"body": note})
+                self.mutation_request("POST", "/repos/%s/issues/%s/comments" % (repo, number), token, {"body": note})
                 posted = True
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")[:200]
@@ -3150,9 +3604,9 @@ class Handler(BaseHTTPRequestHandler):
             # 避免出现 agent + needs-human 的无效组合被调度器看到。
             try:
                 if add_label:
-                    github_request("POST", "/repos/%s/issues/%s/labels" % (repo, number), token, {"labels": [add_label]})
+                    self.mutation_request("POST", "/repos/%s/issues/%s/labels" % (repo, number), token, {"labels": [add_label]})
                 if drop_label:
-                    github_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, drop_label), token)
+                    self.mutation_request("DELETE", "/repos/%s/issues/%s/labels/%s" % (repo, number, drop_label), token)
             except urllib.error.HTTPError as exc:
                 if exc.code == 404 and drop_label:
                     pass
@@ -3172,8 +3626,11 @@ class Handler(BaseHTTPRequestHandler):
             if error is None:
                 error = swap("agent", None)
         if error:
+            clear_github_cache()
+            request_scheduler_refresh()
             return self.send_json(502, {"error": error})
         clear_github_cache()
+        refresh_queued = request_scheduler_refresh()
         if op == "pause":
             message = (
                 "已暂停并标记 needs-human（%s）调度器不会再派发；处理完成后点“恢复执行”"
@@ -3181,7 +3638,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         else:
             message = "已移除 needs-human 并重新加 agent；调度器会重新领取，合并前宿主会重新核验当前 SHA 与审批"
-        return self.send_json(200, {"ok": True, "message": message, "commented": posted})
+        return self.send_json(200, {"ok": True, "message": message, "commented": posted,
+                                    "refresh_queued": refresh_queued})
 
     def handle_tail(self, issue, query):
         if not ISSUE_RE.match(issue or ""):
@@ -3200,8 +3658,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             chunk = tail_chunk(run["path"], offset)
 
-        entry = agent_detail(symphony_state()).get(issue)
-        running = bool(entry) or (time.time() - run["mtime"]) < LIVE_WINDOW
+        state = symphony_state()
+        entry = agent_detail(state).get(issue)
+        running = session_active(run, entry, state)
         agent = None
         if entry:
             tokens = entry.get("tokens") or {}
@@ -3229,7 +3688,10 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def handle_issues(self):
+        generation = _github_generation
         data = build_cards()
+        if generation != _github_generation:
+            return self.send_json(409, {"error": "state changed during refresh; retry"})
         if data is None:
             return self.send_json(503, {"error": "github unavailable"})
         counts = data["counts"]
@@ -3254,6 +3716,10 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "repo": data["repo"],
                 "writable": bool(data.get("writable")),
+                "runtime": agent_status(symphony_state()),
+                "facts": data.get("facts", {}),
+                "github_observed_after": _cache.get("issues_at", 0),
+                "state_observed_after": _state_cache.get("observed_after", 0),
                 "updated": datetime.now(CN).strftime("%H:%M:%S"),
             },
         )
@@ -3270,7 +3736,7 @@ class Handler(BaseHTTPRequestHandler):
         latest = entries[-1] if entries else None
         runs = []
         for r in reversed(entries):
-            active = (r is latest and agent is not None) or (now - r["mtime"]) < LIVE_WINDOW
+            active = session_active(r, agent, state, now)
             runs.append(
                 {
                     "short": r["short"],
@@ -3285,12 +3751,16 @@ class Handler(BaseHTTPRequestHandler):
         agent_info = None
         if agent:
             tokens = agent.get("tokens") or {}
+            provider, model = live_model(latest["path"]) if latest and latest.get("live") else ("", "")
+            rt = load_runtime()
             agent_info = {
                 "message": agent.get("last_message") or "",
                 "event": agent.get("last_event") or "",
                 "event_at": agent.get("last_event_at") or "",
                 "started_at": agent.get("started_at") or "",
                 "tokens": tokens.get("total_tokens"),
+                "model": "%s/%s" % (provider, model) if provider and model else model or rt.get("model") or "",
+                "thinking": rt.get("thinking") or "",
             }
         return self.send_json(
             200,
@@ -3315,8 +3785,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             chunk = tail_chunk(run["path"], offset)
 
-        latest_and_running = entries[-1] is run and agent_detail(symphony_state()).get(issue)
-        active = bool(latest_and_running) or (time.time() - run["mtime"]) < LIVE_WINDOW
+        state = symphony_state()
+        active = session_active(run, agent_detail(state).get(issue), state)
 
         eof = chunk["offset"] >= chunk["size"] if chunk["size"] else True
 
@@ -3378,7 +3848,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def mutation_request(self, *args, **kwargs):
+        try:
+            result = github_request(*args, **kwargs)
+        except urllib.error.HTTPError:
+            self._mutation_outcome = "partial" if self._completed_writes else "not_applied"
+            raise
+        except Exception:
+            self._mutation_outcome = "partial" if self._completed_writes else "uncertain"
+            raise
+        self._completed_writes += 1
+        return result
+
     def send_json(self, status, data):
+        if status >= 400 and self.command == "POST" and urlparse(self.path).path in ("/api/label", "/api/intervene"):
+            data = {**data, "outcome": getattr(self, "_mutation_outcome", "not_applied")}
+            if data["outcome"] != "not_applied" or getattr(self, "_completed_writes", 0):
+                clear_github_cache()
+                request_scheduler_refresh()
         payload = json.dumps(data).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")

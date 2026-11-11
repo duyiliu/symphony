@@ -739,6 +739,7 @@ def _running_entry_payload(entry):
         "workspace_path": entry.get("workspace_path"),
         "session_id": entry.get("session_id"),
         "turn_count": entry.get("turn_count", 0),
+        "merge_eval": bool(entry.get("merge_eval")),
         "last_event": entry.get("last_codex_event"),
         "last_message": _summarize_message(entry.get("last_codex_message")),
         "started_at": _iso(entry.get("started_at")),
@@ -757,6 +758,7 @@ def _retry_entry_payload(entry):
         "issue_identifier": entry.get("identifier"),
         "issue_url": entry.get("issue_url"),
         "attempt": entry.get("attempt"),
+        "delay_type": entry.get("delay_type"),
         "due_at": _due_at(entry.get("due_in_ms")),
         "error": entry.get("error"),
         "worker_host": entry.get("worker_host"),
@@ -787,6 +789,7 @@ def _running_issue_payload(entry):
         "workspace_path": entry.get("workspace_path"),
         "session_id": entry.get("session_id"),
         "turn_count": entry.get("turn_count", 0),
+        "merge_eval": bool(entry.get("merge_eval")),
         "state": entry.get("state"),
         "started_at": _iso(entry.get("started_at")),
         "last_event": entry.get("last_codex_event"),
@@ -842,11 +845,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _json(self, status, payload):
         data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # Client went away mid-response (timeouts, polling UIs); not a
+            # server fault — keep the log clean.
+            log.debug("http client aborted during response")
 
     def _error(self, status, code, message):
         self._json(status, {"error": {"code": code, "message": message}})
@@ -918,6 +926,18 @@ class _Handler(BaseHTTPRequestHandler):
         raise AttributeError(name)
 
 
+def _quiet_handle_error(request, client_address):
+    """socketserver hook: swallow disconnects raised while reading the
+    request line (clients aborting mid-poll), which are not server faults."""
+    import sys
+    error = sys.exc_info()[1]
+    if isinstance(error, (
+            BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+        log.debug("http client aborted during request: %s", error)
+        return
+    log.exception("http request handler failed")
+
+
 def start(orchestrator, store, workflow_path, host, port):
     """Start the observability HTTP server in a daemon thread."""
     api = _Api(orchestrator, store, workflow_path)
@@ -928,6 +948,7 @@ def start(orchestrator, store, workflow_path, host, port):
     BoundHandler.api = api
     server = ThreadingHTTPServer((host, port), BoundHandler)
     server.daemon_threads = True
+    server.handle_error = _quiet_handle_error
     thread = threading.Thread(
         target=server.serve_forever, name="http-api", daemon=True)
     thread.start()

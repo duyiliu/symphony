@@ -44,18 +44,38 @@ class LaneParser(HTMLParser):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_read_started_before_write_cannot_repopulate_cache(self):
+        class Response:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+        board.clear_github_cache()
+        def changed_while_reading(response):
+            board.clear_github_cache()
+            return [{"number": 1, "author_association": "OWNER"}]
+        with patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
+            board.urllib.request, "urlopen", return_value=Response()
+        ), patch.object(board.json, "load", side_effect=changed_while_reading):
+            board.github_issues()
+        self.assertIsNone(board._cache["issues"])
+
+    def test_scheduler_refresh_failure_does_not_undo_successful_tracker_write(self):
+        with patch.object(board.urllib.request, "urlopen", side_effect=TimeoutError()):
+            self.assertFalse(board.request_scheduler_refresh())
+
     def test_empty_lane_class_does_not_match_generic_empty_state(self):
         with patch.object(board, "build_cards", return_value=fixture_cards()):
             document = board.issues_page()
         parser = LaneParser()
         parser.feed(document)
-        self.assertEqual(len(parser.lanes), 6)
-        self.assertEqual(parser.lanes["awaiting"], ["col"])
+        self.assertEqual(len(parser.lanes), len(board.COLUMNS))
+        self.assertEqual(parser.lanes["awaiting"], ["col", "is-empty"])
         for key, classes in parser.lanes.items():
             self.assertNotIn("empty", classes)
             if key != "awaiting":
                 self.assertIn("is-empty", classes)
-        self.assertIn(".col.is-empty{", board.STYLE)
+        self.assertIn(".col.is-empty .empty-col{", board.STYLE)
         self.assertNotIn(".col.empty", board.STYLE)
         # Filtering and periodic refresh must use the same class as initial HTML.
         self.assertIn("classList.toggle('is-empty', empty)", board.BOARD)
@@ -73,11 +93,11 @@ class RenderingTests(unittest.TestCase):
             parser.feed(board.issues_page())
         self.assertTrue(all(classes == ["col", "is-empty"] for classes in parser.lanes.values()))
 
-    def test_github_unavailable_renders_local_fallback(self):
-        with patch.object(board, "build_cards", return_value=None), patch.object(
+    def test_homepage_defers_github_loading(self):
+        with patch.object(board, "build_cards", side_effect=AssertionError("unexpected synchronous load")), patch.object(
             board, "scan_sessions", return_value={}
         ):
-            self.assertIn("GitHub 不可用", board.issues_page())
+            self.assertIn("正在加载任务", board.issues_page())
 
     def test_execution_status_takes_priority_over_labels_and_pr(self):
         for status in ("running", "blocked", "retrying"):
@@ -172,6 +192,9 @@ class RenderingTests(unittest.TestCase):
 
 class HTTPTests(unittest.TestCase):
     def setUp(self):
+        refresh = patch.object(board, "request_scheduler_refresh", return_value=True)
+        self.refresh_mock = refresh.start()
+        self.addCleanup(refresh.stop)
         self.cards = patch.object(board, "build_cards", side_effect=fixture_cards)
         self.cards.start()
         self.addCleanup(self.cards.stop)
@@ -209,7 +232,15 @@ class HTTPTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(payload["counts"]["awaiting"], 1)
         self.assertTrue(payload["writable"])
-        self.assertIn("data-writable='1'", self.request("GET", "/")[1])
+        self.assertIn("data-writable='0'", self.request("GET", "/")[1])
+        self.assertIn("refreshIssues().then", self.request("GET", "/")[1])
+
+    def test_issue_response_rejects_snapshot_overlapping_a_write(self):
+        def overlap():
+            board.clear_github_cache()
+            return fixture_cards()
+        with patch.object(board, "build_cards", side_effect=overlap):
+            self.assertEqual(self.request("GET", "/api/issues")[0], 409)
 
     def test_label_rejects_cross_site_requests(self):
         for endpoint in ("/api/label", "/api/approve", "/api/intervene"):
@@ -225,7 +256,6 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 400)
         bad_payloads = (
             {"issue": "GH-1", "action": "add", "label": "bug"},
-            {"issue": "GH-1", "action": "add", "label": "merge-approved"},
             {"issue": "GH-1", "action": "toggle", "label": "agent"},
             {"issue": "jira-1", "action": "add", "label": "agent"},
             {"issue": "GH-x", "action": "add", "label": "agent"},
@@ -402,6 +432,8 @@ class HTTPTests(unittest.TestCase):
                 )
             self.assertEqual(status, 200)
             self.assertIn("agent", json.loads(body)["message"])
+            self.assertTrue(json.loads(body)["refresh_queued"])
+            self.assertEqual(self.refresh_mock.call_count, 2)
             self.assertEqual(
                 calls,
                 [
@@ -417,6 +449,26 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 403)
         status, body = self.request("POST", "/api/intervene", json.dumps({"issue": "GH-1", "op": "toggle"}))
         self.assertEqual(status, 400)
+
+    def test_write_outcomes_distinguish_rejection_timeout_and_partial_success(self):
+        member = {"author_association": "MEMBER", "state": "open", "labels": []}
+        for error, outcome in [
+            (board.urllib.error.HTTPError("https://api.github.com", 403, "denied", {}, None), "not_applied"),
+            (TimeoutError("timeout"), "uncertain"),
+        ]:
+            with self.subTest(outcome=outcome), patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
+                board, "fetch_issue", return_value=member
+            ), patch.object(board, "github_request", side_effect=error):
+                status, body = self.request("POST", "/api/label", json.dumps({"issue": "GH-1", "action": "add", "label": "merge-approved"}))
+                self.assertEqual(status, 502)
+                self.assertEqual(json.loads(body)["outcome"], outcome)
+        active = {**member, "labels": [{"name": "agent"}]}
+        with patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
+            board, "fetch_issue", return_value=active
+        ), patch.object(board, "github_request", side_effect=[{}, {}, TimeoutError("delete failed")]):
+            status, body = self.request("POST", "/api/intervene", json.dumps({"issue": "GH-1", "op": "pause"}))
+            self.assertEqual(status, 502)
+            self.assertEqual(json.loads(body)["outcome"], "partial")
         self.github_mock.assert_not_called()
 
     def test_pause_reason_extracts_the_latest_host_pause_comment(self):

@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from ..workflow import WorkflowError
 from . import workflow_policy as policy
@@ -97,16 +98,70 @@ def _admit_labeled(issue, number, settings, record, save):
             settings, number, record, save, event, pause_reason)
     if record.get("blocked"):
         return "waiting"
+    delivery = record.get("delivery")
+    if (isinstance(delivery, dict)
+            and delivery.get("published") is True
+            and delivery.get("cycle") == record.get("cycle")):
+        # A published delivery belongs to the host: evaluate the merge gate
+        # inline every admission instead of dispatching an agent that would
+        # just poll checks and burn tokens. Repairs still get a worker.
+        return _admit_merge(number, settings, record, save)
     if record["attempts"] >= policy.config(settings).get("max_attempts", 3):
         pause(settings, number, record, save,
               "Worker attempt limit reached; human intervention required")
         return "waiting"
-    # Fresh develop cycle, or a re-dispatch after delivery (agent is kept):
-    # the worker either develops/delivers or finishes the host-guarded merge.
+    # Fresh develop cycle: the worker develops/delivers; afterwards the host
+    # owns the merge poll until merge, repair dispatch or pause.
     updated = dict(record)
     updated["attempts"] = record["attempts"] + 1
     save(updated)
     return "ok"
+
+
+def _admit_merge(number, settings, record, save):
+    """Host-side merge admission for a published delivery.
+
+    Runs inside ``begin_run`` on every poll while a delivery awaits merge:
+    ``await`` → ``await_merge`` (no agent, slow re-poll), ``fix`` → ``ok``
+    (dispatch a worker to repair), ``human`` → pause. Gate errors that are
+    not structural retry on the next poll.
+    """
+    try:
+        labels, pr_data, delivery = delivery_state(settings, number, record)
+        decision = auto_ready(settings, delivery, pr_data, labels)
+    except GateError as error:
+        if error.reason in _FAIL_CLOSED_REASONS:
+            pause(settings, number, record, save,
+                  "Auto merge declined: %s" % error.reason)
+            return "waiting"
+        log.warning(
+            "Merge admission check failed issue=%s reason=%r; retrying "
+            "next poll", number, error.reason)
+        return "await_merge"
+    if decision[0] == "ready":
+        if _label_approved(settings, labels):
+            record = save({**record, "approval": "label"})
+        try:
+            commit_merge(settings, number, record, save)
+        except GateError as error:
+            if error.reason == "merge_not_confirmed":
+                return "waiting"
+            log.warning(
+                "Host merge attempt failed issue=%s reason=%r; retrying "
+                "next poll", number, error.reason)
+        return "await_merge"
+    if decision[0] == "await":
+        log.info("Merge gate waiting issue=%s reason=%s details=%r sha=%s",
+                 number, decision[1], decision[2], delivery.get("sha"))
+        return "await_merge"
+    if decision[0] == "fix":
+        log.info(
+            "Merge gate needs repair issue=%s reason=%s; dispatching worker",
+            number, decision[1])
+        return "ok"
+    pause(settings, number, record, save,
+          "Auto merge declined: %s" % decision[1])
+    return "waiting"
 
 
 def waiting(issue, settings):
@@ -136,6 +191,42 @@ def waiting(issue, settings):
 def _blocked_cycle(settings, number, record):
     event, _labels = signal(settings, number)
     return record.get("blocked") is True and record.get("cycle") == cycle(event)
+
+
+def merge_pending(issue, settings):
+    """True when a published delivery in the current cycle awaits the
+    host-side merge admission — the worker run should end rather than
+    poll checks itself. Failures return False so normal routing decides."""
+    if not policy.enabled(settings):
+        return False
+    try:
+        number = number_or_fail(issue.id)
+    except GateError:
+        return False
+    try:
+        return locked(
+            settings, number,
+            lambda record, _save: _merge_pending(settings, number, record)
+        ) is True
+    except GateError:
+        return False
+    except Exception as error:  # noqa: BLE001 - never block the runner loop
+        log.debug(
+            "merge_pending check failed issue_id=%s error=%r", issue.id, error)
+        return False
+
+
+def _merge_pending(settings, number, record):
+    if record.get("blocked") or record.get("pending_merge") \
+            or record.get("merged"):
+        return False
+    delivery = record.get("delivery")
+    if not (isinstance(delivery, dict)
+            and delivery.get("published") is True
+            and delivery.get("cycle") == record.get("cycle")):
+        return False
+    event, _labels = signal(settings, number)
+    return record.get("cycle") == cycle(event)
 
 
 def same_phase(before, after, settings):
@@ -286,6 +377,8 @@ def merge_delivery(settings, number, record, save):
     labels, pr_data, delivery = delivery_state(settings, number, record)
     decision = auto_ready(settings, delivery, pr_data, labels)
     if decision[0] == "ready":
+        if _label_approved(settings, labels):
+            record = save({**record, "approval": "label"})
         return commit_merge(settings, number, record, save)
     if decision[0] == "await":
         return {"status": "waiting_%s" % decision[1], "pending": decision[2]}
@@ -297,20 +390,34 @@ def merge_delivery(settings, number, record, save):
 
 
 def delivery_state(settings, number, record):
-    event, labels = signal(settings, number)
-    ensure(
-        record.get("cycle") == cycle(event) and not record.get("blocked"),
-        "not_a_merge_run")
+    # The four reads are independent; fetching them concurrently keeps a
+    # merge call well inside the MCP client timeout on slow networks.
     delivery = record.get("delivery")
-    ensure(
-        isinstance(delivery, dict)
-        and delivery.get("cycle") == record.get("cycle"),
-        "missing_delivery")
-    ensure(delivery.get("published") is True, "delivery_not_published")
-    ensure(
-        _linked_pr(settings, number) == delivery["pr"],
-        "pr_association_changed")
-    pr_data = fetch_pr(settings, delivery["pr"])
+    pr_number = delivery.get("pr") if isinstance(delivery, dict) else None
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_issue = pool.submit(fetch_issue, settings, number)
+        f_events = pool.submit(events, settings, number)
+        f_linked = pool.submit(linked_prs, settings, number)
+        f_pr = (pool.submit(fetch_pr, settings, pr_number)
+                if isinstance(pr_number, int)
+                and not isinstance(pr_number, bool) else None)
+        event, labels = _signal_check(
+            settings, f_issue.result(), f_events.result())
+        ensure(
+            record.get("cycle") == cycle(event) and not record.get("blocked"),
+            "not_a_merge_run")
+        ensure(
+            isinstance(delivery, dict)
+            and delivery.get("cycle") == record.get("cycle"),
+            "missing_delivery")
+        ensure(delivery.get("published") is True, "delivery_not_published")
+        open_prs = [
+            node for node in f_linked.result()
+            if isinstance(node, dict) and node.get("state") == "OPEN"]
+        ensure(len(open_prs) == 1, "ambiguous_pr_association")
+        ensure(
+            open_prs[0]["number"] == delivery["pr"], "pr_association_changed")
+        pr_data = f_pr.result()
     _validate_pr(settings, pr_data)
     ensure(
         pr_data["head"]["sha"] == delivery["sha"]
@@ -322,8 +429,11 @@ def delivery_state(settings, number, record):
 def commit_merge(settings, number, record, save):
     # Re-read labels after CI/risk inspection so mid-flight label edits
     # (needs-human, agent removal, closure) cannot slip through.
-    event, _labels = signal(settings, number)
+    event, labels = signal(settings, number)
     ensure(record.get("cycle") == cycle(event), "authorization_revoked")
+    if record.get("approval") == "label":
+        ensure(
+            _label_approved(settings, labels), "authorization_revoked")
     record = save({**record, "pending_merge": True})
     request(
         settings, "PUT",
@@ -335,41 +445,64 @@ def commit_merge(settings, number, record, save):
 # Deterministic merge admission: real checks, real merge gate, project risk
 # rules and real review approvals. Anything unverifiable goes to a human.
 def auto_ready(settings, delivery, pr_data, issue_labels):
-    runs = pages(
-        settings,
-        "%s/commits/%s/check-runs" % (root(settings), delivery["sha"]),
-        "check_runs")
-    statuses = pages(
-        settings,
-        "%s/commits/%s/statuses" % (root(settings), delivery["sha"]),
-        None)
-    pending, failing = classify_checks(runs, statuses, delivery["sha"])
-    gate = merge_gate(settings, delivery["pr"])
-    ensure(
-        gate.get("headRefOid") == delivery["sha"]
-        and gate.get("baseRefName") == delivery["base"],
-        "delivery_changed")
-    if failing:
-        return ("fix", "checks failing on %s: %s"
-                % (delivery["sha"], ", ".join(failing)))
-    if pending:
-        return ("await", "checks", pending)
-    if gate.get("reviewDecision") == "CHANGES_REQUESTED":
-        return ("fix", "changes requested by a reviewer; address the review "
-                "comments")
-    if gate.get("mergeStateStatus") == "UNKNOWN":
-        return ("await", "checks", ["mergeability"])
-    return _gate_ready(settings, delivery, pr_data, gate, issue_labels)
+    sha = delivery["sha"]
+    pr_number = delivery["pr"]
+    # Independent reads fan out: check-runs + statuses + merge gate +
+    # files + reviews were ~9 sequential round-trips before.
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        f_runs = pool.submit(
+            pages, settings,
+            "%s/commits/%s/check-runs" % (root(settings), sha), "check_runs")
+        f_statuses = pool.submit(
+            pages, settings,
+            "%s/commits/%s/statuses" % (root(settings), sha), None)
+        f_gate = pool.submit(merge_gate, settings, pr_number)
+        f_files = pool.submit(pr_files, settings, pr_number)
+        f_reviews = pool.submit(pr_reviews, settings, pr_number)
+        pending, failing = classify_checks(
+            f_runs.result(), f_statuses.result(), sha)
+        gate = f_gate.result()
+        ensure(
+            gate.get("headRefOid") == sha
+            and gate.get("baseRefName") == delivery["base"],
+            "delivery_changed")
+        if failing:
+            return ("fix", "checks failing on %s: %s"
+                    % (sha, ", ".join(failing)))
+        if pending:
+            return ("await", "checks", pending)
+        if gate.get("reviewDecision") == "CHANGES_REQUESTED":
+            return ("fix", "changes requested by a reviewer; address the "
+                    "review comments")
+        if gate.get("mergeStateStatus") == "UNKNOWN":
+            return ("await", "checks", ["mergeability"])
+        return _gate_ready(
+            settings, delivery, pr_data, gate, issue_labels,
+            f_files.result(), f_reviews.result())
 
 
-def _gate_ready(settings, delivery, pr_data, gate, issue_labels):
-    risk = _risk_required(settings, delivery, issue_labels)
+def _gate_ready(settings, delivery, pr_data, gate, issue_labels, files=None,
+                reviews=None):
+    risk = _risk_required(settings, delivery, issue_labels, files)
     if risk[0] == "human":
         return ("human", risk[1])
-    approval_required = risk[1]
     approval_missing = (
-        approval_required and not _approved(settings, delivery, pr_data))
+        (risk[1] or policy.merge_policy(settings) == "manual")
+        and not _approved(settings, delivery, pr_data, reviews)
+        and not _label_approved(settings, issue_labels))
     return _final_gate(gate, approval_missing)
+
+
+def _label_approved(settings, issue_labels):
+    """Solo-mode approval: repo owner applied the configured approval label.
+
+    Only meaningful when ``approval_label`` is configured; intended for
+    single-account repos where a non-author GitHub review is impossible.
+    The merge-time SHA freeze still applies, so a post-approval push is
+    rejected by ``delivery_changed`` like any other drift.
+    """
+    label = policy.approval_label(settings)
+    return bool(label) and label in (issue_labels or [])
 
 
 def _final_gate(gate, approval_missing):
@@ -419,18 +552,33 @@ def classify_checks(runs, statuses, sha):
                 status.get("state") == "pending"
                 for status in context_statuses):
             pending.append(name)
-        elif (all(run.get("conclusion") == "success" for run in latest)
+        elif (all(
+                run.get("conclusion") in ("success", "neutral", "skipped")
+                for run in latest)
                 and all(
                     status.get("state") == "success"
                     for status in context_statuses)):
             pass
+        elif any(
+                run.get("conclusion") in _TRANSIENT_CHECK_CONCLUSIONS
+                for run in latest):
+            # Completed without a definitive verdict (e.g. GitHub briefly
+            # reports conclusion null / action_required / startup_failure
+            # while a skipped or queued job resolves). Re-poll instead of
+            # dispatching a repair worker for a phantom failure.
+            pending.append(name)
         else:
             failing.append(name)
     return pending, failing
 
 
-def _risk_required(settings, delivery, issue_labels):
-    files = pr_files(settings, delivery["pr"])
+_TRANSIENT_CHECK_CONCLUSIONS = frozenset(
+    {None, "action_required", "startup_failure"})
+
+
+def _risk_required(settings, delivery, issue_labels, files=None):
+    if files is None:
+        files = pr_files(settings, delivery["pr"])
     max_files = policy.max_auto_files(settings)
     if len(files) > max_files:
         return ("human", "diff touches %s files, above the auto-merge budget "
@@ -443,10 +591,12 @@ def _risk_required(settings, delivery, issue_labels):
     return ("ok", risky or policy.high_risk_label() in issue_labels)
 
 
-def _approved(settings, delivery, pr_data):
+def _approved(settings, delivery, pr_data, reviews=None):
+    if reviews is None:
+        reviews = pr_reviews(settings, delivery["pr"])
     author = _map_get(pr_data, "user", "login")
     latest = {}
-    for review in pr_reviews(settings, delivery["pr"]):
+    for review in reviews:
         if (isinstance(review, dict)
                 and review.get("commit_id") == delivery["sha"]
                 and isinstance(review.get("user"), dict)):
@@ -507,12 +657,21 @@ def _clear_labels(settings, number):
     remove_label(settings, number, policy.AGENT_LABEL)
     remove_label(settings, number, policy.pause_label())
     remove_label(settings, number, "merge-approved")
+    approval = policy.approval_label(settings)
+    if approval and approval != "merge-approved":
+        remove_label(settings, number, approval)
 
 
 def signal(settings, number):
     """Fetch the live signal: issue open, develop phase, required labels
     present, newest ``agent`` label event a ``labeled`` grant."""
-    data = fetch_issue(settings, number)
+    return _signal_check(
+        settings,
+        fetch_issue(settings, number),
+        events(settings, number))
+
+
+def _signal_check(settings, data, event_list):
     issue_labels = api_labels(data)
     ensure(
         data.get("state") == "open" and policy.phase(issue_labels) == "develop",
@@ -521,7 +680,7 @@ def signal(settings, number):
     ensure(all(label in issue_labels for label in required),
            "required_labels_removed")
     matched = [
-        event for event in events(settings, number)
+        event for event in event_list
         if isinstance(event, dict)
         and _map_get(event, "label", "name") == "agent"
         and event.get("event") in ("labeled", "unlabeled")
@@ -675,7 +834,7 @@ def _inspect(value):
     if isinstance(value, list):
         return "[%s]" % ", ".join(_inspect(item) for item in value)
     if isinstance(value, dict):
-        return "%{%s}" % ", ".join(
+        return "%%{%s}" % ", ".join(
             "%s => %s" % (json.dumps(str(key), ensure_ascii=False),
                           _inspect(item))
             for key, item in sorted(

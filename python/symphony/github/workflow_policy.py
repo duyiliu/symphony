@@ -54,11 +54,22 @@ def validate(settings):
         raise WorkflowError("invalid_github_workflow_max_attempts")
     if not _risk_config(cfg.get("risk")):
         raise WorkflowError("invalid_github_workflow_risk")
+    if cfg.get("merge_policy", "auto") not in ("auto", "manual"):
+        raise WorkflowError("invalid_github_workflow_merge_policy")
     if any(
         label in (AGENT_LABEL, PAUSE_LABEL, HIGH_RISK_LABEL, "merge-approved")
         for label in required
     ):
         raise WorkflowError("execution_labels_must_not_be_required_labels")
+    approval = cfg.get("approval_label")
+    if approval is not None:
+        normalized = normalize_label(approval)
+        if not present_string(normalized):
+            raise WorkflowError("invalid_github_workflow_approval_label")
+        if normalized in (AGENT_LABEL, PAUSE_LABEL, HIGH_RISK_LABEL):
+            raise WorkflowError("invalid_github_workflow_approval_label")
+        if normalized in [normalize_label(label) for label in required]:
+            raise WorkflowError("invalid_github_workflow_approval_label")
 
 
 def validate_runtime(settings):
@@ -72,16 +83,21 @@ def validate_runtime(settings):
         raise WorkflowError("invalid_github_workflow_state_dir", str(error))
     if (
         state_dir == workspace
-        or state_dir.startswith(workspace + "/")
-        or workspace.startswith(state_dir + "/")
+        or state_dir.startswith(workspace + os.sep)
+        or workspace.startswith(state_dir + os.sep)
     ):
         raise WorkflowError("github_workflow_store_overlaps_workspaces")
 
 
 def _absolute_private_path(path):
-    return isinstance(path, str) and path.startswith("/") and len(
-        [segment for segment in path.split("/") if segment]
-    ) >= 2
+    if not isinstance(path, str):
+        return False
+    normalized = path.replace("\\", "/")
+    if os.name == "nt" and re.match(r"^[A-Za-z]:/", normalized):
+        normalized = normalized[2:]
+    elif not normalized.startswith("/"):
+        return False
+    return len([segment for segment in normalized.split("/") if segment]) >= 2
 
 
 def _risk_config(risk):
@@ -139,6 +155,25 @@ def pause_label():
 
 def high_risk_label():
     return HIGH_RISK_LABEL
+
+
+def merge_policy(settings):
+    """``auto`` merges low-risk deliveries unattended once gates pass;
+    ``manual`` additionally requires an approval (GitHub review or the
+    configured approval label) for every delivery."""
+    return config(settings).get("merge_policy") or "auto"
+
+
+def approval_label(settings):
+    """Optional opt-in label that counts as a human merge approval.
+
+    Solo-repo setups cannot satisfy GitHub review approvals (the token
+    author cannot approve its own PR), so a repo owner may instead apply
+    this label on the issue to approve the current delivery. Disabled
+    unless configured.
+    """
+    label = config(settings).get("approval_label")
+    return normalize_label(label) if present_string(label) else None
 
 
 def review_required_paths(settings):
