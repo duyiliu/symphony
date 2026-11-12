@@ -1,0 +1,24 @@
+const task = await taskSpace('symphony-comment-rework-20261111');
+console.log({spaceId:task.spaceId});
+const page = task.page('p1');
+await page.goto('file:///D:/workspace/git/symphony/work/board-rework-fixture.html');
+await page.waitForSelector('.bcard');
+await page.evaluate(() => {
+  CUR='GH-TEST2';
+  CARD={state:'running',agent:true,paused:false,mergePending:false,approved:false,prNum:'2',pr:'https://github.com/fixture/repo/pull/2'};
+  WRITABLE=true; dheadEl.textContent='运行中补充意见'; dbodyEl.innerHTML=actionsHtml();
+  drawerEl.classList.add('open');shadeEl.classList.add('open');
+  window.testWrites=[]; const original=window.fetch;
+  window.fetch=async (url,opts)=>{if(opts?.method==='POST') window.testWrites.push({url,body:JSON.parse(opts.body)});return original(url,opts);};
+});
+console.log(await page.snapshot());
+await page.click('[data-rework]');
+await page.waitForSelector('#dlg-input',{state:'visible'});
+await page.fill('#dlg-input','请补充可读性验证，并继续优化当前 PR。');
+await page.click('#dlg-ok');
+await page.waitForFunction(()=>window.testWrites.length===1);
+const result=await page.evaluate(()=>({writes:window.testWrites,state:document.querySelector('[data-issue="GH-TEST2"]').getAttribute('data-state'),text:document.querySelector('[data-issue="GH-TEST2"]').getAttribute('data-state-text')}));
+console.log(result);
+if(result.writes[0].url!=='/api/rework'||!result.writes[0].body.request_id.startsWith('GH-TEST2-2-')||result.state!=='running') throw Error('Running feedback verification failed');
+console.log(await page.snapshot());
+await task.finish({keep:[]});

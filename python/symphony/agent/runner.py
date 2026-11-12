@@ -10,7 +10,7 @@ import logging
 import threading
 
 from .. import workspace as workspace_mod
-from ..github import adapter as tracker_adapter
+from .. import tracker as tracker_adapter
 from ..workflow import WorkflowError
 from . import pi_runtime
 
@@ -18,9 +18,7 @@ log = logging.getLogger("symphony.runner")
 
 # Run results pushed back to the orchestrator.
 DONE_NORMAL = "normal"
-DONE_WAITING = "github_workflow_waiting"  # blocked receipt; human must relabel
-DONE_AWAIT_MERGE = "await_merge"          # host polls the merge gate itself
-DONE_NEEDS_WORKER = "needs_worker"        # admission needs an agent slot
+DONE_SKIPPED = "skipped"  # claim-time recheck: task left active states
 DONE_CANCELLED = "cancelled"
 
 
@@ -81,17 +79,8 @@ def run(issue, settings, on_update, on_done, handle, opts=None):
 
     try:
         admission = tracker_adapter.begin_run_issue(issue, tracker)
-        if admission == "waiting":
-            on_done(issue.id, DONE_WAITING)
-            return
-        if admission == "await_merge":
-            on_done(issue.id, DONE_AWAIT_MERGE)
-            return
-        if admission == "skip":
-            on_done(issue.id, DONE_NORMAL)
-            return
-        if opts.get("admission_only"):
-            on_done(issue.id, DONE_NEEDS_WORKER)
+        if admission != "ok":
+            on_done(issue.id, DONE_SKIPPED)
             return
         _run_on_worker_host(
             issue, settings, on_update, on_done, handle, worker_host,
@@ -135,13 +124,13 @@ def _run_on_worker_host(issue, settings, on_update, on_done, handle, worker_host
         workspace_mod.run_before_run(
             settings, issue, workflow_path=workflow_path,
             worker_host=worker_host)
-        _run_agent_turns(
+        reason = _run_agent_turns(
             workspace, issue, settings, on_update, handle, worker_host, attempt)
     finally:
         workspace_mod.run_after_run(
             settings, issue, workflow_path=workflow_path,
             worker_host=worker_host)
-    on_done(issue.id, DONE_NORMAL)
+    on_done(issue.id, reason or DONE_NORMAL)
 
 
 def _run_agent_turns(workspace, issue, settings, on_update, handle, worker_host,
@@ -154,7 +143,7 @@ def _run_agent_turns(workspace, issue, settings, on_update, handle, worker_host,
         workspace, settings, worker_host=worker_host)
     handle.set_session(session)
     try:
-        _do_run_turns(
+        return _do_run_turns(
             session, workspace, issue, settings, on_update, handle, 1, attempt)
     finally:
         handle.set_session(None)
@@ -175,23 +164,24 @@ def _do_run_turns(session, workspace, issue, settings, on_update, handle,
         context, turn["session_id"], workspace, turn_number, max_turns)
 
     refreshed = _continue_with_issue(issue, settings)
-    if refreshed is False:
-        return
+    if refreshed is None:
+        return DONE_NORMAL
     if turn_number < max_turns:
         log.info(
             "Continuing agent run for %s after normal turn completion turn=%s/%s",
             _issue_context(refreshed), turn_number, max_turns)
-        _do_run_turns(
+        return _do_run_turns(
             session, workspace, refreshed, settings, on_update, handle,
             turn_number + 1, attempt)
-    else:
-        log.info(
-            "Reached agent.max_turns for %s with issue still active; "
-            "returning control to orchestrator", _issue_context(refreshed))
+    log.info(
+        "Reached agent.max_turns for %s with issue still active; "
+        "returning control to orchestrator", _issue_context(refreshed))
+    return DONE_NORMAL
 
 
 def _continue_with_issue(issue, settings):
-    """Returns refreshed Issue (continue) or False (done); raises on error."""
+    """Returns a refreshed Issue when it is still active (continue), or
+    ``None`` when it left the active workflow (end the run)."""
     try:
         issues = tracker_adapter.fetch_issues_by_ids(
             settings.tracker, [issue.id])
@@ -200,36 +190,15 @@ def _continue_with_issue(issue, settings):
     refreshed = next(
         (candidate for candidate in issues if candidate.id == issue.id), None)
     if refreshed is None:
-        return False
+        return None
     active = {
         state.strip().lower()
         for state in (settings.tracker.active_states or [])
     }
-    if (
-        (refreshed.state or "").strip().lower() in active
-        and tracker_adapter.routable(refreshed, settings.tracker)
-        and tracker_adapter.same_workflow_phase(issue, refreshed, settings.tracker)
-    ):
-        # A blocked receipt ends the run even if the pause-time label swap
-        # failed to land (issue still looks routable). Without this the
-        # continuation loop re-enters with a stale cycle and every
-        # deliver/merge call is rejected as no_active_workflow_run.
-        if tracker_adapter.issue_blocked(refreshed, settings.tracker):
-            log.info(
-                "Ending run for %s: workflow receipt is blocked",
-                _issue_context(refreshed))
-            return False
-        # Once a delivery is published the merge gate belongs to the host:
-        # end the run instead of letting the agent burn turns polling checks.
-        # The next admission evaluates the gate inline and re-dispatches a
-        # worker only when the gate says repair is needed.
-        if tracker_adapter.host_owns_merge(refreshed, settings.tracker):
-            log.info(
-                "Ending run for %s: delivery published; host owns the "
-                "merge gate", _issue_context(refreshed))
-            return False
+    if (refreshed.state or "").strip().lower() in active \
+            and tracker_adapter.routable(refreshed, settings.tracker):
         return refreshed
-    return False
+    return None
 
 
 def _workflow_path():

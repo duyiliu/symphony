@@ -142,18 +142,6 @@ def merge_gate(settings, number, **kw):
     return gate
 
 
-def remove_label(settings, number, label, **kw):
-    return request(
-        settings, "DELETE",
-        "%s/issues/%s/labels/%s" % (root(settings), number, label), None, **kw)
-
-
-def add_label(settings, number, label, **kw):
-    return request(
-        settings, "POST", "%s/issues/%s/labels" % (root(settings), number),
-        {"labels": [label]}, **kw)
-
-
 def pr_files(settings, number, **kw):
     return pages(settings, "%s/pulls/%s/files" % (root(settings), number), None, **kw)
 

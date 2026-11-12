@@ -24,11 +24,11 @@ POLL_INTERVAL_S = 1.0
 def _validate_settings(settings):
     if settings.tracker.kind is None:
         raise WorkflowError("missing_tracker_kind")
-    if settings.tracker.kind not in ("github",):
+    if settings.tracker.kind not in ("github", "board"):
         raise WorkflowError("unsupported_tracker_kind", settings.tracker.kind)
-    from .github import adapter as github_adapter
+    from . import tracker as tracker_adapter
 
-    github_adapter.validate_config(settings.tracker)
+    tracker_adapter.validate_config(settings)
     workflow_policy.validate_runtime(settings)
     if settings.runtime.kind != "pi":
         raise WorkflowError("unsupported_runtime_kind", settings.runtime.kind)

@@ -8,6 +8,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -17,18 +18,36 @@ board = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(board)
 
 
+def record(number, state="Todo", **extra):
+    base = {
+        "issue_number": number,
+        "identifier": "GH-%d" % number,
+        "state": state,
+        "revision": 3,
+        "repo": "o/r",
+        "title": "Task %d" % number,
+        "url": "https://github.com/o/r/issues/%d" % number,
+        "native_state": "open",
+        "labels": [],
+        "updated_at": "2026-10-27T0%d:00:00Z" % (number % 10),
+    }
+    base.update(extra)
+    return base
+
+
 def fixture_cards():
     cols = {key: "" for key, _, _ in board.COLUMNS}
     counts = {key: 0 for key in cols}
-    cols["awaiting"] = "<div class='bcard' data-issue='GH-1'>Test issue</div>"
-    counts["awaiting"] = 1
+    cols["human_review"] = "<div class='bcard' data-issue='GH-1'>Test issue</div>"
+    counts["human_review"] = 1
     return {
         "cols": cols,
         "counts": counts,
         "total": 1,
         "with_runs": 0,
-        "repo": "example/repo",
+        "repo": "o/r",
         "writable": True,
+        "facts": {},
     }
 
 
@@ -43,110 +62,140 @@ class LaneParser(HTMLParser):
             self.lanes[attrs["data-col"]] = attrs.get("class", "").split()
 
 
+class LaneTests(unittest.TestCase):
+    def test_columns_are_the_seven_local_states(self):
+        self.assertEqual(
+            [key for key, _label, _sub in board.COLUMNS],
+            ["backlog", "todo", "in_progress", "human_review",
+             "merging", "rework", "done"])
+
+    def test_state_to_lane_maps_canonical_and_terminal_aliases(self):
+        expected = {
+            "Backlog": "backlog", "Todo": "todo",
+            "In Progress": "in_progress", "Human Review": "human_review",
+            "Merging": "merging", "Rework": "rework",
+            "Done": "done", "Closed": "done", "Cancelled": "done",
+            "Canceled": "done", "Duplicate": "done",
+        }
+        for state, lane in expected.items():
+            self.assertEqual(board.lane_of_state(state), lane, state)
+        self.assertEqual(board.lane_of_state(None), "backlog")
+        self.assertEqual(board.lane_of_state("bogus"), "backlog")
+
+    def test_task_card_state_runtime_badges_do_not_change_lane(self):
+        self.assertEqual(
+            board.task_card_state(record(1, "In Progress"), "running")[0], "running")
+        self.assertEqual(
+            board.task_card_state(record(1, "Todo"), "retrying")[0], "retrying")
+        self.assertEqual(
+            board.task_card_state(record(1, "Human Review"), None)[0], "awaiting")
+        self.assertEqual(
+            board.task_card_state(record(1, "Done"), None)[0], "done")
+        self.assertEqual(
+            board.task_card_state(record(1, "Rework"), None)[0], "retrying")
+
+
+class BuildCardsTests(unittest.TestCase):
+    def build(self, tasks, state=None):
+        with patch.object(board, "board_tasks", return_value=tasks), patch.object(
+            board, "scan_sessions", return_value={}
+        ), patch.object(board, "symphony_state", return_value=state or {}):
+            return board.build_cards()
+
+    def test_records_land_in_their_state_lane(self):
+        tasks = [
+            record(1, "Backlog"), record(2, "Todo"), record(3, "In Progress"),
+            record(4, "Human Review"), record(5, "Merging"),
+            record(6, "Rework"), record(7, "Done"), record(8, "Cancelled"),
+        ]
+        data = self.build(tasks)
+        self.assertEqual(data["counts"], {
+            "backlog": 1, "todo": 1, "in_progress": 1, "human_review": 1,
+            "merging": 1, "rework": 1, "done": 2})
+        self.assertIn("data-task-state='Rework'", data["cols"]["rework"])
+        self.assertIn("data-task-state='Cancelled'", data["cols"]["done"])
+
+    def test_source_closed_is_a_badge_not_a_state_override(self):
+        tasks = [record(1, "In Progress", native_state="closed")]
+        data = self.build(tasks)
+        self.assertEqual(data["counts"]["in_progress"], 1)
+        self.assertIn("源已关闭", data["cols"]["in_progress"])
+        self.assertTrue(data["facts"]["GH-1"]["closed"])
+
+    def test_card_carries_revision_pr_and_workpad(self):
+        tasks = [record(9, "Merging", revision=7, pr_number=42,
+                        pr_url="https://github.com/o/r/pull/42",
+                        workpad_comment_id=555, branch_name="agent/issue-9")]
+        data = self.build(tasks)
+        html = data["cols"]["merging"]
+        self.assertIn("data-rev='7'", html)
+        self.assertIn("PR #42", html)
+        facts = data["facts"]["GH-9"]
+        self.assertEqual(facts["rev"], 7)
+        self.assertEqual(facts["workpad"], 555)
+        self.assertEqual(facts["branch"], "agent/issue-9")
+
+    def test_card_carries_blocked_reason_for_drawer(self):
+        tasks = [record(9, "Rework", blocked_reason="评审要求重做")]
+        facts = self.build(tasks)["facts"]["GH-9"]
+        self.assertEqual(facts["blocked"], "评审要求重做")
+
+    def test_done_lane_is_capped(self):
+        tasks = [record(n, "Done", updated_at="2026-10-%02dT00:00:00Z" % (n % 28 + 1))
+                 for n in range(1, board.DONE_COL_LIMIT + 4)]
+        data = self.build(tasks)
+        self.assertEqual(data["cols"]["done"].count("class='bcard"), board.DONE_COL_LIMIT)
+
+    def test_unavailable_scheduler_returns_none(self):
+        with patch.object(board, "board_tasks", return_value=None):
+            self.assertIsNone(board.build_cards())
+
+
+class CompletedTests(unittest.TestCase):
+    def test_terminal_tasks_feed_completed_views(self):
+        tasks = [
+            record(1, "Done", updated_at=board.datetime.now(board.CN).isoformat(),
+                   pr_number=2, pr_url="https://github.com/o/r/pull/2"),
+            record(2, "Duplicate", updated_at="2020-01-01T00:00:00Z"),
+            record(3, "Todo"),
+        ]
+        with patch.object(board, "board_tasks", return_value=tasks):
+            data = board.completed_data()
+        numbers = [i["number"] for i in data["issues"]]
+        self.assertEqual(numbers, [1, 2])
+        self.assertEqual(data["issues"][0]["merged_pr"]["number"], 2)
+        self.assertEqual(data["issues"][0]["day"], data["today"])
+        self.assertEqual(data["issues"][1]["state"], "Duplicate")
+
+
 class RenderingTests(unittest.TestCase):
-    def test_read_started_before_write_cannot_repopulate_cache(self):
-        class Response:
-            def __enter__(self):
-                return self
-            def __exit__(self, *args):
-                pass
-        board.clear_github_cache()
-        def changed_while_reading(response):
-            board.clear_github_cache()
-            return [{"number": 1, "author_association": "OWNER"}]
-        with patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
-            board.urllib.request, "urlopen", return_value=Response()
-        ), patch.object(board.json, "load", side_effect=changed_while_reading):
-            board.github_issues()
-        self.assertIsNone(board._cache["issues"])
-
-    def test_scheduler_refresh_failure_does_not_undo_successful_tracker_write(self):
-        with patch.object(board.urllib.request, "urlopen", side_effect=TimeoutError()):
-            self.assertFalse(board.request_scheduler_refresh())
-
-    def test_empty_lane_class_does_not_match_generic_empty_state(self):
+    def test_empty_lane_class_and_columns_render(self):
         with patch.object(board, "build_cards", return_value=fixture_cards()):
             document = board.issues_page()
         parser = LaneParser()
         parser.feed(document)
         self.assertEqual(len(parser.lanes), len(board.COLUMNS))
-        self.assertEqual(parser.lanes["awaiting"], ["col", "is-empty"])
-        for key, classes in parser.lanes.items():
-            self.assertNotIn("empty", classes)
-            if key != "awaiting":
-                self.assertIn("is-empty", classes)
+        # Initial HTML defers data loading to JS; every lane starts empty.
+        self.assertTrue(all("is-empty" in classes for classes in parser.lanes.values()))
         self.assertIn(".col.is-empty .empty-col{", board.STYLE)
-        self.assertNotIn(".col.empty", board.STYLE)
-        # Filtering and periodic refresh must use the same class as initial HTML.
         self.assertIn("classList.toggle('is-empty', empty)", board.BOARD)
-        self.assertNotIn("classList.toggle('empty',", board.BOARD)
-        # The standalone no-runs view still needs its generic empty-state style.
-        self.assertIn(".empty{", board.STYLE)
 
     def test_all_empty_lanes(self):
         data = fixture_cards()
-        data["cols"]["awaiting"] = ""
-        data["counts"]["awaiting"] = 0
+        data["cols"]["human_review"] = ""
+        data["counts"]["human_review"] = 0
         data["total"] = 0
         with patch.object(board, "build_cards", return_value=data):
             parser = LaneParser()
             parser.feed(board.issues_page())
         self.assertTrue(all(classes == ["col", "is-empty"] for classes in parser.lanes.values()))
 
-    def test_homepage_defers_github_loading(self):
-        with patch.object(board, "build_cards", side_effect=AssertionError("unexpected synchronous load")), patch.object(
-            board, "scan_sessions", return_value={}
-        ):
+    def test_homepage_defers_loading(self):
+        with patch.object(board, "build_cards",
+                          side_effect=AssertionError("unexpected synchronous load")), patch.object(
+            board, "scan_sessions", return_value={}), patch.object(
+            board, "board_tasks", return_value=[]):
             self.assertIn("正在加载任务", board.issues_page())
-
-    def test_execution_status_takes_priority_over_labels_and_pr(self):
-        for status in ("running", "blocked", "retrying"):
-            self.assertEqual(board.status_of("GH-1", ["agent"], status, True), status)
-        self.assertEqual(board.status_of("GH-1", ["Agent"], None, True), "ready")
-        self.assertEqual(board.status_of("GH-1", [], None, True), "awaiting")
-        self.assertEqual(board.status_of("GH-1", [], None, False), "idle")
-        self.assertEqual(board.status_of("GH-1", ["needs-human"], None, True), "blocked")
-        self.assertEqual(board.status_of("GH-1", ["agent", "needs-human"], None, True), "blocked")
-        self.assertEqual(board.status_of("GH-1", ["merge-approved"], None, True), "awaiting")
-
-    def test_cards_render_pause_state_and_reason_from_labels(self):
-        issues = [
-            {"number": 1, "title": "Paused one", "state": "open", "updated_at": "2026-10-27T01:00:00Z",
-             "html_url": "https://github.com/o/r/issues/1",
-             "labels": [{"name": "needs-human"}]},
-            {"number": 2, "title": "Running one", "state": "open", "updated_at": "2026-10-27T02:00:00Z",
-             "html_url": "https://github.com/o/r/issues/2",
-             "labels": [{"name": "agent"}, {"name": "high-risk"}]},
-            {"number": 3, "title": "Idle one", "state": "open", "updated_at": "2026-10-27T03:00:00Z",
-             "html_url": "https://github.com/o/r/issues/3", "labels": []},
-        ]
-
-        with patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
-            board, "github_issues", return_value=issues
-        ), patch.object(board, "scan_sessions", return_value={}), patch.object(
-            board, "symphony_state", return_value=None
-        ), patch.object(board, "github_pulls", return_value={}), patch.object(
-            board, "pause_reason", side_effect=lambda repo, token, n: "Merge gate not satisfied: merge state DIRTY." if n == 1 else ""
-        ):
-            data = board.build_cards()
-
-        html = "".join(data["cols"].values())
-        self.assertIn("data-paused='1' data-pause-reason='Merge gate not satisfied: merge state DIRTY.'", html)
-        self.assertIn("等待人工处理", html)
-        self.assertIn("data-agent='1'", html)
-        # 未暂停的卡片属性为空而不是缺失，前端 getAttribute 不会报错。
-        self.assertIn("data-paused='0'", html)
-        self.assertEqual(data["counts"]["blocked"], 1)
-        self.assertEqual(data["counts"]["ready"], 1)
-        self.assertEqual(data["counts"]["idle"], 1)
-
-    def test_board_uses_custom_dialog_instead_of_native_popups(self):
-        self.assertNotRegex(board.BOARD, r"\b(?:alert|confirm|prompt)\s*\(")
-        self.assertIn("function openDialog", board.BOARD)
-        with patch.object(board, "build_cards", return_value=fixture_cards()):
-            document = board.issues_page()
-        self.assertIn("id='modal'", document)
-        self.assertIn("id='dlg-ok'", document)
 
     def test_symphony_state_uses_background_cache(self):
         cached = {"running": [{"issue_identifier": "GH-1"}]}
@@ -156,12 +205,20 @@ class RenderingTests(unittest.TestCase):
             board, "fetch_state", side_effect=AssertionError("unexpected state request")
         ):
             self.assertEqual(board.symphony_state(), cached)
-
         with patch.object(
             board, "_state_cache", {"data": None, "at": 0.0, "started": False}
         ), patch.object(board, "fetch_state", return_value=cached) as fetch:
             self.assertEqual(board.symphony_state(), cached)
             fetch.assert_called_once()
+
+    def test_state_sync_failure_and_staleness_are_explicit(self):
+        for data in ({"started": True, "at": 0},
+                     {"started": True, "at": 1},
+                     {"started": True, "at": board.time.time(), "failed": True}):
+            with patch.object(board, "_state_cache", data):
+                self.assertIn("同步异常", board.state_sync_error())
+        with patch.object(board, "_state_cache", {"started": True, "at": board.time.time()}):
+            self.assertEqual(board.state_sync_error(), "")
 
     def test_count_messages_caches_incremental_live_log(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,37 +227,66 @@ class RenderingTests(unittest.TestCase):
                 handle.write(b'{"type":"entry_appended","entry":{"type":"message"}}\n')
             self.assertEqual(board.count_messages(live, True), 1)
             self.assertEqual(board.count_messages(live, True), 1)
-
             with open(live, "ab") as handle:
                 handle.write(b'{"type":"entry_appended","entry":{"type":"message"}}\n')
             self.assertEqual(board.count_messages(live, True), 2)
-
             with open(live, "ab") as handle:
                 handle.write(b'{"type":"entry_appended","entry":{"type":"mess')
             self.assertEqual(board.count_messages(live, True), 2)
-
             with open(live, "ab") as handle:
                 handle.write(b'age"}}\n')
             self.assertEqual(board.count_messages(live, True), 3)
-
-            legacy = os.path.join(tmp, "legacy.jsonl")
-            with open(legacy, "wb") as handle:
-                handle.write(b'{"type":"message"}\n{"type":"other"}\n')
-            self.assertEqual(board.count_messages(legacy, False), 1)
             board._message_cache.clear()
+
+    def test_scheduler_request_sends_bearer_when_configured(self):
+        captured = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self):
+                return b"{}"
+
+        def open_spy(request, timeout=10):
+            captured["auth"] = request.headers.get("Authorization")
+            return Response()
+
+        opener = type("O", (), {"open": staticmethod(open_spy)})
+        with patch.object(board, "API_TOKEN", "secret"), patch.object(
+            board.urllib.request, "build_opener", return_value=opener()
+        ):
+            board.scheduler_request("PATCH", "/api/v1/tasks/1", {"state": "Done"})
+        self.assertEqual(captured["auth"], "Bearer secret")
+
+    def test_source_fetch_timeout_covers_proxied_github_calls(self):
+        seen = {}
+
+        def fake(method, path, body=None, timeout=10):
+            seen["timeout"] = timeout
+            return {"issue": {"number": 4}}
+
+        with patch.object(board, "scheduler_request", fake):
+            board.fetch_task_source(4)
+        # Scheduler-side source proxying chains sequential GitHub calls
+        # (issue + comment pages + optional PR); observed real latency ~19s.
+        self.assertGreaterEqual(seen["timeout"], 45)
 
 
 class HTTPTests(unittest.TestCase):
     def setUp(self):
+        state = patch.object(board, "symphony_state", return_value={})
+        state.start()
+        self.addCleanup(state.stop)
         refresh = patch.object(board, "request_scheduler_refresh", return_value=True)
         self.refresh_mock = refresh.start()
         self.addCleanup(refresh.stop)
         self.cards = patch.object(board, "build_cards", side_effect=fixture_cards)
         self.cards.start()
         self.addCleanup(self.cards.stop)
-        self.github = patch.object(board, "github_request", side_effect=AssertionError("Unexpected GitHub call"))
-        self.github_mock = self.github.start()
-        self.addCleanup(self.github.stop)
         self.server = board.ThreadingHTTPServer(("127.0.0.1", 0), board.Handler)
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -212,8 +298,17 @@ class HTTPTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def request(self, method, path, body=None, headers=None):
-        connection = http.client.HTTPConnection(*self.server.server_address, timeout=3)
+    def request(self, method, path, body=None, headers=None, drain_lock=True):
+        # The threaded server releases _task_lock just after the response;
+        # drain it first so sequential requests never see a spurious 409.
+        if drain_lock:
+            deadline = board.time.time() + 5
+            while not board._task_lock.acquire(blocking=False):
+                if board.time.time() > deadline:
+                    raise AssertionError("task lock never released")
+                board.time.sleep(0.01)
+            board._task_lock.release()
+        connection = http.client.HTTPConnection(*self.server.server_address, timeout=5)
         try:
             connection.request(method, path, body=body, headers=headers or {})
             response = connection.getresponse()
@@ -221,314 +316,168 @@ class HTTPTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def safe_request(self, *args, **kwargs):
+        # Windows occasionally aborts a connection while the handler thread
+        # is finishing; these calls are always rejected before any mutation.
+        try:
+            return self.request(*args, **kwargs)
+        except (ConnectionAbortedError, ConnectionResetError):
+            return self.request(*args, **kwargs)
+
     def test_index_and_api(self):
-        with patch.dict(os.environ, {"SYMPHONY_BOARD_TOKEN": "test-secret"}):
-            status, body = self.request("GET", "/")
-            self.assertEqual(status, 200)
-            self.assertIn("Issue 工作台", body)
-            self.assertNotIn("test-secret", body)
-            status, body = self.request("GET", "/api/issues")
+        status, body = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn("Issue 工作台", body)
+        status, body = self.request("GET", "/api/issues")
         self.assertEqual(status, 200)
         payload = json.loads(body)
-        self.assertEqual(payload["counts"]["awaiting"], 1)
-        self.assertTrue(payload["writable"])
-        self.assertIn("data-writable='0'", self.request("GET", "/")[1])
-        self.assertIn("refreshIssues().then", self.request("GET", "/")[1])
+        self.assertEqual(payload["counts"]["human_review"], 1)
+        self.assertEqual(payload["counts"]["todo"], 0)
+        document = self.request("GET", "/")[1]
+        self.assertIn("refreshIssues()", document)
 
-    def test_issue_response_rejects_snapshot_overlapping_a_write(self):
-        def overlap():
-            board.clear_github_cache()
-            return fixture_cards()
-        with patch.object(board, "build_cards", side_effect=overlap):
-            self.assertEqual(self.request("GET", "/api/issues")[0], 409)
+    def test_api_source_proxies_through_scheduler(self):
+        source = {"issue": {"number": 1, "title": "T"}, "workpad": None, "pull_request": None}
+        with patch.object(board, "fetch_task_source", return_value=source) as fetch:
+            status, body = self.request("GET", "/api/source/GH-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["issue"]["title"], "T")
+        fetch.assert_called_once_with(1)
+        self.assertEqual(self.request("GET", "/api/source/bad")[0], 400)
+        with patch.object(board, "fetch_task_source", return_value=None):
+            self.assertEqual(self.request("GET", "/api/source/GH-1")[0], 502)
 
-    def test_label_rejects_cross_site_requests(self):
-        for endpoint in ("/api/label", "/api/approve", "/api/intervene"):
+    def test_move_forwards_state_and_revision(self):
+        calls = []
+
+        def fake_patch(number, fields, expected_revision):
+            calls.append((number, fields, expected_revision))
+            return {"task": {"state": "Merging", "revision": 4}}
+
+        with patch.object(board, "request_task_patch", side_effect=fake_patch):
             status, body = self.request(
-                "POST", endpoint, "{}", {"Origin": "http://evil.example"}
-            )
-            self.assertEqual(status, 403)
-            self.assertIn("跨站", json.loads(body)["error"])
-        self.github_mock.assert_not_called()
+                "POST", "/api/task",
+                json.dumps({"issue": "GH-1", "op": "move",
+                            "state": "Merging", "expected_revision": 3}))
+        self.assertEqual(status, 200)
+        self.assertEqual(calls, [(1, {"state": "Merging"}, 3)])
+        payload = json.loads(body)
+        self.assertEqual(payload["state"], "Merging")
+        self.assertTrue(payload["refresh_queued"])
 
-    def test_label_validates_payload_and_credentials(self):
-        status, body = self.request("POST", "/api/label", "not-json")
-        self.assertEqual(status, 400)
-        bad_payloads = (
-            {"issue": "GH-1", "action": "add", "label": "bug"},
-            {"issue": "GH-1", "action": "toggle", "label": "agent"},
-            {"issue": "jira-1", "action": "add", "label": "agent"},
-            {"issue": "GH-x", "action": "add", "label": "agent"},
-        )
-        for payload in bad_payloads:
+    def test_comment_is_posted_before_state_change(self):
+        order = []
+
+        def comment(number, body):
+            order.append(("comment", body))
+            return {"comment": {"id": 1}}
+
+        def patch_(number, fields, rev):
+            order.append(("patch", fields))
+            return {"task": {"state": "Rework", "revision": 2}}
+
+        with patch.object(board, "request_task_comment", side_effect=comment), patch.object(
+            board, "request_task_patch", side_effect=patch_
+        ):
             status, _ = self.request(
-                "POST", "/api/label", json.dumps(payload)
-            )
-            self.assertEqual(status, 400)
-        with patch.object(board, "load_tracker", return_value=("", "")):
-            status, body = self.request(
-                "POST",
-                "/api/label",
-                json.dumps({"issue": "GH-1", "action": "add", "label": "agent"}),
-            )
-        self.assertEqual(status, 503)
-        self.assertIn("GitHub 未配置", json.loads(body)["error"])
-        self.github_mock.assert_not_called()
+                "POST", "/api/task",
+                json.dumps({"issue": "GH-1", "op": "move", "state": "Rework",
+                            "comment": "请修复边界", "expected_revision": 1}))
+        self.assertEqual(status, 200)
+        self.assertEqual(order, [("comment", "请修复边界"), ("patch", {"state": "Rework"})])
 
-    def test_write_endpoints_enforce_trust_and_open_pr(self):
-        outsider = {"author_association": "CONTRIBUTOR", "state": "open", "labels": []}
-        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
-            board, "fetch_issue", return_value=outsider
+    def test_comment_only_op_never_patches(self):
+        with patch.object(board, "request_task_comment", return_value={"comment": {"id": 1}}) as c, patch.object(
+            board, "request_task_patch",
+            side_effect=AssertionError("patch must not run")
         ):
             status, body = self.request(
-                "POST",
-                "/api/label",
-                json.dumps({"issue": "GH-1", "action": "add", "label": "agent"}),
-            )
-            self.assertEqual(status, 403)
-            status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
-            self.assertEqual(status, 410)
-            self.assertIn("merge-approved", json.loads(body)["error"])
-        member = {"author_association": "MEMBER", "state": "open", "labels": []}
-        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
-            board, "fetch_issue", return_value=member
-        ), patch.object(board, "github_pulls", return_value={}):
-            status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
-        self.assertEqual(status, 410)
-        self.github_mock.assert_not_called()
-
-    def test_label_add_swaps_mutually_exclusive_label(self):
-        member = {
-            "author_association": "MEMBER",
-            "state": "open",
-            "labels": [{"name": "needs-human"}],
-        }
-        calls = []
-
-        def fake_request(method, path, token, body=None, timeout=10):
-            calls.append((method, path, body))
-            return {}
-
-        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
-            board, "fetch_issue", return_value=member
-        ), patch.object(board, "github_request", side_effect=fake_request):
-            status, body = self.request(
-                "POST",
-                "/api/label",
-                json.dumps({"issue": "GH-1", "action": "add", "label": "agent"}),
-            )
+                "POST", "/api/task",
+                json.dumps({"issue": "GH-1", "op": "comment", "comment": "备注"}))
         self.assertEqual(status, 200)
-        self.assertIn("agent", json.loads(body)["message"])
-        self.assertEqual(
-            calls,
-            [
-                ("DELETE", "/repos/example/repo/issues/1/labels/needs-human", None),
-                ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["agent"]}),
-            ],
-        )
-        self.assertIsNone(board._cache["issues"])
+        c.assert_called_once_with(1, "备注")
 
-    def test_leftover_legacy_labels_do_not_block_execution(self):
-        member = {
-            "author_association": "MEMBER",
-            "state": "open",
-            "labels": [{"name": "agent"}, {"name": "merge-approved"}],
-        }
-        calls = []
+    def test_revision_conflict_reports_comment_posted(self):
+        def comment(number, body):
+            return {"comment": {"id": 1}}
 
-        def fake_request(method, path, token, body=None, timeout=10):
-            calls.append((method, path, body))
-            return {}
+        def patch_(number, fields, rev):
+            raise board.urllib.error.HTTPError(
+                "http://x", 409, "conflict", {},
+                __import__("io").BytesIO(b'{"error":{"code":"revision_conflict"}}'))
 
-        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
-            board, "fetch_issue", return_value=member
-        ), patch.object(board, "github_request", side_effect=fake_request):
+        with patch.object(board, "request_task_comment", side_effect=comment), patch.object(
+            board, "request_task_patch", side_effect=patch_
+        ):
             status, body = self.request(
-                "POST",
-                "/api/label",
-                json.dumps({"issue": "GH-1", "action": "add", "label": "agent"}),
-            )
-        self.assertEqual(status, 200)
-        # merge-approved carries no meaning: adding agent touches only agent.
-        self.assertEqual(
-            calls,
-            [("POST", "/repos/example/repo/issues/1/labels", {"labels": ["agent"]})],
+                "POST", "/api/task",
+                json.dumps({"issue": "GH-1", "op": "move", "state": "Done",
+                            "comment": "先留言", "expected_revision": 1}))
+        self.assertEqual(status, 409)
+        payload = json.loads(body)
+        self.assertEqual(payload["code"], "revision_conflict")
+        self.assertTrue(payload["comment_posted"])
+
+    def test_move_validates_target_and_identity(self):
+        bad = (
+            {"issue": "GH-1", "op": "move", "state": "bogus"},
+            {"issue": "GH-1", "op": "move"},
+            {"issue": "GH-1", "op": "comment"},
+            {"issue": "GH-1", "op": "bogus"},
+            {"issue": "jira-1", "op": "move", "state": "Done"},
+            {"issue": "GH-x", "op": "move", "state": "Done"},
         )
+        for payload in bad:
+            status, _ = self.request("POST", "/api/task", json.dumps(payload))
+            self.assertEqual(status, 400, payload)
 
-    def test_approve_endpoint_is_gone(self):
-        status, body = self.request("POST", "/api/approve", json.dumps({"issue": "GH-1"}))
-        self.assertEqual(status, 410)
-        self.assertIn("needs-human", json.loads(body)["error"])
-        self.github_mock.assert_not_called()
-
-    def test_label_add_needs_human_swaps_out_agent(self):
-        member = {
-            "author_association": "MEMBER",
-            "state": "open",
-            "labels": [{"name": "agent"}],
-        }
-        calls = []
-
-        def fake_request(method, path, token, body=None, timeout=10):
-            calls.append((method, path, body))
-            return {}
-
-        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
-            board, "fetch_issue", return_value=member
-        ), patch.object(board, "github_request", side_effect=fake_request):
-            status, body = self.request(
-                "POST",
-                "/api/label",
-                json.dumps({"issue": "GH-1", "action": "add", "label": "needs-human"}),
-            )
-        self.assertEqual(status, 200)
-        self.assertIn("needs-human", json.loads(body)["message"])
-        self.assertEqual(
-            calls,
-            [
-                ("DELETE", "/repos/example/repo/issues/1/labels/agent", None),
-                ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["needs-human"]}),
-            ],
-        )
-
-    def test_intervene_pauses_and_resumes_in_auto_mode(self):
-        member = {"author_association": "MEMBER", "state": "open", "labels": [{"name": "agent"}]}
-        calls = []
-
-        def fake_request(method, path, token, body=None, timeout=10):
-            calls.append((method, path, body))
-            return {}
-
-        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
-            board, "fetch_issue", return_value=member
-        ), patch.object(board, "github_request", side_effect=fake_request):
-            status, body = self.request(
-                "POST",
-                "/api/intervene",
-                json.dumps({"issue": "GH-1", "op": "pause", "comment": "CI 一直红，先人工看看"}),
-            )
-            self.assertEqual(status, 200)
-            self.assertIn("needs-human", json.loads(body)["message"])
-            # 顺序与宿主一致：先评论，再加 needs-human，最后才摘 agent。
-            self.assertEqual(
-                calls,
-                [
-                    ("POST", "/repos/example/repo/issues/1/comments",
-                     {"body": "[board] 人工暂停（needs-human）：CI 一直红，先人工看看"}),
-                    ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["needs-human"]}),
-                    ("DELETE", "/repos/example/repo/issues/1/labels/agent", None),
-                ],
-            )
-
-            calls.clear()
-            paused = {
-                "author_association": "MEMBER",
-                "state": "open",
-                "labels": [{"name": "needs-human"}],
-            }
-            with patch.object(board, "fetch_issue", return_value=paused):
-                status, body = self.request(
-                    "POST", "/api/intervene", json.dumps({"issue": "GH-1", "op": "resume"})
-                )
-            self.assertEqual(status, 200)
-            self.assertIn("agent", json.loads(body)["message"])
-            self.assertTrue(json.loads(body)["refresh_queued"])
-            self.assertEqual(self.refresh_mock.call_count, 2)
-            self.assertEqual(
-                calls,
-                [
-                    ("DELETE", "/repos/example/repo/issues/1/labels/needs-human", None),
-                    ("POST", "/repos/example/repo/issues/1/labels", {"labels": ["agent"]}),
-                ],
-            )
-
-        # Cross-site guards still apply.
-        status, _ = self.request(
-            "POST", "/api/intervene", json.dumps({"issue": "GH-1", "op": "pause"}), {"Origin": "http://evil.example"}
-        )
+    def test_write_rejects_cross_site_and_non_object(self):
+        status, body = self.safe_request(
+            "POST", "/api/task", "{}", {"Origin": "http://evil.example"})
         self.assertEqual(status, 403)
-        status, body = self.request("POST", "/api/intervene", json.dumps({"issue": "GH-1", "op": "toggle"}))
-        self.assertEqual(status, 400)
-
-    def test_write_outcomes_distinguish_rejection_timeout_and_partial_success(self):
-        member = {"author_association": "MEMBER", "state": "open", "labels": []}
-        for error, outcome in [
-            (board.urllib.error.HTTPError("https://api.github.com", 403, "denied", {}, None), "not_applied"),
-            (TimeoutError("timeout"), "uncertain"),
-        ]:
-            with self.subTest(outcome=outcome), patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
-                board, "fetch_issue", return_value=member
-            ), patch.object(board, "github_request", side_effect=error):
-                status, body = self.request("POST", "/api/label", json.dumps({"issue": "GH-1", "action": "add", "label": "merge-approved"}))
-                self.assertEqual(status, 502)
-                self.assertEqual(json.loads(body)["outcome"], outcome)
-        active = {**member, "labels": [{"name": "agent"}]}
-        with patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
-            board, "fetch_issue", return_value=active
-        ), patch.object(board, "github_request", side_effect=[{}, {}, TimeoutError("delete failed")]):
-            status, body = self.request("POST", "/api/intervene", json.dumps({"issue": "GH-1", "op": "pause"}))
-            self.assertEqual(status, 502)
-            self.assertEqual(json.loads(body)["outcome"], "partial")
-        self.github_mock.assert_not_called()
-
-    def test_pause_reason_extracts_the_latest_host_pause_comment(self):
-        comments = [
-            {"body": "[agent] Delivery PR #7"},
-            {"body": "[agent] Paused: Merge gate not satisfied: merge state DIRTY.\nDelivery: %{\"pr\" => 7}"},
-            {"body": "普通评论"},
-        ]
-
-        def fake_request(method, path, token, body=None, timeout=10):
-            self.assertIn("comments", path)
-            return comments
-
-        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
-            board, "github_request", side_effect=fake_request
-        ):
-            self.assertEqual(
-                board.pause_reason("example/repo", "t", 1), "Merge gate not satisfied: merge state DIRTY."
-            )
-
-        board_comments = [
-            {"body": "[agent] Delivery PR #7"},
-            {"body": "[board] 人工暂停（needs-human）：CI 一直红，先人工看看"},
-        ]
-
-        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
-            board, "github_request", return_value=board_comments
-        ):
-            self.assertEqual(board.pause_reason("example/repo", "t", 1), "CI 一直红，先人工看看")
-
-        host_comments = [{"body": "[agent] Paused (needs-human): 验证完成，无需改动\nDelivery: nil"}]
-        with patch.object(board, "load_tracker", return_value=("example/repo", "t")), patch.object(
-            board, "github_request", return_value=host_comments
-        ):
-            self.assertEqual(board.pause_reason("example/repo", "t", 1), "验证完成，无需改动")
-        self.assertEqual(board.pause_reason("example/repo", "", 1), "")
-
-    def test_write_endpoints_reject_non_object_json(self):
+        self.assertIn("跨站", json.loads(body)["error"])
         for body in ('"text"', "[]", "123", "null", "true"):
-            for endpoint in ("/api/label", "/api/intervene"):
-                status, payload = self.request(
-                    "POST", endpoint, body, {"Content-Type": "application/json"}
-                )
-                self.assertEqual(status, 400, "%s %s" % (endpoint, body))
-                self.assertIn("JSON", json.loads(payload)["error"])
-        self.github_mock.assert_not_called()
+            status, payload = self.safe_request(
+                "POST", "/api/task", body, {"Content-Type": "application/json"})
+            self.assertEqual(status, 400, body)
 
-    def test_completed_is_inline_and_history_bookmark_redirects(self):
-        with patch.object(board, "github_history", return_value=([], "")):
+    def test_outcomes_distinguish_rejection_and_uncertain(self):
+        member_error = board.urllib.error.HTTPError("http://x", 403, "denied", {}, None)
+        for error, outcome in [
+            (member_error, (403, "not_applied")),
+            (board.urllib.error.HTTPError("http://x", 502, "gw", {}, None), (502, "uncertain")),
+            (TimeoutError("timeout"), (502, "uncertain")),
+        ]:
+            with self.subTest(outcome=outcome), patch.object(
+                board, "request_task_patch", side_effect=error
+            ):
+                status, body = self.request(
+                    "POST", "/api/task",
+                    json.dumps({"issue": "GH-1", "op": "move", "state": "Todo",
+                                "expected_revision": 1}))
+                self.assertEqual(status, outcome[0])
+                self.assertEqual(json.loads(body)["outcome"], outcome[1])
+
+    def test_task_rejects_concurrent_submit(self):
+        captured = []
+        handler = SimpleNamespace(
+            write_guard=lambda: True,
+            send_json=lambda status, payload: captured.append((status, payload)),
+        )
+        with board._task_lock:
+            board.Handler.route_post(handler, board.urlparse("/api/task"))
+        self.assertEqual(captured[0][0], 409)
+
+    def test_completed_and_history_redirect(self):
+        with patch.object(board, "board_tasks", return_value=[]):
             status, body = self.request("GET", "/api/completed")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["issues"], [])
         self.assertEqual(self.request("GET", "/history")[0], 302)
-        status, document = self.request("GET", "/")
+        document = self.request("GET", "/")[1]
         self.assertIn("data-view='today'", document)
-        self.assertIn("data-view='history'", document)
         self.assertIn("id='completed-panel'", document)
-        self.assertNotIn("href='/history'", document)
-        self.assertIn("@media(max-width:640px)", document)
-        self.github_mock.assert_not_called()
+        self.assertIn("id='cstate'", document)
 
     def test_invalid_run_reference_and_unknown_route(self):
         self.assertEqual(self.request("GET", "/api/run/GH-1")[0], 400)

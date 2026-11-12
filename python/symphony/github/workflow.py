@@ -1,17 +1,16 @@
-"""Host-enforced GitHub issue workflow (port of ``workflow.ex``).
+"""Host-enforced GitHub issue workflow.
 
-Issue labels are the source of truth for the ``develop`` phase:
+The task record under ``state_dir`` is the only workflow authority
+(Linear-style board semantics): ``state`` decides whether a worker may run,
+``blocked`` freezes it, and ``review.approved_sha`` is the human merge
+approval for the current delivery. GitHub issues provide task identity;
+GitHub PRs provide the delivery artifact, checks and review evidence.
+Execution labels are retired: ``high-risk`` remains a read-only business
+flag, while ``agent``/``needs-human``/``merge-approved`` carry no meaning.
 
-- ``agent``       : the host may develop this issue
-- ``needs-human`` : development is paused until a human relabels
-- ``high-risk``   : host approval is required before merge
-
-The host keeps private JSON receipts under ``state_dir`` so admission, risk
-evaluation and merge confirmation cannot be forged through agent-visible
-tools. ``agent`` is the only execution label: the agent develops, delivers,
-and the host performs the deterministic merge admission (real checks, merge
-gate, risk rules, review approvals) before squash-merging and closing the
-issue. Uncertain merge outcomes fail closed.
+The host performs deterministic merge admission (real checks, merge gate,
+risk rules, approvals) before squash-merging and closing the issue.
+Uncertain outcomes fail closed.
 """
 
 import json
@@ -19,14 +18,18 @@ import logging
 import os
 import re
 import threading
+import datetime
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from ..workflow import WorkflowError
 from . import workflow_policy as policy
+from . import rework
+from . import task_record
 from .workflow_api import (
-    GateError, add_label, comment, ensure, events, issue as fetch_issue,
+    GateError, comment, ensure, issue as fetch_issue,
     labels as api_labels, linked_prs, merge_gate, pages, pr as fetch_pr,
-    pr_files, pr_reviews, remove_label, request, root,
+    pr_files, pr_reviews, request, root,
 )
 
 log = logging.getLogger("symphony.github.workflow")
@@ -44,12 +47,22 @@ _FAIL_CLOSED_REASONS = (
 
 
 def routable(issue, settings):
-    if policy.enabled(settings) and policy.phase(issue.labels) == "invalid":
+    """A candidate worker may run: routable issue whose task record is todo."""
+    if not issue.routable(getattr(settings, "required_labels", []) or []):
+        return False
+    if not policy.enabled(settings):
+        return True
+    try:
+        state = locked(
+            settings, number_or_fail(issue.id),
+            lambda record, _save: (
+                task_record.state_of(record), task_record.blocked(record)))
+    except Exception as error:  # noqa: BLE001 - fail closed
         log.warning(
-            "Conflicting GitHub execution labels issue_id=%s "
-            "issue_identifier=%s; waiting for human correction",
-            issue.id, issue.identifier)
-    return policy.routable(issue, settings)
+            "Task record check failed, not routable issue_id=%s error=%r",
+            issue.id, error)
+        return False
+    return state == ("todo", False)
 
 
 def record_failure(issue, settings, reason):
@@ -67,16 +80,17 @@ def record_failure(issue, settings, reason):
         log.warning("Failed to persist workflow failure issue_id=%s", issue.id)
 
 
-def begin_run(issue, settings):
+def begin_run(issue, settings, admission_only=False):
     if not policy.enabled(settings):
         return "ok"
     number = number_or_fail(issue.id)
     return locked(
         settings, number,
-        lambda record, save: _admit(issue, number, settings, record, save))
+        lambda record, save: _admit(
+            issue, number, settings, record, save, admission_only=admission_only))
 
 
-def _admit(issue, number, settings, record, save):
+def _admit(issue, number, settings, record, save, admission_only=False):
     if record.get("pending_merge"):
         try:
             resolve_merge(settings, number, record, save)
@@ -84,84 +98,27 @@ def _admit(issue, number, settings, record, save):
             if error.reason != "merge_not_confirmed":
                 raise
         return "skip"
-    return _admit_labeled(issue, number, settings, record, save)
-
-
-def _admit_labeled(issue, number, settings, record, save):
-    event, _labels = signal(settings, number)
-    ensure(policy.phase(issue.labels) == "develop", "execution_phase_changed")
-    resume = record.get("blocked") is True and record.get("cycle") != cycle(event)
-    pause_reason = record.get("error")
-    record = new_cycle(record, cycle(event))
-    if resume:
-        record = publish_resume(
-            settings, number, record, save, event, pause_reason)
-    if record.get("blocked"):
+    state = task_record.state_of(record)
+    if task_record.blocked(record) or state in {"backlog", "done"}:
         return "waiting"
-    delivery = record.get("delivery")
-    if (isinstance(delivery, dict)
-            and delivery.get("published") is True
-            and delivery.get("cycle") == record.get("cycle")):
-        # A published delivery belongs to the host: evaluate the merge gate
-        # inline every admission instead of dispatching an agent that would
-        # just poll checks and burn tokens. Repairs still get a worker.
-        return _admit_merge(number, settings, record, save)
-    if record["attempts"] >= policy.config(settings).get("max_attempts", 3):
+    if state in {"review", "in_progress"}:
+        # A published delivery or a live worker owns this cycle; another
+        # runner must not join.
+        return "skip"
+    ensure(state == "todo", "execution_phase_changed")
+    if admission_only:
+        # Persist nothing: merge_eval shells only re-check ownership.
+        return "ok"
+    if record.get("attempts", 0) >= policy.max_attempts(settings):
         pause(settings, number, record, save,
               "Worker attempt limit reached; human intervention required")
         return "waiting"
-    # Fresh develop cycle: the worker develops/delivers; afterwards the host
-    # owns the merge poll until merge, repair dispatch or pause.
+    # Grant the cycle atomically: state + attempts under the same lock.
     updated = dict(record)
-    updated["attempts"] = record["attempts"] + 1
+    updated["attempts"] = record.get("attempts", 0) + 1
+    updated["state"] = "in_progress"
     save(updated)
     return "ok"
-
-
-def _admit_merge(number, settings, record, save):
-    """Host-side merge admission for a published delivery.
-
-    Runs inside ``begin_run`` on every poll while a delivery awaits merge:
-    ``await`` → ``await_merge`` (no agent, slow re-poll), ``fix`` → ``ok``
-    (dispatch a worker to repair), ``human`` → pause. Gate errors that are
-    not structural retry on the next poll.
-    """
-    try:
-        labels, pr_data, delivery = delivery_state(settings, number, record)
-        decision = auto_ready(settings, delivery, pr_data, labels)
-    except GateError as error:
-        if error.reason in _FAIL_CLOSED_REASONS:
-            pause(settings, number, record, save,
-                  "Auto merge declined: %s" % error.reason)
-            return "waiting"
-        log.warning(
-            "Merge admission check failed issue=%s reason=%r; retrying "
-            "next poll", number, error.reason)
-        return "await_merge"
-    if decision[0] == "ready":
-        if _label_approved(settings, labels):
-            record = save({**record, "approval": "label"})
-        try:
-            commit_merge(settings, number, record, save)
-        except GateError as error:
-            if error.reason == "merge_not_confirmed":
-                return "waiting"
-            log.warning(
-                "Host merge attempt failed issue=%s reason=%r; retrying "
-                "next poll", number, error.reason)
-        return "await_merge"
-    if decision[0] == "await":
-        log.info("Merge gate waiting issue=%s reason=%s details=%r sha=%s",
-                 number, decision[1], decision[2], delivery.get("sha"))
-        return "await_merge"
-    if decision[0] == "fix":
-        log.info(
-            "Merge gate needs repair issue=%s reason=%s; dispatching worker",
-            number, decision[1])
-        return "ok"
-    pause(settings, number, record, save,
-          "Auto merge declined: %s" % decision[1])
-    return "waiting"
 
 
 def waiting(issue, settings):
@@ -189,8 +146,7 @@ def waiting(issue, settings):
 
 
 def _blocked_cycle(settings, number, record):
-    event, _labels = signal(settings, number)
-    return record.get("blocked") is True and record.get("cycle") == cycle(event)
+    return task_record.blocked(record)
 
 
 def merge_pending(issue, settings):
@@ -220,13 +176,42 @@ def _merge_pending(settings, number, record):
     if record.get("blocked") or record.get("pending_merge") \
             or record.get("merged"):
         return False
-    delivery = record.get("delivery")
-    if not (isinstance(delivery, dict)
-            and delivery.get("published") is True
-            and delivery.get("cycle") == record.get("cycle")):
+    if task_record.state_of(record) != "review":
         return False
-    event, _labels = signal(settings, number)
-    return record.get("cycle") == cycle(event)
+    delivery = record.get("delivery")
+    return (isinstance(delivery, dict)
+            and delivery.get("published") is True
+            and delivery.get("cycle") == record.get("cycle"))
+
+
+def prepare_rework(issue, settings):
+    """Freeze feedback visible to this turn; never change the grant."""
+    if not policy.enabled(settings):
+        return ""
+    number = number_or_fail(issue.id)
+
+    def body(record, save):
+        if (task_record.state_of(record) != "in_progress"
+                or task_record.blocked(record)):
+            # The run left in_progress (pause/rework landed mid-turn): no
+            # feedback claim for a worker that no longer owns the cycle.
+            return ""
+        pr_number = (record.get("delivery") or {}).get("pr")
+        if not pr_number:
+            linked = [p for p in linked_prs(settings, number)
+                      if p.get("state") == "OPEN"]
+            ensure(len(linked) <= 1, "ambiguous_pr_association")
+            if not linked:
+                return ""
+            pr_number = linked[0]["number"]
+        feedback = rework.snapshot(settings, number, pr_number)
+        save({**record, "feedback_claim": {
+            "pr": pr_number, "cycle": record["cycle"],
+            "digest": feedback["digest"]}})
+        # The WORKFLOW defines how to read/respond to feedback. This snapshot
+        # is only an optimistic concurrency guard for delivery.
+        return ""
+    return locked(settings, number, body)
 
 
 def same_phase(before, after, settings):
@@ -263,9 +248,7 @@ def _dispatch(settings, number, args, record, save):
     if action == "deliver":
         return deliver(settings, number, args, record, save)
     if action == "merge":
-        return fail_closed(
-            settings, number, record, save,
-            lambda: merge(settings, number, record, save))
+        raise GateError("merge_host_only")
     if action == "pause":
         reason = _inspect(args.get("reason") or "Human intervention required")[:4000]
         pause(settings, number, record, save, reason)
@@ -274,17 +257,85 @@ def _dispatch(settings, number, args, record, save):
 
 
 # --------------------------------------------------------------------------
-# Receipt cycles
+# Board task operations: state transitions on the single authority record.
+# The board calls these through the scheduler HTTP API (its process shares
+# neither memory nor the file locks).
 
 
-def cycle(event):
-    return "develop:%s" % event["id"]
+def task_operate(settings, number, op, payload=None, by="board"):
+    """A board action serialized with worker admission and host merges.
+
+    ``payload``: ``{"sha": ...}`` for approve, ``{"body": ...}`` for
+    rework comments. Returns ``{"ok": True, "state": ...}``.
+    """
+    payload = payload or {}
+
+    def body(record, save):
+        record = dict(record)
+        state = task_record.state_of(record)
+        if op == "start":
+            ensure(state != "done", "task_done")
+            ensure(not task_record.blocked(record), "task_blocked")
+            record = task_record.transition(record, "todo", by, "开始执行")
+        elif op == "pause":
+            ensure(state != "done", "task_done")
+            record["blocked"] = True
+            reason = str(payload.get("comment") or "").strip()
+            _record_history(record, "pause", by, reason)
+            if reason:
+                try:
+                    comment(settings, number,
+                            "[board] 人工暂停：%s" % reason[:500])
+                except Exception:
+                    pass  # 评论失败不回滚暂停状态
+        elif op == "resume":
+            ensure(task_record.blocked(record), "task_not_blocked")
+            record["blocked"] = False
+            _record_history(record, "resume", by)
+        elif op == "rework":
+            ensure(state == "review", "task_not_in_review")
+            delivery = record.get("delivery") or {}
+            body_text = str(payload.get("body") or "").strip()
+            if body_text:
+                comment(settings, number,
+                        "[board] 继续优化（关联 GH-%s）\n\n%s" % (number, body_text))
+                if isinstance(delivery.get("pr"), int):
+                    feedback = rework.snapshot(settings, number, delivery["pr"])
+                    record["rework_feedback"] = {
+                        "pr": delivery["pr"], "digest": feedback["digest"]}
+            record = task_record.transition(record, "todo", by, "继续优化")
+        elif op == "approve":
+            ensure(state == "review", "task_not_in_review")
+            delivery = record.get("delivery") or {}
+            sha = payload.get("sha")
+            ensure(
+                delivery.get("published") is True and delivery.get("sha")
+                and delivery.get("sha") == sha, "delivery_changed")
+            review = dict(record.get("review") or {})
+            review["approved_sha"] = sha
+            review["approved_by"] = by
+            review["approved_at"] = _utc_now()
+            record["review"] = review
+            _record_history(record, "approve", by)
+        elif op in {"stop", "close"}:
+            ensure(state != "done", "task_done")
+            record = task_record.transition(record, "done", by, "人工关闭")
+        else:
+            raise GateError(("unknown_task_operation", str(op)))
+        save(record)
+        return {"ok": True, "state": task_record.state_of(record),
+                "blocked": task_record.blocked(record)}
+
+    return locked(settings, number, body)
 
 
-def new_cycle(record, cycle_value):
-    if record.get("cycle") == cycle_value:
-        return record
-    return {"cycle": cycle_value, "attempts": 0, "blocked": False}
+def _record_history(record, action, by, detail=""):
+    history = list(record.get("history") or [])
+    entry = {"at": _utc_now(), "action": action, "by": by}
+    if detail:
+        entry["detail"] = detail[:200]
+    history.append(entry)
+    record["history"] = history[-50:]
 
 
 # --------------------------------------------------------------------------
@@ -293,10 +344,9 @@ def new_cycle(record, cycle_value):
 
 def deliver(settings, number, args, record, save):
     ensure(record.get("pending_merge") is not True, "merge_result_pending")
-    event, _labels = signal(settings, number)
     ensure(
-        record.get("cycle") == cycle(event) and not record.get("blocked"),
-        "no_active_workflow_run")
+        task_record.state_of(record) == "in_progress"
+        and not task_record.blocked(record), "no_active_workflow_run")
     tests = args.get("tests")
     ensure(
         isinstance(tests, str) and tests.strip() != ""
@@ -310,10 +360,17 @@ def deliver(settings, number, args, record, save):
     pr_data = fetch_pr(settings, pr_number)
     _validate_pr(settings, pr_data)
     sha = pr_data["head"]["sha"]
+    feedback = rework.snapshot(settings, number, pr_number)
+    claim = record.get("feedback_claim") or {}
+    if (feedback["digest"] != claim.get("digest", "")
+            or (feedback["digest"] and (claim.get("pr") != pr_number or claim.get("cycle") != record["cycle"]))):
+        return {"status": "needs_repair", "reason": "new_rework_feedback",
+                "message": "New PR feedback arrived. End this turn; the next turn will load it."}
     previous = record.get("delivery") or {}
     same_delivery = (
         previous.get("cycle") == record.get("cycle")
-        and previous.get("sha") == sha)
+        and previous.get("sha") == sha
+        and previous.get("feedback_digest", "") == feedback["digest"])
     ensure(
         _map_get(fetch_pr(settings, pr_number), "head", "sha") == sha,
         "head_changed_during_delivery")
@@ -321,15 +378,29 @@ def deliver(settings, number, args, record, save):
         delivery = previous
     else:
         delivery = {
+            "id": str(uuid.uuid4()),
             "pr": pr_number,
             "sha": sha,
             "base": pr_data["base"]["ref"],
             "cycle": record["cycle"],
             "tests": tests,
             "published": False,
+            "feedback_digest": feedback["digest"],
+            "feedback_after": max([previous.get("feedback_after", "")] + [c["updated_at"] for c in feedback["comments"]]),
+            "issue": number,
         }
+        # A new delivery invalidates any earlier board approval for this PR.
+        review = dict(record.get("review") or {})
+        if review.get("approved_sha"):
+            review["approved_sha"] = None
+            review["approved_by"] = None
+            review["approved_at"] = None
+            record = save({**record, "review": review})
     record = save({**record, "delivery": delivery})
     record = publish_delivery(settings, number, record, save)
+    record = task_record.transition(record, "review", "worker", "交付")
+    record = _set_host(record, save, "awaiting",
+                       "交付已记录，宿主接管门禁与合并")
     return {"status": "delivered", "delivery": record["delivery"]}
 
 
@@ -342,8 +413,7 @@ def publish_delivery(settings, number, record, save):
         "Delivery PR #%s @ `%s` → `%s`\n\n"
         "Agent-reported test evidence:\n%s\n\n"
         "The host will verify checks, review gates and risk rules, then merge "
-        "this SHA. High-risk or non-converging changes pause with "
-        "`needs-human`."
+        "this SHA. High-risk or non-converging changes pause the task record."
         % (delivery["pr"], delivery["sha"], delivery["base"],
            delivery["tests"]))
     published = dict(delivery)
@@ -351,61 +421,31 @@ def publish_delivery(settings, number, record, save):
     return save({**record, "delivery": published})
 
 
-def publish_resume(settings, number, record, save, event, pause_reason):
-    actor = _map_get(event, "actor", "login") or "unknown"
-    comment(
-        settings, number,
-        "Manual resume (人工恢复执行): `needs-human` removed and `agent` "
-        "re-added by @%s.\n\n"
-        "Previous pause reason: %s\n"
-        "Host resumes as a new develop cycle. This is not merge "
-        "authorization: checks, delivery SHA and review approvals are "
-        "re-verified before any merge."
-        % (actor, pause_reason or "human intervention"))
-    return save({**record, "resumed_event": event["id"]})
-
-
 def merge(settings, number, record, save):
     if record.get("merged"):
         return {"status": "merged"}
     if record.get("pending_merge"):
         return resolve_merge(settings, number, record, save)
-    return merge_delivery(settings, number, record, save)
-
-
-def merge_delivery(settings, number, record, save):
-    labels, pr_data, delivery = delivery_state(settings, number, record)
-    decision = auto_ready(settings, delivery, pr_data, labels)
-    if decision[0] == "ready":
-        if _label_approved(settings, labels):
-            record = save({**record, "approval": "label"})
-        return commit_merge(settings, number, record, save)
-    if decision[0] == "await":
-        return {"status": "waiting_%s" % decision[1], "pending": decision[2]}
-    if decision[0] == "fix":
-        return {"status": "needs_repair", "reason": decision[1]}
-    pause(settings, number, record, save,
-          "Auto merge declined: %s" % decision[1])
-    return {"status": "paused"}
+    # The background host checker owns the merge; workers only observe.
+    return {"status": "waiting_host",
+            "stage": (record.get("host") or {}).get("stage") or "awaiting"}
 
 
 def delivery_state(settings, number, record):
-    # The four reads are independent; fetching them concurrently keeps a
-    # merge call well inside the MCP client timeout on slow networks.
+    # The reads are independent; fetching them concurrently keeps a merge
+    # call well inside the MCP client timeout on slow networks.
     delivery = record.get("delivery")
     pr_number = delivery.get("pr") if isinstance(delivery, dict) else None
     with ThreadPoolExecutor(max_workers=4) as pool:
         f_issue = pool.submit(fetch_issue, settings, number)
-        f_events = pool.submit(events, settings, number)
         f_linked = pool.submit(linked_prs, settings, number)
         f_pr = (pool.submit(fetch_pr, settings, pr_number)
                 if isinstance(pr_number, int)
                 and not isinstance(pr_number, bool) else None)
-        event, labels = _signal_check(
-            settings, f_issue.result(), f_events.result())
-        ensure(
-            record.get("cycle") == cycle(event) and not record.get("blocked"),
-            "not_a_merge_run")
+        issue_data = f_issue.result()
+        labels = api_labels(issue_data)
+        ensure(issue_data.get("state") == "open",
+               "host_authorization_revoked")
         ensure(
             isinstance(delivery, dict)
             and delivery.get("cycle") == record.get("cycle"),
@@ -427,14 +467,11 @@ def delivery_state(settings, number, record):
 
 
 def commit_merge(settings, number, record, save):
-    # Re-read labels after CI/risk inspection so mid-flight label edits
-    # (needs-human, agent removal, closure) cannot slip through.
-    event, labels = signal(settings, number)
-    ensure(record.get("cycle") == cycle(event), "authorization_revoked")
-    if record.get("approval") == "label":
-        ensure(
-            _label_approved(settings, labels), "authorization_revoked")
-    record = save({**record, "pending_merge": True})
+    issue = fetch_issue(settings, number)
+    ensure(issue.get("state") == "open", "host_authorization_revoked")
+    ensure(not rework.pending(record["delivery"], rework.snapshot(
+        settings, number, record["delivery"]["pr"])), "rework_requested")
+    record = save({**record, "pending_merge": True, "host": {**record.get("host", {}), "stage": "merging", "reason": "正在确认合并结果", "observed_at": _utc_now()}})
     request(
         settings, "PUT",
         "%s/pulls/%s/merge" % (root(settings), record["delivery"]["pr"]),
@@ -444,7 +481,7 @@ def commit_merge(settings, number, record, save):
 
 # Deterministic merge admission: real checks, real merge gate, project risk
 # rules and real review approvals. Anything unverifiable goes to a human.
-def auto_ready(settings, delivery, pr_data, issue_labels):
+def auto_ready(settings, delivery, pr_data, issue_labels, record=None):
     sha = delivery["sha"]
     pr_number = delivery["pr"]
     # Independent reads fan out: check-runs + statuses + merge gate +
@@ -478,41 +515,32 @@ def auto_ready(settings, delivery, pr_data, issue_labels):
             return ("await", "checks", ["mergeability"])
         return _gate_ready(
             settings, delivery, pr_data, gate, issue_labels,
-            f_files.result(), f_reviews.result())
+            f_files.result(), f_reviews.result(), record)
 
 
 def _gate_ready(settings, delivery, pr_data, gate, issue_labels, files=None,
-                reviews=None):
+                reviews=None, record=None):
     risk = _risk_required(settings, delivery, issue_labels, files)
     if risk[0] == "human":
         return ("human", risk[1])
+    board_approved = (
+        isinstance(record, dict)
+        and (record.get("review") or {}).get("approved_sha") == delivery["sha"])
     approval_missing = (
         (risk[1] or policy.merge_policy(settings) == "manual")
-        and not _approved(settings, delivery, pr_data, reviews)
-        and not _label_approved(settings, issue_labels))
+        and not board_approved
+        and not _approved(settings, delivery, pr_data, reviews))
     return _final_gate(gate, approval_missing)
 
 
-def _label_approved(settings, issue_labels):
-    """Solo-mode approval: repo owner applied the configured approval label.
-
-    Only meaningful when ``approval_label`` is configured; intended for
-    single-account repos where a non-author GitHub review is impossible.
-    The merge-time SHA freeze still applies, so a post-approval push is
-    rejected by ``delivery_changed`` like any other drift.
-    """
-    label = policy.approval_label(settings)
-    return bool(label) and label in (issue_labels or [])
-
-
 def _final_gate(gate, approval_missing):
+    # Review-first ordering: REVIEW_REQUIRED blocks mergeStateStatus, so
+    # awaiting review must be decided before reporting a fix is needed.
+    if gate.get("reviewDecision") == "REVIEW_REQUIRED" or approval_missing:
+        return ("await", "review", [])
     if gate.get("mergeStateStatus") != "CLEAN":
         return ("fix", "merge state %s; resolve conflicts or update the branch"
                 % gate.get("mergeStateStatus"))
-    if gate.get("reviewDecision") == "REVIEW_REQUIRED":
-        return ("await", "review", [])
-    if approval_missing:
-        return ("await", "review", [])
     return ("ready",)
 
 
@@ -603,6 +631,8 @@ def _approved(settings, delivery, pr_data, reviews=None):
             latest[review["user"].get("login")] = review
     return any(
         review.get("state") == "APPROVED"
+        and (not delivery.get("feedback_after")
+             or review.get("submitted_at", "") > delivery["feedback_after"])
         and review["user"].get("type") == "User"
         and isinstance(login, str)
         and login not in (author, None)
@@ -615,12 +645,16 @@ def resolve_merge(settings, number, record, save):
     if (pr_data.get("merged") is True
             and _map_get(pr_data, "head", "sha") == delivery["sha"]
             and _map_get(pr_data, "base", "ref") == delivery["base"]):
-        request(
-            settings, "PATCH",
-            "%s/issues/%s" % (root(settings), number), {"state": "closed"})
-        _clear_labels(settings, number)
-        save({**record, "pending_merge": False, "blocked": True,
-              "merged": True})
+        record = _set_host(record, save, "finalizing", "PR 已合并，正在关闭 Issue")
+        issue = fetch_issue(settings, number)
+        if issue.get("state") != "closed":
+            request(
+                settings, "PATCH",
+                "%s/issues/%s" % (root(settings), number), {"state": "closed"})
+        record = task_record.transition(
+            {**record, "pending_merge": False, "blocked": False,
+             "merged": True}, "done", "host", "PR 已合并")
+        _set_host(record, save, "merged", "PR 已合并，任务已完成")
         return {"status": "merged"}
     updated = dict(record)
     updated["pending_merge"] = False
@@ -641,57 +675,18 @@ def fail_closed(settings, number, record, save, fn):
 
 
 def pause(settings, number, record, save, reason):
-    save({**record, "blocked": True, "error": reason})
+    record = dict(record)
+    record["blocked"] = True
+    record["error"] = reason
+    record["host"] = {**record.get("host", {}), "stage": "paused",
+                      "reason": str(reason), "observed_at": _utc_now()}
+    save(record)
     comment(
         settings, number,
-        "Paused (needs-human): %s\nDelivery: %s\n\n"
-        "恢复方式：人工处理后，移除 `needs-human` 标签并重新添加 `agent`。"
-        "重贴 `agent` 不是合并授权；合并前宿主会重新核验当前 SHA 的检查与有效 "
-        "Review 批准。"
+        "Paused: %s\nDelivery: %s\n\n"
+        "恢复方式：处理完成后在看板点“恢复执行”（解除 blocked）。"
+        "恢复不是合并授权；合并前宿主会重新核验当前 SHA 的检查与批准。"
         % (reason, _inspect(record.get("delivery"))))
-    add_label(settings, number, policy.pause_label())
-    remove_label(settings, number, policy.AGENT_LABEL)
-
-
-def _clear_labels(settings, number):
-    remove_label(settings, number, policy.AGENT_LABEL)
-    remove_label(settings, number, policy.pause_label())
-    remove_label(settings, number, "merge-approved")
-    approval = policy.approval_label(settings)
-    if approval and approval != "merge-approved":
-        remove_label(settings, number, approval)
-
-
-def signal(settings, number):
-    """Fetch the live signal: issue open, develop phase, required labels
-    present, newest ``agent`` label event a ``labeled`` grant."""
-    return _signal_check(
-        settings,
-        fetch_issue(settings, number),
-        events(settings, number))
-
-
-def _signal_check(settings, data, event_list):
-    issue_labels = api_labels(data)
-    ensure(
-        data.get("state") == "open" and policy.phase(issue_labels) == "develop",
-        "issue_not_executable")
-    required = getattr(settings, "required_labels", None) or []
-    ensure(all(label in issue_labels for label in required),
-           "required_labels_removed")
-    matched = [
-        event for event in event_list
-        if isinstance(event, dict)
-        and _map_get(event, "label", "name") == "agent"
-        and event.get("event") in ("labeled", "unlabeled")
-    ]
-    event = matched[-1] if matched else None
-    ensure(
-        isinstance(event, dict) and event.get("event") == "labeled"
-        and isinstance(event.get("id"), int)
-        and not isinstance(event.get("id"), bool),
-        "missing_label_event")
-    return event, issue_labels
 
 
 def _linked_pr(settings, number):
@@ -734,6 +729,87 @@ def _validate_pr(settings, pr_data):
 # Receipt store
 
 
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _set_host(record, save, stage, reason, **values):
+    return save({**record, "host": {**record.get("host", {}), "stage": stage,
+                 "reason": str(reason), "observed_at": _utc_now(), "last_error": None, **values}})
+
+
+def _queue_host_repair(settings, number, record, save, reason):
+    used = record.get("repair_budget", 0)
+    if used >= policy.max_attempts(settings):
+        pause(settings, number, record, save, "自动修复次数已达上限：%s" % reason)
+        return
+    record = save({**record, "repair_budget": used + 1})
+    record = task_record.transition(record, "todo", "host", "退回修复：%s" % reason)
+    save(record)
+
+
+def reconcile_delivery(settings, number, active=False):
+    """One background host step. No Agent process or orchestrator slot.
+
+    Only ``review`` records are owned here. External convergence (issue
+    closed, PR merged/closed) is checked first so no waiting substate can
+    hang."""
+    def body(record, save):
+        if record.get("merged") or task_record.blocked(record):
+            return
+        if task_record.state_of(record) != "review":
+            return
+        delivery = record.get("delivery") or {}
+        if record.get("pending_merge"):
+            resolve_merge(settings, number, record, save)
+            return
+        if active:
+            return
+        # Convergence first: the issue is the task identity.
+        data = fetch_issue(settings, number)
+        labels = api_labels(data)
+        if data.get("state") != "open":
+            record = task_record.transition(record, "done", "host",
+                                            "Issue 已关闭")
+            _set_host(record, save, "closed", "Issue 已关闭，停止自动合并")
+            return
+        if not delivery.get("published"):
+            return
+        pr = fetch_pr(settings, delivery["pr"])
+        if pr.get("merged") is True:
+            record = save({**record, "pending_merge": True})
+            return resolve_merge(settings, number, record, save)
+        if pr.get("state") == "closed":
+            record = task_record.transition(record, "done", "host",
+                                            "PR 已关闭但未合并")
+            _set_host(record, save, "closed", "PR 已关闭但未合并")
+            return
+        if rework.pending(delivery, rework.snapshot(settings, number, delivery["pr"])):
+            return _set_host(record, save, "waiting_update", "修改意见已记录，等待人工退回执行")
+        record = _set_host(record, save, "checking",
+                           "正在检查交付 SHA、CI 与批准")
+        try:
+            labels, pr, delivery_checked = delivery_state(settings, number, record)
+        except GateError as error:
+            if error.reason == "delivery_changed":
+                return _queue_host_repair(settings, number, record, save, "PR 提交已变化，需要重新验证交付")
+            raise
+        decision = auto_ready(settings, delivery_checked, pr, labels,
+                              record)
+        if decision[0] == "ready":
+            return commit_merge(settings, number, record, save)
+        if decision[0] == "await":
+            stage = "waiting_review" if decision[1] == "review" else "waiting_checks"
+            return _set_host(record, save, stage,
+                             "等待批准" if stage == "waiting_review"
+                             else "等待 CI 检查：%s" % decision[2],
+                             review_required=stage == "waiting_review")
+        if decision[0] == "fix":
+            return _queue_host_repair(settings, number, record, save, decision[1])
+        pause(settings, number, record, save, decision[1])
+    return locked(settings, number, body)
+
+
 def _path(settings, number):
     return os.path.join(
         policy.config(settings)["state_dir"], "%s.json" % number)
@@ -751,7 +827,7 @@ def _read_record(path):
         raise GateError("invalid_workflow_receipt")
     if not isinstance(record, dict):
         raise GateError("invalid_workflow_receipt")
-    return record
+    return task_record.normalize(record)
 
 
 def _store_record(path, record):
@@ -761,6 +837,13 @@ def _store_record(path, record):
         os.chmod(directory, 0o700)
     except OSError:
         pass
+    # Backup before overwrite: the record is the only workflow authority.
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as src, open(path + ".bak", "wb") as dst:
+                dst.write(src.read())
+        except OSError:
+            log.warning("Unable to back up task record %s", path)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False))

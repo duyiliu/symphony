@@ -60,33 +60,69 @@ class SortTest(unittest.TestCase):
 
 
 class CandidateTest(unittest.TestCase):
-    def test_merge_evaluation_does_not_consume_agent_capacity(self):
+    def test_worker_runtime_info_records_workspace_and_consumes_capacity(self):
         orch = _orchestrator()
         orch.max_concurrent_agents = 1
-        orch.running["1"] = {"merge_eval": True, "issue": _issue("1")}
-        self.assertEqual(orch._available_slots(), 1)
-        self.assertTrue(orch._state_slots_available(_issue("2"), orch._store.settings()))
+        orch.running["1"] = {"issue": _issue("1")}
+        orch._on_worker_runtime_info("1", {"workspace_path": "worker-workspace",
+                                           "worker_host": "h1"})
+        self.assertEqual(orch.running["1"]["workspace_path"],
+                         "worker-workspace")
+        self.assertEqual(orch.running["1"]["worker_host"], "h1")
+        self.assertEqual(orch._available_slots(), 0)
 
-    def test_gate_repair_waits_for_agent_dispatch(self):
+    def test_running_entry_consumes_agent_capacity(self):
+        orch = _orchestrator()
+        orch.max_concurrent_agents = 1
+        orch.running["1"] = {"issue": _issue("1")}
+        settings = orch._store.settings()
+        self.assertEqual(orch._available_slots(), 0)
+        active = orch._active_state_set(settings)
+        terminal = orch._terminal_state_set(settings)
+        self.assertFalse(
+            orch._should_dispatch(_issue("2"), active, terminal, settings))
+
+    def test_done_normal_schedules_continuation_check(self):
         from symphony.agent import runner
         orch = _orchestrator()
-        orch.running["1"] = {"ref": 7, "issue": _issue("1"), "identifier": "GH-1"}
+        orch.running["1"] = {"ref": 7, "issue": _issue("1"),
+                             "identifier": "GH-1"}
         with patch.object(orch, "_schedule_issue_retry") as schedule:
-            orch._on_worker_done("1", 7, runner.DONE_NEEDS_WORKER)
-        self.assertEqual(schedule.call_args.args[2]["delay_type"], "continuation")
+            orch._on_worker_done("1", 7, runner.DONE_NORMAL)
+        self.assertEqual(schedule.call_args.args[2]["delay_type"],
+                         "continuation")
         self.assertNotIn("1", orch.running)
 
-    def test_admission_only_never_starts_worker(self):
+    def test_skip_at_claim_releases_without_worker(self):
         from symphony.agent import runner
         issue = _issue()
         done = []
-        with patch.object(runner.tracker_adapter, "begin_run_issue", return_value="ok"), \
+        with patch.object(runner.tracker_adapter, "begin_run_issue",
+                          return_value="skip"), \
              patch.object(runner, "_run_on_worker_host") as worker:
             runner.run(issue, _settings(), lambda *args: None,
-                       lambda *args: done.append(args), runner.RunHandle(),
-                       {"admission_only": True})
+                       lambda *args: done.append(args), runner.RunHandle())
         worker.assert_not_called()
-        self.assertEqual(done, [(issue.id, runner.DONE_NEEDS_WORKER)])
+        self.assertEqual(done, [(issue.id, runner.DONE_SKIPPED)])
+
+    def test_retry_waits_for_capacity_then_respawns(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+        orch.max_concurrent_agents = 1
+        orch.running["other"] = {"issue": _issue("other")}
+        metadata = {"delay_type": "continuation", "identifier": "GH-1"}
+        with patch.object(orch, "_schedule_issue_retry") as retry, \
+                patch.object(orch, "_spawn_issue") as spawn:
+            orch._handle_active_retry(_issue(), 1, metadata, settings)
+        retry.assert_called_once()
+        spawn.assert_not_called()
+        orch.running.clear()
+        with patch.object(orch, "_refresh_issue_for_dispatch",
+                          return_value=_issue()), \
+                patch.object(orch, "_spawn_issue") as spawn:
+            orch._handle_active_retry(_issue(), 1, metadata, settings)
+        spawn.assert_called_once()
+        self.assertEqual(spawn.call_args.args[0].id, "1")
 
     def test_candidate(self):
         orch = _orchestrator()
@@ -187,6 +223,67 @@ class _FakeHandle:
 
     def cancel(self):
         self.cancelled = True
+
+
+class RunnerContinuationTest(unittest.TestCase):
+    """The run loop ends on refreshed local state, not on cached data."""
+
+    def _run_with_state(self, refreshed, active=True):
+        from types import SimpleNamespace
+        from symphony.agent import runner
+        issue = _issue("1")
+        if refreshed is not None and not active:
+            refreshed.state = "Human Review"
+        settings = SimpleNamespace(
+            tracker=SimpleNamespace(
+                active_states=["open", "todo", "in progress", "merging",
+                               "rework"], required_labels=[]),
+            runtime=SimpleNamespace(kind="pi"),
+            agent=SimpleNamespace(max_turns=2),
+            worker=SimpleNamespace(ssh_hosts=[]))
+        done, turns = [], []
+        with patch.object(runner.tracker_adapter, "begin_run_issue",
+                          return_value="ok"), \
+             patch.object(runner.tracker_adapter, "fetch_issues_by_ids",
+                          return_value=[refreshed]
+                          if refreshed is not None else []), \
+             patch.object(runner.tracker_adapter, "routable",
+                          return_value=True), \
+             patch.object(runner, "_workflow_path", return_value=None), \
+             patch.object(runner.workspace_mod, "create_for_issue",
+                          return_value="ws"), \
+             patch.object(runner.workspace_mod, "run_before_run",
+                          return_value=None), \
+             patch.object(runner.workspace_mod, "run_after_run",
+                          return_value=None), \
+             patch.object(runner, "_build_turn_prompt", return_value="p"), \
+             patch.object(runner.pi_runtime, "start_session",
+                          return_value="sess"), \
+             patch.object(runner.pi_runtime, "stop_session",
+                          return_value=None), \
+             patch.object(runner.pi_runtime, "run_turn",
+                          side_effect=lambda *a, **k:
+                          turns.append(1) or {"session_id": "s1"}):
+            runner.run(issue, settings, lambda *a: None,
+                       lambda *a: done.append(a), runner.RunHandle())
+        return done, turns
+
+    def test_issue_gone_ends_after_one_turn(self):
+        from symphony.agent import runner
+        done, turns = self._run_with_state(None)
+        self.assertEqual(done, [("1", runner.DONE_NORMAL)])
+        self.assertEqual(len(turns), 1)
+
+    def test_inactive_issue_ends_after_one_turn(self):
+        from symphony.agent import runner
+        done, turns = self._run_with_state(_issue("1"), active=False)
+        self.assertEqual(done, [("1", runner.DONE_NORMAL)])
+        self.assertEqual(len(turns), 1)
+
+    def test_active_issue_continues_to_next_turn(self):
+        done, turns = self._run_with_state(_issue("1"))
+        self.assertEqual(len(turns), 2)  # max_turns=2, issue stays active
+        self.assertEqual(done[0][1], "normal")
 
 
 class SnapshotShapeTest(unittest.TestCase):

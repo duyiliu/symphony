@@ -31,7 +31,7 @@ class _State:
 
 
 def _tools():
-    from .github import adapter as tracker_adapter
+    from . import tracker as tracker_adapter
 
     return tracker_adapter
 

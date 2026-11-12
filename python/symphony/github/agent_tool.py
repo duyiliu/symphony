@@ -1,259 +1,138 @@
-"""``github_api`` / ``github_workflow`` agent tools exposed over the MCP bridge."""
+"""In-process MCP tools: ``github_api`` (configured-repo REST) and
+``task_api`` (authoritative local task record). Both execute on the host —
+the worker environment carries no GitHub token."""
 
-import json
+import base64
 import logging
 
-from ..workflow import WorkflowError
-from ..workflow_store import get_store
+from .. import workflow_store
 from . import client as gh_client
-from . import workflow as gh_workflow
-from . import workflow_policy
-from .workflow_api import GateError
+from . import workflow_policy as policy
 
-log = logging.getLogger("symphony.github.tools")
-
-_ALLOWED_METHODS = ("GET", "POST", "PATCH", "PUT", "DELETE")
+log = logging.getLogger("symphony.github.agent_tool")
 
 _GITHUB_API_SPEC = {
     "name": "github_api",
-    "description": "Execute a GitHub REST API request using Symphony's configured auth.\n",
+    "description": (
+        "Call the GitHub REST API for the configured repository. Use this "
+        "for issue comments, pull requests, checks, labels and merges "
+        "instead of the `gh` CLI — no GitHub token is available in your "
+        "shell."),
     "inputSchema": {
         "type": "object",
-        "additionalProperties": False,
-        "required": ["method", "path"],
         "properties": {
-            "method": {
-                "type": "string",
-                "enum": list(_ALLOWED_METHODS),
-                "description": "GitHub REST method.",
-            },
+            "method": {"type": "string", "enum": [
+                "GET", "POST", "PATCH", "PUT", "DELETE"]},
             "path": {
                 "type": "string",
-                "description": "GitHub REST path such as /repos/owner/repo/issues/1/comments.",
-            },
+                "description": "Path relative to https://api.github.com, "
+                               "e.g. /repos/{owner}/{repo}/issues/1. Do "
+                               "not embed a query string — use params."},
             "params": {
-                "type": ["object", "null"],
-                "description": "Optional query parameters.",
-                "additionalProperties": True,
-            },
-            "body": {
-                "type": ["object", "null"],
-                "description": "Optional JSON request body (object, not a JSON string).",
-            },
+                "type": "object",
+                "description": "Optional query parameters (e.g. "
+                               "{\"page\": 2, \"per_page\": 100} for "
+                               "pagination). Values must be scalars."},
+            "body": {"type": ["object", "array", "null"]},
         },
-    },
-}
-
-_GITHUB_WORKFLOW_SPEC = {
-    "name": "github_workflow",
-    "description": (
-        "Host-enforced GitHub workflow. Register delivery before handoff. "
-        "`agent` alone carries develop through host-guarded merge: only the "
-        "host merges, after re-checking labels, SHA, reported checks, risk "
-        "rules and review approvals. Issue is its numeric GitHub number. "
-        "Never manipulate execution labels through github_api."
-    ),
-    "inputSchema": {
-        "type": "object",
+        "required": ["method", "path"],
         "additionalProperties": False,
-        "required": ["action", "issue"],
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["status", "deliver", "merge", "pause"],
-            },
-            "issue": {"type": "string"},
-            "pr": {"type": "integer"},
-            "tests": {"type": "string"},
-            "reason": {"type": "string"},
-        },
     },
 }
-
-
-def tool_specs():
-    specs = [_GITHUB_API_SPEC]
-    settings = _tracker_settings()
-    if settings is not None and workflow_policy.enabled(settings):
-        specs.append(_GITHUB_WORKFLOW_SPEC)
-    return specs
 
 
 def _tracker_settings():
-    store = get_store()
+    store = workflow_store.get_store()
     if store is None:
         return None
-    settings = store.settings()
-    return getattr(settings, "tracker", None) if settings else None
+    return store.settings().tracker
 
 
-def execute(tool, arguments):
-    if tool == "github_api":
-        return _execute_github_api(arguments)
-    if tool == "github_workflow":
-        return _execute_workflow(arguments)
-    return _unsupported_tool_response(tool)
+def tool_specs(tracker_settings=None):
+    settings = tracker_settings or _tracker_settings()
+    specs = [_GITHUB_API_SPEC]
+    if settings is not None and settings.kind == "board":
+        from ..tasks import tools as task_tools
+        specs.append(task_tools.TASK_API_SPEC)
+    return specs
 
 
-def _execute_github_api(arguments):
-    try:
-        method, path, params, body = _normalize_arguments(arguments)
-    except GateError as error:
-        return _failure_response(_tool_error_payload(error.reason))
-    settings = _tracker_settings()
+def execute_agent_tool(tool_name, arguments, tracker_settings=None):
+    settings = tracker_settings or _tracker_settings()
     if settings is None:
-        return _failure_response(_tool_error_payload("github_workflow_disabled"))
-    try:
-        workflow_policy.allow_request(settings, method, path, body)
-        result = gh_client.request(method, path, params, body, settings)
-    except WorkflowError as error:
-        return _failure_response(_tool_error_payload(error.reason))
-    except GateError as error:
-        return _failure_response(_tool_error_payload(error.reason))
-    except gh_client.GitHubError as error:
-        return _failure_response(
-            _tool_error_payload(("github_api_request", error.reason)))
-    except Exception:  # noqa: BLE001 - tools must not crash the bridge
-        log.exception("github_api tool failed")
-        return _failure_response(_tool_error_payload("tool_error"))
-    status = result.get("status")
-    if not isinstance(status, int) or isinstance(status, bool):
-        return _failure_response(_tool_error_payload("github_unknown_payload"))
-    return _rest_response(status, result.get("body"))
-
-
-def _execute_workflow(arguments):
+        return {"error": {"code": "workflow_not_loaded"}}
+    if tool_name == "task_api":
+        if settings.kind != "board":
+            return {"error": {"code": "unknown_tool", "detail": tool_name}}
+        from ..tasks import tools as task_tools
+        return task_tools.execute(settings, arguments)
+    if tool_name != "github_api":
+        return {"error": {"code": "unknown_tool", "detail": tool_name}}
     if not isinstance(arguments, dict):
-        return _failure_response(_tool_error_payload("invalid_arguments"))
-    settings = _tracker_settings()
-    if settings is None:
-        return _failure_response(_tool_error_payload("github_workflow_disabled"))
+        return {"error": {"code": "invalid_arguments"}}
+    method = arguments.get("method")
+    path = arguments.get("path")
+    params = arguments.get("params")
+    body = arguments.get("body")
+    if not isinstance(method, str) or not isinstance(path, str):
+        return {"error": {"code": "invalid_arguments"}}
+    if "://" in path or not path.startswith("/") \
+            or "?" in path or "#" in path:
+        # Query strings go through `params`; a raw '?' would otherwise be
+        # silently stripped by urlsplit and bypass policy validation.
+        return {"error": {"code": "invalid_arguments"}}
+    if params is not None and not _valid_params(params):
+        return {"error": {"code": "invalid_arguments"}}
+    url = _API_ROOT + path
     try:
-        result = gh_workflow.execute(settings, arguments)
-    except GateError as error:
-        return _failure_response(_tool_error_payload(error.reason))
-    except WorkflowError as error:
-        return _failure_response(_tool_error_payload(error.reason))
-    except Exception:  # noqa: BLE001 - tools must not crash the bridge
-        log.exception("github_workflow tool failed")
-        return _failure_response(_tool_error_payload("tool_error"))
-    return _tool_response(True, _encode_payload(result))
-
-
-def _normalize_arguments(arguments):
-    if not isinstance(arguments, dict):
-        raise GateError("invalid_arguments")
-    method = _normalize_method(arguments.get("method"))
-    path = _normalize_path(arguments.get("path"))
-    params = _normalize_params(arguments.get("params"))
-    return method, path, params, _normalize_body(arguments.get("body"))
-
-
-def _normalize_method(method):
-    if not isinstance(method, str):
-        raise GateError("invalid_method")
-    normalized = method.strip().upper()
-    if normalized in _ALLOWED_METHODS:
-        return normalized
-    raise GateError("invalid_method")
-
-
-def _normalize_path(path):
-    if not isinstance(path, str):
-        raise GateError("invalid_path")
-    trimmed = path.strip()
-    if trimmed.startswith("/") and not any(
-            token in trimmed for token in ("://", "\n", "\r", "\x00")):
-        return trimmed
-    raise GateError("invalid_path")
-
-
-def _normalize_params(params):
-    if params is None:
-        return {}
-    if isinstance(params, dict):
-        return params
-    if isinstance(params, str):
-        parsed = _json_object(params)
-        if parsed is not None:
-            return parsed
-    raise GateError("invalid_params")
-
-
-def _normalize_body(body):
-    """Models sometimes send the JSON body as a serialized string.
-
-    The policy layer requires a dict, so a string body silently reads as a
-    denied request; coerce it (or fail with a clear reason) instead.
-    """
-    if body is None or isinstance(body, dict):
-        return body
-    if isinstance(body, str):
-        parsed = _json_object(body)
-        if parsed is not None:
-            return parsed
-    raise GateError("invalid_body")
-
-
-def _json_object(raw):
+        allowed = policy.allow_request(settings, method, url, body)
+    except Exception:  # noqa: BLE001 - a policy failure must not leak detail
+        log.exception("github_api policy evaluation failed")
+        return {"error": {"code": "forbidden"}}
+    if not allowed:
+        return {"error": {"code": "forbidden"}}
+    from urllib.parse import urlsplit
+    api_path = urlsplit(url).path
     try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _rest_response(status, body):
-    return _tool_response(
-        200 <= status <= 299,
-        _encode_payload({"status": status, "body": body}))
-
-
-def _failure_response(payload):
-    return _tool_response(False, _encode_payload(payload))
-
-
-def _tool_response(success, output):
-    return {
-        "success": success,
-        "output": output,
-        "contentItems": [{"type": "inputText", "text": output}],
+        result = gh_client.request(
+            method, api_path, params or {}, body, settings)
+    except Exception as error:  # noqa: BLE001
+        log.exception("github_api request failed")
+        return {"error": {"code": "github_request_failed",
+                          "detail": getattr(error, "reason", str(error))}}
+    response = {
+        "status": result["status"],
+        "body": _sanitize_body(result["body"]),
     }
-
-
-def _encode_payload(payload):
-    try:
-        return json.dumps(payload, ensure_ascii=False, indent=2)
-    except (TypeError, ValueError):
-        return repr(payload)
-
-
-def _unsupported_tool_response(tool):
-    return _failure_response({
-        "error": {
-            "message": "Unsupported dynamic tool: %s." % gh_workflow._inspect(tool),
-            "supportedTools": [spec["name"] for spec in tool_specs()],
+    if not (200 <= result["status"] <= 299):
+        response["error"] = {
+            "code": "github_status",
+            "status": result["status"],
         }
-    })
+    return response
 
 
-def _tool_error_payload(reason):
-    if reason == "invalid_arguments":
-        return {"error": {"message": "`github_api` expects an object with `method` and `path`."}}
-    if reason == "invalid_method":
-        return {"error": {"message": "`github_api.method` must be GET, POST, PATCH, PUT, or DELETE."}}
-    if reason == "invalid_path":
-        return {"error": {"message": "`github_api.path` must be a relative GitHub REST path."}}
-    if reason == "invalid_params":
-        return {"error": {"message": "`github_api.params` must be a JSON object when provided."}}
-    if reason == "missing_github_token":
-        return {"error": {"message": "Symphony is missing GitHub auth. Set `tracker.provider.token` in `WORKFLOW.md` or export `GITHUB_TOKEN`."}}
-    if isinstance(reason, tuple) and reason and reason[0] == "github_api_request":
-        return {"error": {
-            "message": "GitHub API request failed before receiving a successful response.",
-            "reason": gh_workflow._inspect(reason[1]),
-        }}
-    return {"error": {
-        "message": "GitHub API tool execution failed.",
-        "reason": gh_workflow._inspect(reason),
-    }}
+def _valid_params(params):
+    """Query params are plain scalars — the repo boundary stays in the
+    path, so a nested object or array here is simply malformed input."""
+    if not isinstance(params, dict):
+        return False
+    return all(
+        isinstance(key, str)
+        and (value is None
+             or isinstance(value, (str, int, float, bool)))
+        for key, value in params.items())
+
+
+def _sanitize_body(body):
+    """Bound the tool payload; binary-ish bodies degrade to a marker."""
+    if isinstance(body, (dict, list)):
+        return body
+    if body is None:
+        return None
+    if isinstance(body, bytes):
+        return {"_binary": base64.b64encode(body[:256]).decode("ascii")}
+    return {"_text": str(body)[:8000]}
+
+
+_API_ROOT = "https://api.github.com"

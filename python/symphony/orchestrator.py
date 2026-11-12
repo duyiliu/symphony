@@ -21,7 +21,7 @@ import time
 from . import config as config_mod
 from . import workspace as workspace_mod
 from .agent import runner as agent_runner
-from .github import adapter as tracker_adapter
+from . import tracker as tracker_adapter
 from .util import normalize_issue_state, present_string
 from .workflow import WorkflowError
 
@@ -29,9 +29,6 @@ log = logging.getLogger("symphony.orchestrator")
 
 CONTINUATION_RETRY_DELAY_MS = 1_000
 FAILURE_RETRY_BASE_MS = 10_000
-# Cadence for host-side merge gate evaluation while a delivery awaits
-# merge — the worker is released so each poll is just a few API reads.
-MERGE_POLL_DELAY_MS = 30_000
 
 _EMPTY_TOTALS = {
     "input_tokens": 0,
@@ -88,7 +85,6 @@ class Orchestrator:
         self.tick_token = None
 
         self.running = {}
-        self.completed = set()
         self.claimed = set()
         self.blocked = {}
         self.retry_attempts = {}
@@ -284,6 +280,12 @@ class Orchestrator:
             return
         settings = self._store.settings()
         try:
+            # Source discovery shares the same in-process locks as task
+            # writes; a failed discovery must never hide existing records.
+            tracker_adapter.import_sources(settings.tracker)
+        except Exception as error:  # noqa: BLE001
+            log.warning("Source discovery failed: %r", error)
+        try:
             issues = tracker_adapter.fetch_candidate_issues(settings.tracker)
         except Exception as error:  # noqa: BLE001
             log.error("Failed to fetch from issue tracker: %r", error)
@@ -307,8 +309,7 @@ class Orchestrator:
     # -- dispatch ----------------------------------------------------------
 
     def _available_slots(self):
-        used = sum(1 for entry in self.running.values() if not entry.get("merge_eval"))
-        return max(self.max_concurrent_agents - used, 0)
+        return max(self.max_concurrent_agents - len(self.running), 0)
 
     def _active_state_set(self, settings):
         return {
@@ -370,7 +371,7 @@ class Orchestrator:
         normalized = normalize_issue_state(issue.state)
         used = sum(
             1 for entry in self.running.values()
-            if not entry.get("merge_eval") and entry.get("issue") is not None
+            if entry.get("issue") is not None
             and normalize_issue_state(entry["issue"].state or "") == normalized
         )
         return limit > used
@@ -400,7 +401,7 @@ class Orchestrator:
     def _running_on_host(self, host):
         return sum(
             1 for entry in self.running.values()
-            if not entry.get("merge_eval") and entry.get("worker_host") == host)
+            if entry.get("worker_host") == host)
 
     def _dispatch_issue(self, issue, settings, attempt=None, preferred_host=None):
         refreshed = self._refresh_issue_for_dispatch(issue, settings)
@@ -441,7 +442,7 @@ class Orchestrator:
             return ("skip", refreshed)
         return refreshed
 
-    def _spawn_issue(self, issue, settings, attempt, worker_host, merge_eval=False):
+    def _spawn_issue(self, issue, settings, attempt, worker_host):
         ref = self._new_token()
         handle = agent_runner.RunHandle()
 
@@ -461,8 +462,7 @@ class Orchestrator:
             try:
                 agent_runner.run(
                     issue, settings, on_update, on_done, handle,
-                    opts={"worker_host": worker_host, "attempt": attempt,
-                          "admission_only": merge_eval})
+                    opts={"worker_host": worker_host, "attempt": attempt})
             except Exception as error:  # noqa: BLE001 - last-resort isolation
                 log.exception("Agent runner crashed for %s", _issue_context(issue))
                 on_done(issue.id, error)
@@ -490,7 +490,6 @@ class Orchestrator:
             "codex_last_reported_total_tokens": 0,
             "turn_count": 0,
             "retry_attempt": attempt if isinstance(attempt, int) and attempt > 0 else 0,
-            "merge_eval": merge_eval,
             "started_at": _now(),
         }
         try:
@@ -506,7 +505,7 @@ class Orchestrator:
             return
 
         log.info(
-            "Runner spawned for issue: %s attempt=%r worker_host=%s",
+            "Agent runner spawned for issue: %s attempt=%r worker_host=%s",
             _issue_context(issue), attempt, worker_host or "local")
         self.running[issue.id] = entry
         self.claimed.add(issue.id)
@@ -521,30 +520,13 @@ class Orchestrator:
         entry = self.running.pop(issue_id)
         self._record_session_completion_totals(entry)
         session_id = entry.get("session_id") or "n/a"
-        if reason == agent_runner.DONE_WAITING:
-            self._block_issue_from_entry(
-                issue_id, entry,
-                "GitHub workflow paused; waiting for a new label event",
-                github_workflow_waiting=True)
-        elif reason == agent_runner.DONE_AWAIT_MERGE:
-            # A published delivery is waiting on the merge gate (checks,
-            # review, approval). The worker slot was released; the next
-            # retry tick re-runs admission which evaluates the gate
-            # host-side and merges / re-polls / dispatches a repair worker.
-            self._schedule_issue_retry(issue_id, 1, {
-                "identifier": entry.get("identifier"),
-                "issue_url": entry["issue"].url if entry.get("issue") else None,
-                "delay_type": "merge_poll",
-                "worker_host": entry.get("worker_host"),
-                "workspace_path": entry.get("workspace_path"),
-            })
-        elif reason == agent_runner.DONE_NEEDS_WORKER:
-            self._schedule_issue_retry(issue_id, 1, {
-                "identifier": entry.get("identifier"),
-                "issue_url": entry["issue"].url if entry.get("issue") else None,
-                "delay_type": "continuation",
-                "worker_host": entry.get("worker_host"),
-            })
+        if reason == agent_runner.DONE_SKIPPED:
+            # Claim-time recheck found the task out of active states;
+            # release so a later poll can pick it up if it returns.
+            log.info(
+                "Agent run skipped for issue_id=%s: task not in an active "
+                "state; releasing claim", issue_id)
+            self._release_issue_claim(issue_id)
         elif reason == agent_runner.DONE_NORMAL:
             if self._input_required_blocker(entry):
                 self._block_input_required(issue_id, entry, session_id, "normal")
@@ -553,7 +535,6 @@ class Orchestrator:
                     "Agent task completed for issue_id=%s session_id=%s; "
                     "scheduling active-state continuation check",
                     issue_id, session_id)
-                self.completed.add(issue_id)
                 self.retry_attempts.pop(issue_id, None)
                 self._schedule_issue_retry(issue_id, 1, {
                     "identifier": entry.get("identifier"),
@@ -684,8 +665,6 @@ class Orchestrator:
     def _retry_delay(self, attempt, metadata, settings):
         if metadata.get("delay_type") == "continuation" and attempt == 1:
             return CONTINUATION_RETRY_DELAY_MS
-        if metadata.get("delay_type") == "merge_poll":
-            return MERGE_POLL_DELAY_MS
         return self._failure_retry_delay(attempt, settings)
 
     @staticmethod
@@ -748,11 +727,10 @@ class Orchestrator:
     def _handle_active_retry(self, issue, attempt, metadata, settings):
         terminal = self._terminal_state_set(settings)
         active = self._active_state_set(settings)
-        merge_eval = metadata.get("delay_type") == "merge_poll"
         slots = self._candidate_issue(issue, active, terminal, settings) and (
-            merge_eval or (self._available_slots() > 0
+            self._available_slots() > 0
             and self._state_slots_available(issue, settings)
-            and self._worker_slots_available(settings, metadata.get("worker_host"))))
+            and self._worker_slots_available(settings, metadata.get("worker_host")))
         if slots:
             refreshed = self._refresh_issue_for_dispatch(issue, settings)
             if isinstance(refreshed, tuple) and refreshed[0] == "error":
@@ -775,17 +753,13 @@ class Orchestrator:
         self._schedule_issue_retry(issue.id, attempt + 1, metadata, settings)
 
     def _dispatch_refreshed(self, issue, settings, attempt, metadata):
-        if metadata.get("delay_type") == "merge_poll":
-            self._spawn_issue(issue, settings, attempt, None, merge_eval=True)
-            return
         worker_host = self._select_worker_host(settings, metadata.get("worker_host"))
         if worker_host == "no_worker_capacity":
             metadata["identifier"] = issue.identifier
             metadata["error"] = "no available orchestrator slots"
             self._schedule_issue_retry(issue.id, attempt + 1, metadata, settings)
             return
-        self._spawn_issue(issue, settings, attempt, worker_host,
-                        merge_eval=metadata.get("delay_type") == "merge_poll")
+        self._spawn_issue(issue, settings, attempt, worker_host)
 
     def _release_issue_claim(self, issue_id):
         self.claimed.discard(issue_id)
@@ -855,11 +829,6 @@ class Orchestrator:
                 "Issue no longer routed to this worker: %s assignee=%r; "
                 "stopping active agent", _issue_context(issue), issue.assignee_id)
             self._terminate_running_issue(issue.id, False, settings)
-        elif self._github_phase_changed(issue, settings):
-            log.info(
-                "GitHub execution phase changed: %s; restarting with a new "
-                "workflow run", _issue_context(issue))
-            self._terminate_running_issue(issue.id, False, settings)
         elif state_name in active:
             entry = self.running.get(issue.id)
             if entry is not None and entry.get("issue") is not None:
@@ -869,13 +838,6 @@ class Orchestrator:
                 "Issue moved to non-active state: %s state=%s; stopping active agent",
                 _issue_context(issue), issue.state)
             self._terminate_running_issue(issue.id, False, settings)
-
-    def _github_phase_changed(self, issue, settings):
-        entry = self.running.get(issue.id)
-        if entry is None or entry.get("issue") is None:
-            return False
-        return not tracker_adapter.same_workflow_phase(
-            entry["issue"], issue, settings.tracker)
 
     def _reconcile_blocked_issues(self):
         settings = self._store.settings()
@@ -916,8 +878,6 @@ class Orchestrator:
                 "Blocked issue no longer routed to this worker: %s assignee=%r; "
                 "releasing block", _issue_context(issue), issue.assignee_id)
             self._release_issue_claim(issue.id)
-        elif self._github_workflow_reactivated(issue, settings):
-            self._release_issue_claim(issue.id)
         elif state_name in active:
             entry = self.blocked.get(issue.id)
             if entry is not None and entry.get("issue") is not None:
@@ -927,12 +887,6 @@ class Orchestrator:
                 "Blocked issue moved to non-active state: %s state=%s; "
                 "releasing block", _issue_context(issue), issue.state)
             self._release_issue_claim(issue.id)
-
-    def _github_workflow_reactivated(self, issue, settings):
-        entry = self.blocked.get(issue.id)
-        if not (entry and entry.get("github_workflow_waiting")):
-            return False
-        return not tracker_adapter.issue_blocked(issue, settings.tracker)
 
     def _reconcile_stalled_running_issues(self, settings):
         timeout_ms = settings.codex.stall_timeout_ms
@@ -1158,7 +1112,6 @@ class Orchestrator:
                 "codex_output_tokens": entry.get("codex_output_tokens", 0),
                 "codex_total_tokens": entry.get("codex_total_tokens", 0),
                 "turn_count": entry.get("turn_count", 0),
-                "merge_eval": bool(entry.get("merge_eval")),
                 "started_at": entry.get("started_at"),
                 "last_codex_timestamp": entry.get("last_codex_timestamp"),
                 "last_codex_message": entry.get("last_codex_message"),

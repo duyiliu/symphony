@@ -1,258 +1,155 @@
-"""GitHub-only opt-in label routing and least-authority REST tool policy."""
+"""Policy helpers for the GitHub tracker family.
+
+``repo()`` resolves the configured repository; ``allow_request()`` is the
+``github_api`` agent-tool boundary: configured repo only, per-method path
+prefixes and body key allowlists. The worker environment never carries a
+raw GitHub token — the host executes these calls on the agent's behalf.
+"""
 
 import os
 import re
+from urllib.parse import urlsplit
 
-from ..paths import canonicalize, PathSafetyError
-from ..util import normalize_label, present_string
+from ..util import present_string
 from ..workflow import WorkflowError
 
-AGENT_LABEL = "agent"
-PAUSE_LABEL = "needs-human"
-HIGH_RISK_LABEL = "high-risk"
-
-DEFAULT_REVIEW_REQUIRED_PATHS = [
-    "**/*.sql",
-    "**/migrations/**",
-    ".github/workflows/**",
-    "**/.github/workflows/**",
-    "deploy/**",
-    "**/deploy/**",
-    "**/Dockerfile*",
-    "**/docker-compose*.yml",
-    "**/docker-compose*.yaml",
-    "**/*auth*",
-    "**/*permission*",
-    "**/security/**",
-]
-
-DEFAULT_MAX_AUTO_FILES = 100
-
-
-def config(settings):
-    value = getattr(settings, "github_workflow", None)
-    return value if isinstance(value, dict) else {}
-
-
-def enabled(settings):
-    return getattr(settings, "kind", None) == "github" and config(settings).get("enabled") is True
-
-
-def validate(settings):
-    cfg = config(settings)
-    if "enabled" in cfg and not isinstance(cfg["enabled"], bool):
-        raise WorkflowError("invalid_github_workflow_enabled")
-    if not enabled(settings):
-        return
-    required = getattr(settings, "required_labels", []) or []
-    if not _absolute_private_path(cfg.get("state_dir")):
-        raise WorkflowError("invalid_github_workflow_state_dir")
-    if not present_string(cfg.get("base_branch")):
-        raise WorkflowError("missing_github_workflow_base_branch")
-    max_attempts = cfg.get("max_attempts", 3)
-    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts <= 0:
-        raise WorkflowError("invalid_github_workflow_max_attempts")
-    if not _risk_config(cfg.get("risk")):
-        raise WorkflowError("invalid_github_workflow_risk")
-    if cfg.get("merge_policy", "auto") not in ("auto", "manual"):
-        raise WorkflowError("invalid_github_workflow_merge_policy")
-    if any(
-        label in (AGENT_LABEL, PAUSE_LABEL, HIGH_RISK_LABEL, "merge-approved")
-        for label in required
-    ):
-        raise WorkflowError("execution_labels_must_not_be_required_labels")
-    approval = cfg.get("approval_label")
-    if approval is not None:
-        normalized = normalize_label(approval)
-        if not present_string(normalized):
-            raise WorkflowError("invalid_github_workflow_approval_label")
-        if normalized in (AGENT_LABEL, PAUSE_LABEL, HIGH_RISK_LABEL):
-            raise WorkflowError("invalid_github_workflow_approval_label")
-        if normalized in [normalize_label(label) for label in required]:
-            raise WorkflowError("invalid_github_workflow_approval_label")
-
-
-def validate_runtime(settings):
-    tracker = settings.tracker
-    if not enabled(tracker):
-        return
-    try:
-        state_dir = canonicalize(config(tracker)["state_dir"])
-        workspace = canonicalize(settings.workspace.root)
-    except PathSafetyError as error:
-        raise WorkflowError("invalid_github_workflow_state_dir", str(error))
-    if (
-        state_dir == workspace
-        or state_dir.startswith(workspace + os.sep)
-        or workspace.startswith(state_dir + os.sep)
-    ):
-        raise WorkflowError("github_workflow_store_overlaps_workspaces")
-
-
-def _absolute_private_path(path):
-    if not isinstance(path, str):
-        return False
-    normalized = path.replace("\\", "/")
-    if os.name == "nt" and re.match(r"^[A-Za-z]:/", normalized):
-        normalized = normalized[2:]
-    elif not normalized.startswith("/"):
-        return False
-    return len([segment for segment in normalized.split("/") if segment]) >= 2
-
-
-def _risk_config(risk):
-    if risk is None:
-        return True
-    if not isinstance(risk, dict):
-        return False
-    paths = risk.get("review_required_paths")
-    if paths is not None and not (
-        isinstance(paths, list) and all(present_string(item) for item in paths)
-    ):
-        return False
-    max_files = risk.get("max_auto_files")
-    if max_files is not None and not (
-        isinstance(max_files, int) and not isinstance(max_files, bool) and max_files > 0
-    ):
-        return False
-    return all(key in ("review_required_paths", "max_auto_files") for key in risk)
-
-
-def phase(labels):
-    labels = [normalize_label(label) for label in (labels or [])]
-    if AGENT_LABEL in labels and PAUSE_LABEL in labels:
-        return "invalid"
-    if AGENT_LABEL in labels:
-        return "develop"
-    return "waiting"
-
-
-def routable(issue, settings):
-    return issue.routable(getattr(settings, "required_labels", []) or []) and (
-        not enabled(settings) or phase(issue.labels) == "develop"
-    )
-
-
-def same_phase(before, after, settings):
-    return not enabled(settings) or phase(before.labels) == phase(after.labels)
+_API_HOSTS = ("api.github.com", "uploads.github.com")
 
 
 def repo(settings):
-    """Policy-level repo resolution — unlike client ``settings()`` a ``$VAR``
-    reference resolves only against that variable (no fallback chain)."""
-    provider = getattr(settings, "provider", None) or {}
+    provider = settings.provider or {}
     value = provider.get("repo")
     if isinstance(value, str) and value.startswith("$"):
-        return os.environ.get(value[1:]) or ""
-    if isinstance(value, str):
-        return value
-    return os.environ.get("GITHUB_REPO") or ""
+        value = os.environ.get(value[1:])
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
 
 
-def pause_label():
-    return PAUSE_LABEL
+def token(settings):
+    provider = settings.provider or {}
+    value = provider.get("token")
+    if isinstance(value, str) and value.startswith("$"):
+        return os.environ.get(value[1:])
+    return value
 
 
-def high_risk_label():
-    return HIGH_RISK_LABEL
-
-
-def merge_policy(settings):
-    """``auto`` merges low-risk deliveries unattended once gates pass;
-    ``manual`` additionally requires an approval (GitHub review or the
-    configured approval label) for every delivery."""
-    return config(settings).get("merge_policy") or "auto"
-
-
-def approval_label(settings):
-    """Optional opt-in label that counts as a human merge approval.
-
-    Solo-repo setups cannot satisfy GitHub review approvals (the token
-    author cannot approve its own PR), so a repo owner may instead apply
-    this label on the issue to approve the current delivery. Disabled
-    unless configured.
-    """
-    label = config(settings).get("approval_label")
-    return normalize_label(label) if present_string(label) else None
-
-
-def review_required_paths(settings):
-    paths = config(settings).get("risk", {}).get("review_required_paths") if isinstance(
-        config(settings).get("risk"), dict) else None
-    if isinstance(paths, list) and paths:
-        return paths
-    return DEFAULT_REVIEW_REQUIRED_PATHS
-
-
-def max_auto_files(settings):
-    risk = config(settings).get("risk")
-    value = risk.get("max_auto_files") if isinstance(risk, dict) else None
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    return DEFAULT_MAX_AUTO_FILES
-
-
-def max_attempts(settings):
-    return config(settings).get("max_attempts", 3)
-
-
-def allow_request(settings, method, path, body):
-    """Least-authority REST allowlist for the ``github_api`` agent tool."""
-    if not enabled(settings):
+def validate_runtime(settings):
+    """State dir must not collide with the workspace root (board kind)."""
+    if settings.tracker.kind != "board":
         return
-    prefix = "/repos/%s/" % repo(settings)
-    in_repo = path.startswith(prefix)
-    relative = path[len(prefix):] if in_repo else path
-    clean = not any(token in path for token in ("%", "?", "#", "\\", "..", "//"))
-    allowed = clean and in_repo and _allowed_endpoint(method, relative, body)
-    if not allowed:
-        raise WorkflowError("github_workflow_policy_denied")
+    from ..tasks import store as store_mod
+    state_dir = store_mod.state_dir(settings.tracker)
+    root = os.path.abspath(settings.workspace.root or "")
+    directory = os.path.abspath(state_dir or "")
+    if directory == root or directory.startswith(root + os.sep) \
+            or root.startswith(directory + os.sep):
+        raise WorkflowError(
+            "invalid_workflow_config",
+            "tracker provider.state_dir must not overlap workspace.root")
 
 
-_GET_RE = re.compile(r"^(issues|pulls|commits|branches|compare|contents|git/trees|actions/runs|actions/jobs)(/|$)")
-_COMMENT_RE = re.compile(r"^(issues/\d+/comments|pulls/\d+/comments(?:/\d+/replies)?)$")
-_PATCH_RE = re.compile(r"^(?:(?:issues|pulls)/\d+|(?:issues|pulls)/comments/\d+)$")
+# -- github_api allowlist --------------------------------------------------
 
-
-def _allowed_endpoint(method, relative, body):
-    if method == "GET":
-        return bool(_GET_RE.match(relative))
-    if method == "POST":
-        if relative == "pulls":
-            return _keys(body, {"title", "body", "head", "base", "draft", "maintainer_can_modify"})
-        if _COMMENT_RE.match(relative):
-            return _keys(body, {
-                "body", "commit_id", "path", "position", "line", "side",
-                "start_line", "start_side", "in_reply_to", "subject_type",
-            })
+def _allowed_url(url):
+    if not isinstance(url, str):
         return False
-    if method == "PATCH":
-        return bool(_PATCH_RE.match(relative)) and _keys(body, {"title", "body"})
-    return False
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and parsed.hostname in _API_HOSTS
+
+
+def _path_parts(path):
+    if not isinstance(path, str) or not path.startswith("/"):
+        return None
+    if "%" in path or "?" in path or "#" in path or "\\" in path:
+        return None
+    parts = [p for p in path.split("/") if p]
+    if not parts or ".." in parts:
+        return None
+    return parts
 
 
 def _keys(body, allowed):
-    return isinstance(body, dict) and all(key in allowed for key in body)
+    return isinstance(body, dict) and \
+        all(key in allowed for key in body.keys())
 
 
-def path_matches(patterns, path):
-    path = (path or "").lower()
-    return any(re.match(glob_regex(pattern), path) for pattern in patterns)
+# GET prefix set kept broad for read-side flexibility (checks, statuses,
+# reviews, comments, refs, actions, labels, contents).
+_GET_PREFIXES = (
+    "issues", "pulls", "commits", "branches", "compare", "contents",
+    "git", "actions", "labels", "rate_limit",
+)
+
+_POST_LABEL_KEYS = {"labels"}
+_POST_LABEL_CREATE_KEYS = {"name", "color", "description"}
+_POST_ISSUE_KEYS = {"title", "body", "labels", "assignees", "milestone"}
+_POST_PR_KEYS = {"title", "body", "head", "base", "draft",
+                 "maintainer_can_modify", "issue"}
+_POST_COMMENT_KEYS = {"body"}
+_POST_PR_COMMENT_KEYS = {
+    "body", "commit_id", "path", "position", "line", "side",
+    "start_line", "start_side", "in_reply_to", "subject_type",
+}
+_PATCH_ISSUE_KEYS = {"title", "body", "state", "state_reason", "labels"}
+_PATCH_PR_KEYS = {"title", "body", "state", "base"}
+_PATCH_COMMENT_KEYS = {"body"}
+_PUT_MERGE_KEYS = {"sha", "merge_method", "commit_title", "commit_message"}
 
 
-def glob_regex(glob):
-    source = "".join(_glob_token(ch) for ch in glob.lower())
-    source = source.replace("[^/]*[^/]*", ".*")
-    if source.startswith(".*/"):
-        source = "(?:.*/)?" + source[3:]
-    return "^" + source + "$"
+def allow_request(settings, method, url, body):
+    """True when the github_api call stays inside the configured repo and
+    the method/path/key allowlist. Worker token never leaves the host."""
+    if not _allowed_url(url):
+        return False
+    parts = _path_parts(urlsplit(url).path)
+    if not parts:
+        return False
+    if parts[0] != "repos" or len(parts) < 3:
+        return False
+    if "/".join(parts[1:3]) != repo(settings):
+        return False
+    tail = parts[3:]
+    method = method.upper()
+    body = body if body is not None else {}
 
-
-def _glob_token(ch):
-    if ch == "*":
-        return "[^/]*"
-    if ch == "/":
-        return "/"
-    if ch == "?":
-        return "[^/]"
-    return re.escape(ch)
+    if method == "GET":
+        return bool(tail) and tail[0] in _GET_PREFIXES
+    if method == "DELETE":
+        # Workpad / comment deletion only.
+        return len(tail) == 3 and tail[0] == "issues" \
+            and tail[1] == "comments"
+    if method == "PUT":
+        return len(tail) == 3 and tail[0] == "pulls" \
+            and tail[2] == "merge" and _keys(body, _PUT_MERGE_KEYS)
+    if method == "PATCH":
+        if len(tail) == 3 and tail[0] == "issues" and tail[1] == "comments":
+            return _keys(body, _PATCH_COMMENT_KEYS)
+        if len(tail) == 3 and tail[0] == "pulls" and tail[1] == "comments":
+            return _keys(body, _PATCH_COMMENT_KEYS)
+        if len(tail) == 2 and tail[0] == "issues":
+            return _keys(body, _PATCH_ISSUE_KEYS)
+        if len(tail) == 2 and tail[0] == "pulls":
+            return _keys(body, _PATCH_PR_KEYS)
+        return False
+    if method != "POST":
+        return False
+    if tail == ["pulls"]:
+        return _keys(body, _POST_PR_KEYS)
+    if tail == ["issues"]:
+        return _keys(body, _POST_ISSUE_KEYS)
+    if tail == ["labels"]:
+        return _keys(body, _POST_LABEL_CREATE_KEYS)
+    if len(tail) == 3 and tail[0] == "issues" and tail[2] == "comments":
+        return _keys(body, _POST_COMMENT_KEYS)
+    if len(tail) == 3 and tail[0] == "issues" and tail[2] == "labels":
+        # Body is either {"labels": [...]} or a bare list of names.
+        return _keys(body, _POST_LABEL_KEYS) or (
+            isinstance(body, list)
+            and all(isinstance(v, str) for v in body))
+    if len(tail) == 3 and tail[0] == "pulls" and tail[2] == "comments":
+        return _keys(body, _POST_PR_COMMENT_KEYS)
+    return False

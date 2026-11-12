@@ -14,13 +14,34 @@ from .util import normalize_issue_state, present_string
 from .workflow import WorkflowError
 
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SUPPORTED_TRACKER_KINDS = {"github"}
+SUPPORTED_TRACKER_KINDS = {"github", "board"}
 
 DEFAULT_PROMPT_TEMPLATE = """\
-You are working on an issue from the configured tracker.
+You are working on an issue tracked on the local board.
 
 Identifier: {{ issue.identifier }}
 Title: {{ issue.title }}
+Current board state: {{ issue.state }}
+Source URL: {{ issue.url }}
+
+## Tooling
+
+- `task_api` — the board record (the workflow authority). Always
+  `{"action": "get", "issue": "{{ issue.identifier }}"}` first and re-read
+  before acting on state; writes require the `expected_revision` from your
+  last read.
+- `github_api` — GitHub REST for the configured repo (never the `gh` CLI).
+- `git` fetch/push in the shell works over SSH.
+
+## Statuses
+
+Backlog, Todo, In Progress, Human Review, Merging, Rework, then terminal
+Done/Closed/Cancelled/Canceled/Duplicate. On `Todo` first write
+`In Progress`; work finishes at `Human Review`; `Merging` runs the land
+flow (re-read the task before merging); `Rework` is a full reset from
+`origin/main`; all other states are not yours to advance.
+
+## Issue content
 
 Body:
 {% if issue.description %}
@@ -41,7 +62,6 @@ class TrackerSettings:
     provider: dict = field(default_factory=dict)
     secret_environment_names: list = field(default_factory=list)
     required_labels: list = field(default_factory=list)
-    github_workflow: dict = field(default_factory=dict)
     active_states: list = None
     terminal_states: list = None
 
@@ -123,6 +143,7 @@ class ObservabilitySettings:
 class ServerSettings:
     port: int = None
     host: str = "127.0.0.1"
+    api_token: str = None
 
 
 @dataclass
@@ -251,7 +272,6 @@ def parse_settings(config):
         assignee=_opt_str(tracker.get("assignee"), "tracker.assignee", errors),
         provider=_opt_map(tracker.get("provider"), "tracker.provider", errors) or {},
         required_labels=_opt_str_list(tracker.get("required_labels"), "tracker.required_labels", errors) or [],
-        github_workflow=_opt_map(tracker.get("github_workflow"), "tracker.github_workflow", errors) or {},
         active_states=_opt_str_list(tracker.get("active_states"), "tracker.active_states", errors),
         terminal_states=_opt_str_list(tracker.get("terminal_states"), "tracker.terminal_states", errors),
     )
@@ -374,6 +394,7 @@ def parse_settings(config):
     settings.server = ServerSettings(
         port=port,
         host=host if host is not None else "127.0.0.1",
+        api_token=_opt_str(server.get("api_token"), "server.api_token", errors),
     )
 
     if errors:
@@ -391,7 +412,7 @@ def _finalize(settings):
     tracker.project_slug = provider.get("project_slug", tracker.project_slug)
 
     secret_names = []
-    if tracker.kind == "github":
+    if tracker.kind in ("github", "board"):
         secret_names = [
             "GITHUB_TOKEN",
             "GH_TOKEN",

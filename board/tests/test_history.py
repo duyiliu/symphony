@@ -1,4 +1,4 @@
-"""Completed issues exclude deliveries, failures, abandoned issues and PRs."""
+"""Completed views are fed by local terminal task records, not GitHub reads."""
 import importlib.util
 from pathlib import Path
 import unittest
@@ -9,72 +9,66 @@ board = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(board)
 
 
+def record(number, state, **extra):
+    base = {
+        "issue_number": number,
+        "identifier": "GH-%d" % number,
+        "state": state,
+        "revision": 1,
+        "repo": "o/r",
+        "title": "Task %d" % number,
+        "url": "https://github.com/o/r/issues/%d" % number,
+        "native_state": "open",
+        "updated_at": "2026-10-27T01:00:00Z",
+    }
+    base.update(extra)
+    return base
+
+
 class CompletedTests(unittest.TestCase):
-    def setUp(self):
-        self.now = board.datetime.now(board.CN).isoformat()
-        self.closed = {"number": 1, "title": "Done <script>", "closed_at": self.now,
-                       "html_url": "https://github.com/o/r/issues/1", "state": "closed", "state_reason": "completed"}
-        board._history_cache.update(repo=None, events=None, at=0)
-
-    def test_only_completed_issues_are_returned_and_cached(self):
-        rows = [self.closed, {**self.closed, "number": 2, "pull_request": {}},
-                {**self.closed, "number": 3, "state_reason": "not_planned"},
-                {**self.closed, "number": 4, "state": "open"}]
-        with patch.object(board, "load_tracker", return_value=("o/r", "secret")), patch.object(
-            board, "github_request", return_value=rows
-        ) as api, patch.object(board, "scan_sessions", side_effect=AssertionError("not sessions")):
+    def test_only_terminal_states_are_returned(self):
+        now = board.datetime.now(board.CN).isoformat()
+        tasks = [
+            record(1, "Done", updated_at=now),
+            record(2, "Closed", updated_at=now),
+            record(3, "Cancelled", updated_at=now),
+            record(4, "Canceled", updated_at=now),
+            record(5, "Duplicate", updated_at=now),
+            record(6, "Todo"),
+            record(7, "Human Review"),
+            record(8, "Merging"),
+        ]
+        with patch.object(board, "board_tasks", return_value=tasks):
             data = board.completed_data()
-            self.assertEqual([e["number"] for e in data["issues"]], [1])
-            self.assertEqual(data["issues"][0]["title"], "Done <script>")
-            self.assertFalse(data["warning"])
-            board.completed_data()
-            self.assertEqual(api.call_count, 1)
-            self.assertIn("state=closed", api.call_args.args[1])
-            self.assertNotIn("comments", api.call_args.args[1])
+        self.assertEqual(sorted(i["number"] for i in data["issues"]), [1, 2, 3, 4, 5])
+        self.assertFalse(data["warning"])
 
-    def test_pagination_and_sort_by_completion_not_update(self):
-        first = [{**self.closed, "number": n, "closed_at": "2020-01-01T01:00:00Z"} for n in range(1, 101)]
-        second = [{**self.closed, "number": 101}]
-        with patch.object(board, "load_tracker", return_value=("o/r", "secret")), patch.object(
-            board, "github_request", side_effect=[first, second]
-        ) as api:
+    def test_completion_is_sorted_newest_first_and_day_bucketed(self):
+        tasks = [
+            record(1, "Done", updated_at="2026-10-25T01:00:00Z"),
+            record(2, "Done", updated_at="2026-10-27T01:00:00Z"),
+        ]
+        with patch.object(board, "board_tasks", return_value=tasks):
             data = board.completed_data()
-            self.assertEqual(len(data["issues"]), 101)
-            self.assertEqual(data["issues"][0]["number"], 101)
-            self.assertIn("page=2", api.call_args.args[1])
+        self.assertEqual([i["number"] for i in data["issues"]], [2, 1])
+        self.assertEqual(data["issues"][0]["day"], "2026-10-27")
+        self.assertEqual(data["issues"][1]["day"], "2026-10-25")
 
-    def test_merged_pr_is_distinguished_from_closed_unmerged_pr(self):
-        rows = [self.closed,
-                {**self.closed, "number": 2},
-                {"number": 153, "body": "Closes #1", "html_url": "https://github.com/o/r/pull/153",
-                 "pull_request": {"merged_at": self.now}},
-                {"number": 154, "body": "Closes #2", "pull_request": {"merged_at": None}}]
-        with patch.object(board, "load_tracker", return_value=("o/r", "t")), patch.object(
-            board, "github_request", return_value=rows
-        ):
-            issues = {e["number"]: e for e in board.completed_data()["issues"]}
-        self.assertEqual(issues[1]["merged_pr"]["number"], 153)
-        self.assertNotIn("merged_pr", issues[2])
-
-    def test_api_failure_preserves_cache_and_shows_warning(self):
-        board._history_cache.update(repo="o/r", events=[{"number": 1, "at": self.now}], at=0)
-        with patch.object(board, "load_tracker", return_value=("o/r", "secret")), patch.object(
-            board, "github_request", side_effect=OSError("offline")
-        ):
+    def test_merged_pr_comes_from_the_record_not_a_rescan(self):
+        tasks = [
+            record(1, "Done", pr_number=153, pr_url="https://github.com/o/r/pull/153"),
+            record(2, "Done"),
+        ]
+        with patch.object(board, "board_tasks", return_value=tasks):
             data = board.completed_data()
-            self.assertIn("读取失败", data["warning"])
-            self.assertEqual(len(data["issues"]), 1)
+        self.assertEqual(data["issues"][0]["merged_pr"],
+                         {"number": 153, "url": "https://github.com/o/r/pull/153"})
+        self.assertIsNone(data["issues"][1]["merged_pr"])
 
-    def test_beijing_completion_day(self):
-        class Clock(board.datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return cls(2026, 10, 27, 1, tzinfo=board.CN)
-        events = [{**self.closed, "at": "2026-10-26T17:00:00Z"}]
-        with patch.object(board, "datetime", Clock), patch.object(board, "github_history", return_value=(events, "")):
-            data = board.completed_data()
-            self.assertEqual(data["today"], "2026-10-27")
-            self.assertEqual(data["issues"][0]["day"], "2026-10-27")
+    def test_missing_or_bad_timestamps_are_skipped(self):
+        tasks = [record(1, "Done", updated_at=""), record(2, "Done", updated_at="garbage")]
+        with patch.object(board, "board_tasks", return_value=tasks):
+            self.assertEqual(board.completed_data()["issues"], [])
 
 
 if __name__ == "__main__":

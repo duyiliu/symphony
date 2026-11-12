@@ -1,12 +1,13 @@
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from symphony.github import client, workflow_policy  # noqa: E402
 from symphony.github import agent_tool  # noqa: E402
-from symphony.github.workflow_api import GateError  # noqa: E402
 from symphony.agent import pi_runtime  # noqa: E402
 
 
@@ -58,193 +59,138 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(issue.labels, ["agent", "bug"])
 
 
-class PolicyTest(unittest.TestCase):
-    class _T:
-        kind = "github"
-        required_labels = ["agent"]
-        provider = {"repo": "o/r", "token": "t"}
-        github_workflow = {}
+class AllowRequestTest(unittest.TestCase):
+    """github_api policy: configured-repo boundary + method/body allowlist."""
 
-    def test_glob(self):
-        self.assertTrue(workflow_policy.path_matches(
-            ["**/*.sql"], "db/migrate/x.sql"))
-        self.assertTrue(workflow_policy.path_matches(
-            ["deploy/**"], "deploy/foo.service"))
-        self.assertTrue(workflow_policy.path_matches(
-            ["**/Dockerfile*"], "services/api/Dockerfile"))
-        self.assertFalse(workflow_policy.path_matches(
-            ["deploy/**"], "src/deploy.go"))
-        self.assertTrue(workflow_policy.path_matches(
-            ["**/deploy/**"], "src/deploy/x.sh"))
+    _T = SimpleNamespace(
+        kind="board", required_labels=[],
+        provider={"repo": "o/r", "token": "t", "state_dir": "/var/lib/x"})
 
-    def test_phase(self):
-        self.assertEqual(workflow_policy.phase(["agent"]), "develop")
-        self.assertEqual(workflow_policy.phase([]), "waiting")
-        self.assertEqual(
-            workflow_policy.phase(["agent", "needs-human"]), "invalid")
+    def _ok(self, method, url, body=None):
+        return workflow_policy.allow_request(self._T, method, url, body)
 
-    def test_allow_request_disabled_is_permissive(self):
-        # github_workflow not enabled -> allow_request is a no-op
-        workflow_policy.allow_request(self._T, "DELETE", "/repos/o/r/issues/1", None)
+    def test_read_endpoints_allowed(self):
+        self.assertTrue(self._ok(
+            "GET", "https://api.github.com/repos/o/r/issues/1/comments"))
+        self.assertTrue(self._ok(
+            "GET", "https://api.github.com/repos/o/r/pulls/1/reviews"))
+        self.assertTrue(self._ok(
+            "GET", "https://api.github.com/repos/o/r/commits/abc/status"))
+        self.assertTrue(self._ok(
+            "GET", "https://api.github.com/repos/o/r/actions/jobs/9/logs"))
 
-    def test_allow_request_enabled_restricts(self):
-        tracker = self._T()
-        tracker.github_workflow = {
-            "enabled": True,
-            "state_dir": "/var/lib/symphony/github-workflow",
-            "base_branch": "master",
-        }
-        from symphony.workflow import WorkflowError
-        with self.assertRaises(WorkflowError):
-            workflow_policy.allow_request(tracker, "DELETE", "/repos/o/r/issues/1", None)
-        workflow_policy.allow_request(tracker, "GET", "/repos/o/r/issues/1", None)
-        workflow_policy.allow_request(
-            tracker, "POST", "/repos/o/r/issues/1/comments", {"body": "hi"})
-        with self.assertRaises(WorkflowError):
-            workflow_policy.allow_request(
-                tracker, "POST", "/repos/o/r/issues/1/comments",
-                {"body": "hi", "evil": True})
-        with self.assertRaises(WorkflowError):
-            workflow_policy.allow_request(
-                tracker, "GET", "/repos/o/r/../etc", None)
-        with self.assertRaises(WorkflowError):
-            workflow_policy.allow_request(
-                tracker, "GET", "/repos/other/x/issues/1", None)
+    def test_write_endpoints_scoped(self):
+        self.assertTrue(self._ok(
+            "POST", "https://api.github.com/repos/o/r/issues/1/comments",
+            {"body": "hi"}))
+        self.assertTrue(self._ok(
+            "PUT", "https://api.github.com/repos/o/r/pulls/1/merge",
+            {"sha": "a" * 40, "merge_method": "squash"}))
+        self.assertTrue(self._ok(
+            "DELETE", "https://api.github.com/repos/o/r/issues/comments/9"))
+        self.assertTrue(self._ok(
+            "PATCH", "https://api.github.com/repos/o/r/pulls/1",
+            {"state": "closed"}))
 
+    def test_repo_boundary_and_traversal_rejected(self):
+        self.assertFalse(self._ok(
+            "GET", "https://api.github.com/repos/other/x/issues/1"))
+        self.assertFalse(self._ok(
+            "GET", "https://api.github.com/repos/o/r/../etc"))
+        self.assertFalse(self._ok(
+            "GET", "https://api.github.com/orgs/o"))
+        self.assertFalse(self._ok(
+            "GET", "http://api.github.com/repos/o/r/issues/1"))
+        self.assertFalse(self._ok(
+            "GET", "https://evil.example.com/repos/o/r/issues/1"))
 
-class ToolArgumentNormalizeTest(unittest.TestCase):
-    """Models sometimes send `body`/`params` as serialized JSON strings."""
-
-    def test_string_body_coerced_to_dict(self):
-        _m, _p, _pa, body = agent_tool._normalize_arguments({
-            "method": "PATCH", "path": "/repos/o/r/pulls/1",
-            "body": '{"body": "hi"}'})
-        self.assertEqual(body, {"body": "hi"})
-
-    def test_dict_body_passthrough(self):
-        _m, _p, _pa, body = agent_tool._normalize_arguments({
-            "method": "PATCH", "path": "/repos/o/r/pulls/1",
-            "body": {"body": "hi"}})
-        self.assertEqual(body, {"body": "hi"})
-
-    def test_string_params_coerced(self):
-        _m, _p, params, _b = agent_tool._normalize_arguments({
-            "method": "GET", "path": "/repos/o/r/issues/1",
-            "params": '{"per_page": 5}'})
-        self.assertEqual(params, {"per_page": 5})
-
-    def test_invalid_body_rejected_clearly(self):
-        for bad in (42, "not-json", "[1, 2]"):
-            with self.assertRaises(GateError) as ctx:
-                agent_tool._normalize_arguments({
-                    "method": "POST",
-                    "path": "/repos/o/r/issues/1/comments", "body": bad})
-            self.assertEqual(ctx.exception.reason, "invalid_body")
+    def test_disallowed_methods_and_bodies(self):
+        self.assertFalse(self._ok(
+            "DELETE", "https://api.github.com/repos/o/r/pulls/1"))
+        self.assertFalse(self._ok(
+            "PUT", "https://api.github.com/repos/o/r/pulls/1/merge",
+            {"sha": "a" * 40, "merge_method": "squash", "extra": 1}))
+        self.assertFalse(self._ok(
+            "POST", "https://api.github.com/repos/o/r/issues/1/comments",
+            {"body": "hi", "evil": True}))
+        self.assertFalse(self._ok(
+            "PATCH", "https://api.github.com/repos/o/r/issues/1",
+            {"merged": True}))
 
 
-class ApprovalLabelTest(unittest.TestCase):
-    class _T:
-        kind = "github"
-        required_labels = ["agent"]
-        provider = {"repo": "o/r", "token": "t"}
-        github_workflow = {
-            "enabled": True,
-            "state_dir": "/var/lib/symphony/github-workflow",
-            "base_branch": "master",
-            "approval_label": "merge-approved",
-        }
+class ExecuteAgentToolTest(unittest.TestCase):
+    """Tool boundary: relative paths only; failures never reach the wire."""
 
-    def test_approval_label_configured(self):
-        self.assertEqual(
-            workflow_policy.approval_label(self._T), "merge-approved")
+    _T = SimpleNamespace(
+        kind="board", required_labels=[],
+        provider={"repo": "o/r", "token": "t", "state_dir": "/var/lib/x"})
 
-    def test_approval_label_unset(self):
-        tracker = self._T()
-        tracker.github_workflow = dict(tracker.github_workflow)
-        del tracker.github_workflow["approval_label"]
-        self.assertIsNone(workflow_policy.approval_label(tracker))
+    def test_full_url_rejected_as_invalid_arguments(self):
+        result = agent_tool.execute_agent_tool("github_api", {
+            "method": "GET",
+            "path": "https://api.github.com/repos/o/r/issues/1"}, self._T)
+        self.assertEqual(result["error"]["code"], "invalid_arguments")
 
-    def test_label_approved(self):
-        from symphony.github import workflow as gh_workflow
-        self.assertTrue(
-            gh_workflow._label_approved(self._T, ["agent", "merge-approved"]))
-        self.assertFalse(gh_workflow._label_approved(self._T, ["agent"]))
-        tracker = self._T()
-        tracker.github_workflow = dict(tracker.github_workflow)
-        del tracker.github_workflow["approval_label"]
-        self.assertFalse(
-            gh_workflow._label_approved(tracker, ["merge-approved"]))
+    def test_missing_leading_slash_rejected(self):
+        result = agent_tool.execute_agent_tool("github_api", {
+            "method": "GET", "path": "repos/o/r/issues/1"}, self._T)
+        self.assertEqual(result["error"]["code"], "invalid_arguments")
 
-    def test_approval_label_rejects_execution_labels(self):
-        from symphony.workflow import WorkflowError
-        for bad in ("agent", "needs-human", "high-risk", "", "  "):
-            tracker = self._T()
-            tracker.github_workflow = dict(tracker.github_workflow)
-            tracker.github_workflow["approval_label"] = bad
-            with self.assertRaises(WorkflowError):
-                workflow_policy.validate(tracker)
+    def test_forbidden_never_calls_request(self):
+        with patch.object(client, "request") as call:
+            result = agent_tool.execute_agent_tool("github_api", {
+                "method": "DELETE",
+                "path": "/repos/other/x/issues/comments/9"}, self._T)
+        self.assertEqual(result["error"]["code"], "forbidden")
+        call.assert_not_called()
 
-    def test_merge_policy(self):
-        self.assertEqual(workflow_policy.merge_policy(self._T), "auto")
-        tracker = self._T()
-        tracker.github_workflow = dict(
-            tracker.github_workflow, merge_policy="manual")
-        self.assertEqual(workflow_policy.merge_policy(tracker), "manual")
-        tracker.github_workflow = dict(
-            tracker.github_workflow, merge_policy="bogus")
-        from symphony.workflow import WorkflowError
-        with self.assertRaises(WorkflowError):
-            workflow_policy.validate(tracker)
+    def test_allowed_call_reaches_request_with_api_path(self):
+        with patch.object(client, "request",
+                          return_value={"status": 200, "body": {"id": 1}}
+                          ) as call:
+            result = agent_tool.execute_agent_tool("github_api", {
+                "method": "GET", "path": "/repos/o/r/issues/1"}, self._T)
+        self.assertEqual(result["body"], {"id": 1})
+        self.assertEqual(call.call_args.args[1], "/repos/o/r/issues/1")
 
+    def test_non_2xx_surfaces_status_not_exception(self):
+        with patch.object(client, "request",
+                          return_value={"status": 404, "body": {"m": "x"}}):
+            result = agent_tool.execute_agent_tool("github_api", {
+                "method": "GET", "path": "/repos/o/r/issues/1"}, self._T)
+        self.assertEqual(result["status"], 404)
+        self.assertEqual(result["error"]["code"], "github_status")
 
-class ClassifyChecksTest(unittest.TestCase):
-    """Transient check-run conclusions must re-poll, not dispatch repairs."""
+    def test_params_forwarded_for_pagination(self):
+        with patch.object(client, "request",
+                          return_value={"status": 200, "body": [{"id": 2}]}
+                          ) as call:
+            result = agent_tool.execute_agent_tool("github_api", {
+                "method": "GET",
+                "path": "/repos/o/r/issues/1/comments",
+                "params": {"page": 2, "per_page": 100}}, self._T)
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(call.call_args.args[2],
+                         {"page": 2, "per_page": 100})
 
-    SHA = "a" * 40
+    def test_params_must_be_scalar_dict(self):
+        with patch.object(client, "request") as call:
+            for bad in ({"page": {"evil": 1}}, {"page": [1]}, "p=2", 5):
+                result = agent_tool.execute_agent_tool("github_api", {
+                    "method": "GET",
+                    "path": "/repos/o/r/issues/1/comments",
+                    "params": bad}, self._T)
+                self.assertEqual(result["error"]["code"],
+                                 "invalid_arguments")
+        call.assert_not_called()
 
-    def _run(self, conclusion, name="job", status="completed"):
-        return {
-            "name": name, "status": status, "conclusion": conclusion,
-            "head_sha": self.SHA, "id": 1, "app": {"id": 1},
-        }
-
-    def test_success_skipped_pass(self):
-        from symphony.github import workflow as gh_workflow
-        pending, failing = gh_workflow.classify_checks(
-            [self._run("success"), self._run("skipped", "mutation")],
-            [], self.SHA)
-        self.assertEqual(pending, [])
-        self.assertEqual(failing, [])
-
-    def test_null_conclusion_is_pending_not_failing(self):
-        from symphony.github import workflow as gh_workflow
-        pending, failing = gh_workflow.classify_checks(
-            [self._run("success"), self._run(None, "mutation")],
-            [], self.SHA)
-        self.assertEqual(pending, ["mutation"])
-        self.assertEqual(failing, [])
-
-    def test_transient_conclusions_pending(self):
-        from symphony.github import workflow as gh_workflow
-        for conclusion in ("action_required", "startup_failure"):
-            pending, failing = gh_workflow.classify_checks(
-                [self._run(conclusion)], [], self.SHA)
-            self.assertEqual(pending, ["job"])
-            self.assertEqual(failing, [])
-
-    def test_real_failures_still_fail(self):
-        from symphony.github import workflow as gh_workflow
-        for conclusion in ("failure", "timed_out", "cancelled"):
-            _pending, failing = gh_workflow.classify_checks(
-                [self._run(conclusion)], [], self.SHA)
-            self.assertEqual(failing, ["job"])
-
-    def test_in_progress_is_pending(self):
-        from symphony.github import workflow as gh_workflow
-        pending, failing = gh_workflow.classify_checks(
-            [self._run(None, status="in_progress")], [], self.SHA)
-        self.assertEqual(pending, ["job"])
-        self.assertEqual(failing, [])
+    def test_query_string_in_path_still_rejected(self):
+        with patch.object(client, "request") as call:
+            result = agent_tool.execute_agent_tool("github_api", {
+                "method": "GET",
+                "path": "/repos/o/r/issues/1/comments?page=2"}, self._T)
+        self.assertEqual(result["error"]["code"], "invalid_arguments")
+        call.assert_not_called()
 
 
 class PiRuntimeMcpInjectionTest(unittest.TestCase):

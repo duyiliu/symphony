@@ -12,8 +12,10 @@ Python board can consume it unchanged.
 import datetime
 import json
 import logging
+import os
 import re
 import threading
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("symphony.http_api")
@@ -739,7 +741,6 @@ def _running_entry_payload(entry):
         "workspace_path": entry.get("workspace_path"),
         "session_id": entry.get("session_id"),
         "turn_count": entry.get("turn_count", 0),
-        "merge_eval": bool(entry.get("merge_eval")),
         "last_event": entry.get("last_codex_event"),
         "last_message": _summarize_message(entry.get("last_codex_message")),
         "started_at": _iso(entry.get("started_at")),
@@ -789,7 +790,6 @@ def _running_issue_payload(entry):
         "workspace_path": entry.get("workspace_path"),
         "session_id": entry.get("session_id"),
         "turn_count": entry.get("turn_count", 0),
-        "merge_eval": bool(entry.get("merge_eval")),
         "state": entry.get("state"),
         "started_at": _iso(entry.get("started_at")),
         "last_event": entry.get("last_codex_event"),
@@ -851,6 +851,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+            # Flush now: handlers may do best-effort work (e.g. nudging a
+            # refresh) after responding — the client must not wait on it.
+            self.wfile.flush()
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             # Client went away mid-response (timeouts, polling UIs); not a
             # server fault — keep the log clean.
@@ -864,13 +867,218 @@ class _Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _route_exists(path):
-        """Paths that match an Elixir route pattern (405 vs 404 on bad verbs)."""
-        if path in ("/", "/api/v1/state", "/api/v1/refresh"):
+        """Paths that match a served route pattern (405 vs 404 on bad verbs)."""
+        if path in ("/", "/api/v1/state", "/api/v1/refresh",
+                    "/api/v1/tasks", "/api/v1/tasks/import"):
             return True
+        if path.startswith("/api/v1/tasks/"):
+            tail = path[len("/api/v1/tasks/"):]
+            if tail.endswith("/comments") or tail.endswith("/source"):
+                tail = tail.rsplit("/", 1)[0]
+            return tail != "" and "/" not in tail
         if path.startswith("/api/v1/"):
             identifier = path[len("/api/v1/"):]
             return identifier != "" and "/" not in identifier
         return False
+
+    def _mutation_allowed(self):
+        """Write-path auth: loopback clients (the colocated board) or a
+        configured bearer token (``server.api_token`` / GitHub token)."""
+        client_ip = (self.client_address or ("",))[0]
+        if client_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            return True
+        supplied = self.headers.get("Authorization", "")
+        if not supplied.startswith("Bearer "):
+            return False
+        supplied = supplied[len("Bearer "):]
+        settings = self.api.settings()
+        from .github import workflow_policy as policy
+        candidates = []
+        api_token = settings.server.api_token or ""
+        if api_token.startswith("$"):
+            api_token = os.environ.get(api_token[1:], "")
+        if api_token:
+            candidates.append(api_token)
+        gh_token = policy.token(settings.tracker) or ""
+        if gh_token:
+            candidates.append(gh_token)
+        return any(hmac.compare_digest(supplied, c) for c in candidates)
+
+    def _json_body(self, limit=65536):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            return None
+        if not 0 < length <= limit:
+            return None
+        try:
+            return json.loads(self.rfile.read(length))
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    @staticmethod
+    def _tasks_store():
+        from . import workflow_store
+        store = workflow_store.get_store()
+        if store is None:
+            return None, None
+        tracker = store.settings().tracker
+        if tracker.kind != "board":
+            return tracker, None
+        from .tasks import store as store_mod
+        return tracker, store_mod.Store(tracker)
+
+    @staticmethod
+    def _task_number(identifier):
+        try:
+            return int(str(identifier))
+        except (TypeError, ValueError):
+            text = str(identifier).upper()
+            if text.startswith("GH-"):
+                try:
+                    return int(text[3:])
+                except ValueError:
+                    return None
+            return None
+
+    @staticmethod
+    def _task_error_status(code):
+        return {
+            "invalid_state": 400, "invalid_fields": 400,
+            "missing_expected_revision": 400, "invalid_issue": 400,
+            "invalid_body": 400, "issue_not_found": 404,
+            "task_not_found": 404, "not_an_issue": 400,
+            "revision_conflict": 409,
+            "receipt_repository_mismatch": 409,
+            "invalid_task_record": 409,
+            "unsupported_schema_version": 409,
+        }.get(code, 500)
+
+    def _handle_tasks_get(self, tail):
+        if not self._mutation_allowed():
+            return self._error(403, "forbidden", "Authentication required")
+        tracker, task_store = self._tasks_store()
+        if task_store is None:
+            return self._error(404, "not_found",
+                               "Task API requires tracker.kind=board")
+        from .tasks import store as store_mod
+        if tail == "":
+            records, errors = task_store.list()
+            return self._json(200, {
+                "tasks": [store_mod.public_record(r) for r in records],
+                "errors": errors})
+        if tail.endswith("/source"):
+            identifier = tail[:-len("/source")]
+            return self._handle_task_source(identifier)
+        number = self._task_number(tail)
+        if number is None:
+            return self._error(404, "task_not_found", "Task not found")
+        try:
+            record = task_store.get(number)
+        except store_mod.TaskError as error:
+            return self._error(
+                self._task_error_status(error.code), error.code,
+                str(error.detail or error.code))
+        if record is None:
+            return self._error(404, "task_not_found", "Task not found")
+        return self._json(200, {"task": store_mod.public_record(record)})
+
+    def _handle_task_source(self, identifier):
+        """Proxied GitHub detail for the board UI (board holds no token).
+
+        Only registered tasks may be proxied: the record must exist so this
+        endpoint cannot be used to read arbitrary issues of a private repo."""
+        tracker, task_store = self._tasks_store()
+        if tracker is None or tracker.kind != "board":
+            return self._error(404, "not_found",
+                               "Task API requires tracker.kind=board")
+        number = self._task_number(identifier)
+        if number is None:
+            return self._error(404, "task_not_found", "Task not found")
+        from .tasks import store as store_mod
+        try:
+            record = task_store.get(number)
+        except store_mod.TaskError as error:
+            return self._error(
+                self._task_error_status(error.code), error.code,
+                str(error.detail or error.code))
+        if record is None:
+            return self._error(404, "task_not_found", "Task not found")
+        from .github import client as gh_client
+        from .github import workflow_policy as policy
+        repo = policy.repo(tracker)
+        try:
+            issue_res = gh_client.request(
+                "GET", "/repos/%s/issues/%d" % (repo, number), {}, None,
+                tracker)
+        except Exception as error:  # noqa: BLE001
+            return self._error(502, "github_unavailable", str(error))
+        if issue_res["status"] == 404:
+            return self._error(404, "issue_not_found", "Source issue not found")
+        if not (200 <= issue_res["status"] <= 299):
+            return self._error(502, "github_status",
+                             "status=%s" % issue_res["status"])
+        issue = issue_res["body"] or {}
+        workpad = None
+        try:
+            page = 1
+            while page <= 10:
+                res = gh_client.request(
+                    "GET", "/repos/%s/issues/%d/comments" % (repo, number),
+                    {"per_page": 100, "page": page}, None, tracker)
+                if not (200 <= res["status"] <= 299) \
+                        or not isinstance(res["body"], list):
+                    break
+                for row in res["body"]:
+                    text = (row.get("body") or "")
+                    if "## Codex Workpad" in text \
+                            or "## Symphony Workpad" in text:
+                        workpad = {
+                            "id": row.get("id"),
+                            "body": text,
+                            "html_url": row.get("html_url"),
+                        }
+                        break
+                if workpad is not None or len(res["body"]) < 100:
+                    break
+                page += 1
+        except Exception:  # noqa: BLE001 - workpad display is best-effort
+            log.debug("workpad fetch failed for issue %s", number)
+        pr_payload = None
+        from .tasks import store as store_mod
+        try:
+            record = store_mod.Store(tracker).get(number)
+        except Exception:  # noqa: BLE001
+            record = None
+        pr_number = (record or {}).get("pr_number")
+        if isinstance(pr_number, int):
+            try:
+                pr_res = gh_client.request(
+                    "GET", "/repos/%s/pulls/%d" % (repo, pr_number), {},
+                    None, tracker)
+                if 200 <= pr_res["status"] <= 299:
+                    row = pr_res["body"] or {}
+                    pr_payload = {
+                        "number": row.get("number"),
+                        "title": row.get("title"),
+                        "state": row.get("state"),
+                        "merged": row.get("merged_at") is not None,
+                        "html_url": row.get("html_url"),
+                        "head_sha": ((row.get("head") or {}).get("sha")),
+                    }
+            except Exception:  # noqa: BLE001
+                log.debug("pr fetch failed for task %s", number)
+        return self._json(200, {
+            "issue": {
+                "number": issue.get("number"),
+                "title": issue.get("title"),
+                "state": issue.get("state"),
+                "body": issue.get("body"),
+                "html_url": issue.get("html_url"),
+            },
+            "workpad": workpad,
+            "pull_request": pr_payload,
+        })
 
     def do_GET(self):
         path = self._path()
@@ -882,6 +1090,10 @@ class _Handler(BaseHTTPRequestHandler):
             # no dashboard, so a minimal service document is returned instead.
             self._json(200, {"service": "symphony", "status": "ok"})
             return
+        if path == "/api/v1/tasks":
+            return self._handle_tasks_get("")
+        if path.startswith("/api/v1/tasks/"):
+            return self._handle_tasks_get(path[len("/api/v1/tasks/"):])
         if path.startswith("/api/v1/"):
             identifier = path[len("/api/v1/"):]
             if "/" not in identifier and identifier:
@@ -897,6 +1109,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self._path()
+        if path == "/api/v1/tasks/import":
+            return self._handle_task_import()
+        if path.startswith("/api/v1/tasks/") \
+                and path.endswith("/comments"):
+            identifier = path[len("/api/v1/tasks/"):-len("/comments")]
+            return self._handle_task_comment(identifier)
         if path == "/api/v1/refresh":
             payload = refresh_payload(self.api.orchestrator)
             if payload is None:
@@ -906,6 +1124,123 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._method_not_allowed_or_404()
 
+    def _handle_task_import(self):
+        if not self._mutation_allowed():
+            return self._error(403, "forbidden", "Authentication required")
+        tracker, _task_store = self._tasks_store()
+        if tracker is None or tracker.kind != "board":
+            return self._error(404, "not_found",
+                             "Task API requires tracker.kind=board")
+        body = self._json_body()
+        if not isinstance(body, dict):
+            return self._error(400, "invalid_body", "Invalid JSON body")
+        try:
+            number = int(body.get("issue_number"))
+        except (TypeError, ValueError):
+            return self._error(400, "invalid_fields", "issue_number required")
+        from . import tracker as tracker_adapter
+        from .tasks import store as store_mod
+        try:
+            record = tracker_adapter.import_issue_by_number(tracker, number)
+        except store_mod.TaskError as error:
+            return self._error(
+                self._task_error_status(error.code), error.code,
+                str(error.detail or error.code))
+        except Exception as error:  # noqa: BLE001
+            return self._error(502, "github_unavailable", str(error))
+        self._json(200, {"task": store_mod.public_record(record)})
+        try:
+            self.api.orchestrator.request_refresh()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    def _handle_task_comment(self, identifier):
+        """Human comment proxied to the task's own source issue only."""
+        if not self._mutation_allowed():
+            return self._error(403, "forbidden", "Authentication required")
+        tracker, task_store = self._tasks_store()
+        if task_store is None:
+            return self._error(404, "not_found",
+                             "Task API requires tracker.kind=board")
+        number = self._task_number(identifier)
+        if number is None:
+            return self._error(404, "task_not_found", "Task not found")
+        from .tasks import store as store_mod
+        try:
+            record = task_store.get(number)
+        except store_mod.TaskError as error:
+            return self._error(
+                self._task_error_status(error.code), error.code,
+                str(error.detail or error.code))
+        if record is None:
+            return self._error(404, "task_not_found", "Task not found")
+        body = self._json_body()
+        text = (body or {}).get("body") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            return self._error(400, "invalid_fields", "body required")
+        from .github import client as gh_client
+        from .github import workflow_policy as policy
+        try:
+            result = gh_client.request(
+                "POST",
+                "/repos/%s/issues/%d/comments"
+                % (policy.repo(tracker), number),
+                {}, {"body": text}, tracker)
+        except Exception as error:  # noqa: BLE001
+            return self._error(502, "github_unavailable", str(error))
+        if not (200 <= result["status"] <= 299):
+            return self._error(502, "github_status",
+                             "status=%s" % result["status"])
+        row = result["body"] or {}
+        return self._json(201, {"comment": {
+            "id": row.get("id"), "html_url": row.get("html_url")}})
+
+    def do_PATCH(self):
+        path = self._path()
+        if path.startswith("/api/v1/tasks/"):
+            identifier = path[len("/api/v1/tasks/"):]
+            if "/" not in identifier and identifier:
+                return self._handle_task_patch(identifier)
+        return self._method_not_allowed_or_404()
+
+    def _handle_task_patch(self, identifier):
+        if not self._mutation_allowed():
+            return self._error(403, "forbidden", "Authentication required")
+        tracker, task_store = self._tasks_store()
+        if task_store is None:
+            return self._error(404, "not_found",
+                             "Task API requires tracker.kind=board")
+        number = self._task_number(identifier)
+        if number is None:
+            return self._error(404, "task_not_found", "Task not found")
+        body = self._json_body()
+        if not isinstance(body, dict):
+            return self._error(400, "invalid_body", "Invalid JSON body")
+        from .tasks import store as store_mod
+        fields = {
+            key: body[key]
+            for key in ("state", "branch_name", "pr_number", "pr_url",
+                        "pr_head_sha", "workpad_comment_id")
+            if key in body}
+        if not fields:
+            return self._error(400, "invalid_fields", "nothing to update")
+        try:
+            record = task_store.update(
+                number, fields, body.get("expected_revision"), by="board")
+        except store_mod.TaskError as error:
+            return self._error(
+                self._task_error_status(error.code), error.code,
+                str(error.detail or error.code))
+        # Respond first: request_refresh may block on a slow poll and must
+        # never turn an already-persisted write into an unknown outcome.
+        self._json(200, {"task": store_mod.public_record(record)})
+        try:
+            self.api.orchestrator.request_refresh()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
     def _method_not_allowed_or_404(self):
         if self._route_exists(self._path()):
             self._error(405, "method_not_allowed", "Method not allowed")
@@ -914,7 +1249,6 @@ class _Handler(BaseHTTPRequestHandler):
 
     do_PUT = _method_not_allowed_or_404
     do_DELETE = _method_not_allowed_or_404
-    do_PATCH = _method_not_allowed_or_404
     do_HEAD = _method_not_allowed_or_404
     do_OPTIONS = _method_not_allowed_or_404
 

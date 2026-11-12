@@ -318,6 +318,6 @@ def _extract_labels(issue):
 
 
 def request(method, path, params, body, tracker_settings):
-    """Authenticated raw request used by workflow_api and the github_api tool."""
+    """Authenticated raw request used by the github_api tool and task importers."""
     gh_settings = settings(tracker_settings)
     return perform_request(method, path, params or {}, body, gh_settings)
