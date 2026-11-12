@@ -10,9 +10,7 @@ defmodule SymphonyElixir.MixProject do
       start_permanent: Mix.env() == :prod,
       test_coverage: [
         summary: [
-          # Baseline is 93.44%; keep the gate at the current floor so regressions fail
-          # without requiring 100% coverage on process/network-heavy runtime modules.
-          threshold: 93
+          threshold: 100
         ],
         ignore_modules: [
           SymphonyElixir.Asana.Client,

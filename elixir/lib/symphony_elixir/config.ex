@@ -4,7 +4,6 @@ defmodule SymphonyElixir.Config do
   """
 
   alias SymphonyElixir.{Config.Schema, Tracker}
-  alias SymphonyElixir.GitHub.WorkflowPolicy, as: GitHubWorkflowPolicy
   alias SymphonyElixir.{Workflow, WorkflowStore}
 
   @default_prompt_template """
@@ -120,9 +119,7 @@ defmodule SymphonyElixir.Config do
     if is_nil(settings.tracker.kind) do
       {:error, :missing_tracker_kind}
     else
-      with :ok <- Tracker.validate_config(settings.tracker) do
-        GitHubWorkflowPolicy.validate_runtime(settings)
-      end
+      Tracker.validate_config(settings.tracker)
     end
   end
 

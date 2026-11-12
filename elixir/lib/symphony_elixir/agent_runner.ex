@@ -4,9 +4,8 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
+  alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
-  alias SymphonyElixir.GitHub.Workflow, as: GitHubWorkflow
-  alias SymphonyElixir.GitHub.WorkflowPolicy, as: GitHubWorkflowPolicy
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -26,22 +25,11 @@ defmodule SymphonyElixir.AgentRunner do
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    tracker = Config.settings!().tracker
-
-    result =
-      case GitHubWorkflow.begin_run(issue, tracker, Keyword.take(opts, [:github_client])) do
-        :ok -> run_on_worker_host(issue, codex_update_recipient, opts, worker_host)
-        :skip -> :ok
-        :waiting -> exit({:shutdown, :github_workflow_waiting})
-        {:error, _reason} = error -> error
-      end
-
-    case result do
+    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
       :ok ->
         :ok
 
       {:error, reason} ->
-        GitHubWorkflow.record_failure(issue, tracker, reason)
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
     end
@@ -56,7 +44,7 @@ defmodule SymphonyElixir.AgentRunner do
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_agent_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -97,52 +85,24 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
-  defp run_agent_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
-    runtime = runtime_module()
-    opts = Keyword.put(opts, :runtime, runtime)
 
-    with {:ok, session} <- runtime.start_session(workspace, worker_host: worker_host) do
+    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_agent_turns(
-          session,
-          workspace,
-          issue,
-          codex_update_recipient,
-          opts,
-          issue_state_fetcher,
-          1,
-          max_turns
-        )
+        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
-        runtime.stop_session(session)
+        AppServer.stop_session(session)
       end
     end
   end
 
-  defp runtime_module do
-    case Config.settings!().runtime.kind do
-      "pi" -> SymphonyElixir.Agent.Runtime.Pi
-      _ -> SymphonyElixir.Agent.Runtime.Codex
-    end
-  end
-
-  defp do_run_agent_turns(
-         app_session,
-         workspace,
-         issue,
-         codex_update_recipient,
-         opts,
-         issue_state_fetcher,
-         turn_number,
-         max_turns
-       ) do
-    runtime = Keyword.fetch!(opts, :runtime)
+  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
-           runtime.run_turn(
+           AppServer.run_turn(
              app_session,
              prompt,
              issue,
@@ -154,7 +114,7 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_agent_turns(
+          do_run_codex_turns(
             app_session,
             workspace,
             refreshed_issue,
@@ -196,8 +156,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) and
-             GitHubWorkflowPolicy.same_phase?(issue, refreshed_issue, Config.settings!().tracker) do
+        if active_issue_state?(refreshed_issue.state) and issue_routable?(refreshed_issue) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}
@@ -223,7 +182,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp active_issue_state?(_state_name), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    GitHubWorkflow.routable?(issue, Config.settings!().tracker)
+    Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
 
   defp selected_worker_host(nil, []), do: nil
