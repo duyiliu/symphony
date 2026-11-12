@@ -292,13 +292,25 @@ body.dialog-open{overflow:hidden}
 .crow:last-child{border-bottom:0}
 .crow b{color:var(--fg);font-weight:600}
 .cnote{font-size:11px;color:var(--fg3)}
+.runbar{display:flex;flex-wrap:wrap;gap:6px 18px;margin:2px 0 14px;font-size:11.5px;color:var(--fg3)}
+.runbar b{color:var(--fg);font-weight:600}
+.runlist{border:1px solid var(--edge);border-radius:8px;background:var(--panel);overflow:hidden}
+.runrow{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--edge);text-decoration:none;color:inherit;transition:background .12s}
+.runrow:last-child{border-bottom:0}
+.runrow:hover{background:var(--elev)}
+.runrow .dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--fg3)}
+.runrow .dot.live{background:var(--ok)}
+.rr-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.rr-time{display:flex;align-items:center;gap:8px;font:12px var(--mono);color:var(--fg)}
+.rr-sub{font-size:11px;color:var(--fg3)}
+.rr-go{flex:none;color:var(--fg3);font-size:16px;line-height:1}
+.runrow:hover .rr-go{color:var(--info)}
 .state-idle{opacity:.92}
 .bquick{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;opacity:0;transition:opacity .12s}.bcard:hover .bquick,.bcard:focus-within .bquick{opacity:1}
 .bqbtn{min-height:24px;padding:2px 8px;border:1px solid var(--edge2);border-radius:5px;background:transparent;color:var(--fg2);font:11px var(--sans);cursor:pointer;transition:color .12s,border-color .12s}
 .bqbtn:hover{color:var(--fg);border-color:var(--fg3)}
 .bqbtn.back:hover{color:var(--warn);border-color:rgba(251,191,36,.35)}
-.dhist{margin-top:6px;border:1px solid var(--edge);border-radius:6px;background:var(--card);padding:4px 12px}
-.dhrow{display:flex;align-items:baseline;gap:8px;padding:7px 0;border-bottom:1px solid var(--edge);font-size:11.5px;color:var(--fg2)}
+.dhist{margin-top:6px;border:1px solid var(--edge);border-radius:6px;background:var(--card);padding:4px 12px}.dhrow{display:flex;align-items:baseline;gap:8px;padding:7px 0;border-bottom:1px solid var(--edge);font-size:11.5px;color:var(--fg2)}
 .dhrow:last-child{border-bottom:0}
 .dhdot{flex:none;width:5px;height:5px;border-radius:50%;background:var(--edge2);margin-top:5px}
 .dhmain{flex:1;min-width:0;overflow-wrap:anywhere}
@@ -330,7 +342,14 @@ body.dialog-open{overflow:hidden}
 .fbtn::before{content:"●";font-size:5px;vertical-align:1px}
 .fbtn[aria-pressed="true"]{color:var(--ok);border-color:rgba(52,211,153,.35)}
 .log-body{margin:0 12px 10px;max-height:320px;overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--edge);border-radius:4px;background:var(--sunken);padding:8px 10px;font:10.5px/1.7 var(--mono)}
-.msg{margin:0}
+.msg{margin:0;padding:10px 14px;border-bottom:1px solid var(--edge);transition:background .12s}
+#feed .msg:hover{background:rgba(255,255,255,.025)}
+.msg[data-role="user"]{background:rgba(56,189,248,.05);box-shadow:inset 2px 0 0 rgba(56,189,248,.55)}
+.msg[data-role="tool"]{box-shadow:inset 2px 0 0 rgba(167,139,250,.4)}
+.msg[data-role="meta"]{background:rgba(251,113,133,.06)}
+.msg.collapsed .ln.say,.msg.collapsed .ln.user,.msg.collapsed .ln.tool .out{max-height:240px;overflow:hidden;-webkit-mask-image:linear-gradient(#000 65%,transparent);mask-image:linear-gradient(#000 65%,transparent)}
+.msg .expand{margin-top:4px;font-size:11px;color:var(--info);cursor:pointer;background:none;border:0;padding:0}
+.msg .expand:hover{text-decoration:underline}
 .log-body .msg+.msg,#feed .msg+.msg{margin-top:6px}
 .ln{margin:0}
 .ln.say{color:var(--fg);white-space:pre-wrap;word-break:break-word}
@@ -1975,39 +1994,50 @@ def issue_page(name):
         record, agent_status(symphony_state()).get(name))
     label_text, badge_cls = STATUS_UI.get(tone, STATUS_UI["idle"])
 
-    header = (
-        "<h1>%s <span class='badge %s'>%s</span></h1>"
-        "<div class='meta'><a href='/'>返回全部 issue</a> &middot; "
-        "<a href='/live/%s'>实时视图</a> &middot; %d 次运行</div>"
-        % (esc(name), esc(badge_cls), esc(label_text), esc(name), len(entries))
-    )
-
     if not entries:
+        header = (
+            "<h1>%s <span class='badge %s'>%s</span></h1>"
+            "<div class='meta'><a href='/'>返回全部 issue</a> &middot; "
+            "<a href='/live/%s'>实时视图</a></div>"
+            % (esc(name), esc(badge_cls), esc(label_text), esc(name))
+        )
         return page(name, header + "<div class='empty'>该 issue 还没有运行记录</div>")
 
     cards = []
+    total_msgs = 0
     for position, run in enumerate(reversed(entries), 1):
         href = "/run/%s/%s" % (name, run["short"])
         latest = "<span class='badge ready'>最新</span>" if position == 1 else ""
+        total_msgs += run["messages"]
+        live_dot = "live" if run.get("live") else "idle"
         cards.append(
-            "<div class='card state-idle'>"
-            "<div class='cardhead'><span class='ico idle'>%s</span>"
-            "<a class='title' href='%s'>%s</a>%s</div>"
-            "<div class='sub'>%s &middot; %d 条消息 &middot; %s</div>"
-            "<div class='right'><span class='count'>%s</span></div></div>"
+            "<a class='runrow' href='%s'>"
+            "<span class='dot %s'></span>"
+            "<span class='rr-main'><span class='rr-time'>%s%s</span>"
+            "<span class='rr-sub'>%d 条消息 · %s · %s</span></span>"
+            "<span class='rr-go'>›</span></a>"
             % (
-                ICONS["idle"],
                 esc(href),
+                live_dot,
                 esc(run["started"]),
                 latest,
-                human_size(run["size"]),
                 run["messages"],
-                esc(run["short"]),
                 human_size(run["size"]),
+                esc(run["short"]),
             )
         )
 
-    return page(name, header + "".join(cards))
+    header = (
+        "<h1>%s <span class='badge %s'>%s</span></h1>"
+        "<div class='meta'><a href='/'>返回全部 issue</a> &middot; "
+        "<a href='/live/%s'>实时视图</a></div>"
+        "<div class='runbar'><span><b>%d</b> 次运行</span>"
+        "<span><b>%d</b> 条消息</span>"
+        "<span>最近 <b>%s</b></span></div>"
+        % (esc(name), esc(badge_cls), esc(label_text), esc(name),
+           len(entries), total_msgs, esc(entries[-1]["started"]))
+    )
+    return page(name, header + "<div class='runlist'>" + "".join(cards) + "</div>")
 
 
 def run_page(issue, short):
@@ -2084,7 +2114,8 @@ def render_record(record):
     if role == "user":
         text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
         if text:
-            lines.append("<div class='ln mark'>[%s] 用户</div>" % stamp)
+            label = ("[%s] " % stamp) if stamp else ""
+            lines.append("<div class='ln mark'>%s用户</div>" % label)
             lines.append("<div class='ln user'>%s</div>" % esc(clip(text, TEXT_LIMIT)))
     elif role == "toolResult":
         text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
@@ -2119,7 +2150,7 @@ def render_record(record):
 
     if not lines:
         return ""
-    return "<div class='msg'>%s</div>" % "".join(lines)
+    return "<div class='msg' data-role='%s'>%s</div>" % (esc(role or ''), "".join(lines))
 
 
 def clip(text, limit):
@@ -2236,7 +2267,7 @@ def live_block_html(bid, block):
         return inner
     if kind == "meta":
         return (
-            "<div class='msg' data-bid='%s'><div class='ln mark err'>%s</div></div>"
+            "<div class='msg' data-role='meta' data-bid='%s'><div class='ln mark err'>%s</div></div>"
             % (esc(bid), block.get("text", ""))
         )
     if kind == "tool":
@@ -2245,7 +2276,7 @@ def live_block_html(bid, block):
         tm = ("✗ " if err else "✓ ") + esc(block.get("time", "")) + state
         out = block.get("out") or ""
         return (
-            "<div class='msg' data-bid='%s'><div class='ln tool%s'>"
+            "<div class='msg' data-role='tool' data-bid='%s'><div class='ln tool%s'>"
             "<div class='th'>▶ %s</div>%s<div class='tm'>%s</div></div></div>"
             % (
                 esc(bid),
@@ -2277,7 +2308,7 @@ def live_block_html(bid, block):
             "<div class='ln tokens'>tokens in=%s out=%s</div>"
             % (usage.get("input"), usage.get("output"))
         )
-    return "<div class='msg' data-bid='%s'>%s</div>" % (esc(bid), "".join(parts))
+    return "<div class='msg' data-role='assistant' data-bid='%s'>%s</div>" % (esc(bid), "".join(parts))
 
 
 def live_feed(st, record):
@@ -2566,6 +2597,15 @@ def live_page(issue, entries):
     body = """
 <h1>%(issue)s <span id='status' class='%(state)s'>%(label)s</span></h1>
 <div class='meta'>%(started)s · %(short)s · <a href='/issue/%(issue)s'>runs</a> · <a href='/'>all issues</a><span id='trim'></span></div>
+<div class='tools'>
+  <button class='chip on' id='follow'>跟随最新</button>
+  <button class='chip on' data-filter='all'>全部</button>
+  <button class='chip' data-filter='assistant'>助手</button>
+  <button class='chip' data-filter='tool'>工具</button>
+  <button class='chip' data-filter='user'>用户</button>
+  <span class='grow'></span>
+  <span class='meta' id='counter'></span>
+</div>
 <div id='detail' class='meta'></div>
 <div id='feed'>%(fragment)s</div>
 <script>
@@ -2575,6 +2615,9 @@ const MAX_MSGS = 400;
 let offset = %(offset)d;
 let AGENT = null;
 let skipped = 0;
+let FOLLOW = true;
+let FILTER = 'all';
+
 function trimFeed() {
   const feed = document.getElementById('feed');
   if (!feed) { return; }
@@ -2587,6 +2630,59 @@ function trimFeed() {
     if (t) { t.textContent = ' · 顶部已省略 ' + skipped + ' 条'; }
   }
 }
+
+function collapseLong(root) {
+  (root || document).querySelectorAll('.msg').forEach(function (m) {
+    if (m.dataset.collapseChecked) { return; }
+    m.dataset.collapseChecked = '1';
+    const targets = m.querySelectorAll('.ln.say, .ln.user, .ln.tool .out');
+    let tall = false;
+    targets.forEach(function (el) { if (el.scrollHeight > 320) { tall = true; } });
+    if (!tall) { return; }
+    m.classList.add('collapsed');
+    const btn = document.createElement('button');
+    btn.className = 'expand';
+    btn.textContent = '展开全文';
+    btn.addEventListener('click', function () {
+      const open = m.classList.toggle('collapsed');
+      btn.textContent = open ? '展开全文' : '收起';
+    });
+    m.appendChild(btn);
+  });
+}
+
+function applyFilter() {
+  const feed = document.getElementById('feed');
+  if (!feed) { return; }
+  let shown = 0;
+  feed.querySelectorAll('.msg').forEach(function (m) {
+    const role = m.getAttribute('data-role') || '';
+    let keep = true;
+    if (FILTER === 'assistant') { keep = role === 'assistant'; }
+    else if (FILTER === 'tool') { keep = role === 'tool' || !!m.querySelector('.ln.tool'); }
+    else if (FILTER === 'user') { keep = role === 'user'; }
+    m.hidden = !keep;
+    if (keep) { shown += 1; }
+  });
+  const c = document.getElementById('counter');
+  if (c) { c.textContent = shown + ' / ' + feed.querySelectorAll('.msg').length + ' 条'; }
+}
+
+document.querySelectorAll('[data-filter]').forEach(function (b) {
+  b.addEventListener('click', function () {
+    FILTER = b.getAttribute('data-filter');
+    document.querySelectorAll('[data-filter]').forEach(function (x) {
+      x.classList.toggle('on', x === b);
+    });
+    applyFilter();
+  });
+});
+document.getElementById('follow').addEventListener('click', function (e) {
+  FOLLOW = !FOLLOW;
+  e.target.classList.toggle('on', FOLLOW);
+  if (FOLLOW) { window.scrollTo(0, document.body.scrollHeight); }
+});
+
 function ago(iso) {
   if (!iso) { return ""; }
   const s = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
@@ -2613,10 +2709,11 @@ async function tick() {
     AGENT = data.agent || null;
     if (data.html) {
       const feed = document.getElementById('feed');
-      const pinned = window.innerHeight + window.scrollY >= document.body.scrollHeight - 120;
       feed.insertAdjacentHTML('beforeend', data.html);
       trimFeed();
-      if (pinned) window.scrollTo(0, document.body.scrollHeight);
+      collapseLong(feed);
+      applyFilter();
+      if (FOLLOW) { window.scrollTo(0, document.body.scrollHeight); }
     }
     const el = document.getElementById('status');
     const live = data.running || !!AGENT;
@@ -2627,6 +2724,9 @@ async function tick() {
 }
 setInterval(tick, 1000);
 setInterval(draw, 1000);
+collapseLong();
+applyFilter();
+if (FOLLOW) { window.scrollTo(0, document.body.scrollHeight); }
 </script>
 """ % {
         "issue": esc(issue),
