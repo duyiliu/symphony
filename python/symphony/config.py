@@ -1,8 +1,7 @@
 """Runtime configuration loaded from WORKFLOW.md front matter.
 
 Mirrors SymphonyElixir.Config.Schema: typed sections, defaults, validation and
-environment indirection. Only the GitHub tracker kind is supported by this
-implementation; other kinds fail validation with ``unsupported_tracker_kind``.
+environment indirection. Linear is the default tracker for the preserved Python/Pi implementation.
 """
 
 import os
@@ -14,43 +13,17 @@ from .util import normalize_issue_state, present_string
 from .workflow import WorkflowError
 
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SUPPORTED_TRACKER_KINDS = {"github", "board"}
+SUPPORTED_TRACKER_KINDS = {"linear", "github", "board"}
 
-DEFAULT_PROMPT_TEMPLATE = """\
-You are working on an issue tracked on the local board.
-
-Identifier: {{ issue.identifier }}
+DEFAULT_PROMPT_TEMPLATE = """\\
+You are working on Linear issue {{ issue.identifier }}.
 Title: {{ issue.title }}
-Current board state: {{ issue.state }}
-Source URL: {{ issue.url }}
+Status: {{ issue.state }}
+URL: {{ issue.url }}
 
-## Tooling
-
-- `task_api` — the board record (the workflow authority). Always
-  `{"action": "get", "issue": "{{ issue.identifier }}"}` first and re-read
-  before acting on state; writes require the `expected_revision` from your
-  last read.
-- `github_api` — GitHub REST for the configured repo (never the `gh` CLI).
-- `git` fetch/push in the shell works over SSH.
-
-## Statuses
-
-Backlog, Todo, In Progress, Human Review, Merging, Rework, then terminal
-Done/Closed/Cancelled/Canceled/Duplicate. On `Todo` first write
-`In Progress`; work finishes at `Human Review`; `Merging` runs the land
-flow (re-read the task before merging); `Rework` is a full reset from
-`origin/main`; all other states are not yours to advance.
-
-## Issue content
-
-Body:
-{% if issue.description %}
-{{ issue.description }}
-{% else %}
-No description provided.
-{% endif %}
+Use the host-provided linear_graphql tool for issue state, comments and links.
+Follow the repository's workflow policy and keep the workpad current.
 """
-
 
 @dataclass
 class TrackerSettings:
@@ -409,10 +382,17 @@ def _finalize(settings):
     provider = _normalize_keys(tracker.provider) or {}
     tracker.provider = provider
     tracker.endpoint = provider.get("endpoint", tracker.endpoint)
+    if tracker.kind == "linear" and tracker.endpoint is None:
+        tracker.endpoint = "https://api.linear.app/graphql"
     tracker.project_slug = provider.get("project_slug", tracker.project_slug)
+    tracker.api_key = provider.get("api_key", tracker.api_key)
+    tracker.assignee = provider.get("assignee", tracker.assignee)
 
     secret_names = []
-    if tracker.kind in ("github", "board"):
+    if tracker.kind == "linear":
+        secret_names = ["LINEAR_API_KEY"] + env_reference_names(
+            [tracker.api_key])
+    elif tracker.kind in ("github", "board"):
         secret_names = [
             "GITHUB_TOKEN",
             "GH_TOKEN",
