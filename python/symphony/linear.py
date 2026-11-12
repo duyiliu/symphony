@@ -9,10 +9,10 @@ import logging
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-from ..config import resolve_env_setting
-from ..issue import Issue
-from ..util import normalize_issue_state, normalize_label, parse_datetime, present_string
-from ..workflow import WorkflowError
+from .config import resolve_env_setting
+from .issue import Issue
+from .util import normalize_issue_state, normalize_label, parse_datetime, present_string
+from .workflow import WorkflowError
 
 log = logging.getLogger("symphony.linear")
 PAGE_SIZE = 50
