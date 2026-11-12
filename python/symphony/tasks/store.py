@@ -194,6 +194,7 @@ def public_record(record):
         "revision", "branch_name", "pr_number", "pr_url", "pr_head_sha",
         "workpad_comment_id", "title", "url", "native_state", "labels",
         "blocked_reason", "last_error", "updated_at", "created_at",
+        "history",
     ) if key in record}
 
 

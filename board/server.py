@@ -119,9 +119,12 @@ a{color:inherit;text-decoration:none}
 .completed-description summary{cursor:pointer;margin-top:8px;min-height:32px}
 .completed-card:focus-visible,.chip:focus-visible{outline:2px solid var(--info);outline-offset:2px}
 .board{flex:1;min-height:0;display:flex;gap:12px;padding:12px 16px 16px;overflow-x:auto;overflow-y:hidden}
-.col{display:flex;flex-direction:column;flex:1 1 0;min-width:232px;min-height:0;border:1px solid var(--edge);border-radius:8px;background:var(--panel)}
+.col{display:flex;flex-direction:column;flex:1 1 0;min-width:232px;max-width:360px;min-height:0;border:1px solid var(--edge);border-radius:8px;background:var(--panel)}
 .col[hidden]{display:none}
 .col.is-empty .empty-col{padding:14px 10px}
+.bcard.dragging{opacity:.45}
+.col.drop-target{border-color:var(--info);background:rgba(56,189,248,.06)}
+.col.drop-target .chead{color:var(--info)}
 .col-head{flex:none;display:flex;align-items:flex-start;gap:8px;padding:10px 12px 8px}
 .cdot{flex:none;width:6px;height:6px;border-radius:50%;margin-top:6px;background:var(--fg3)}
 .cdot.backlog{background:var(--fg3)}
@@ -273,6 +276,37 @@ body.dialog-open{overflow:hidden}
 .mpr{color:var(--info)}
 .mpr:hover{text-decoration:underline}
 .dnote{margin:14px 0 2px;font-size:11px;color:var(--fg3)}
+.dnote.warn{color:var(--warn)}
+.dsub{margin-top:3px;font-size:11px;color:var(--fg3);overflow-wrap:anywhere}
+.dgrid{margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px 20px;border:1px solid var(--edge);border-radius:6px;background:var(--card);padding:11px 12px}
+.dk{font-size:10px;color:var(--fg3);letter-spacing:.02em}
+.dv{margin-top:1px;font-size:12px;color:var(--fg);overflow-wrap:anywhere}
+.dpre{margin:6px 0 0;padding:10px 12px;border:1px solid var(--edge);border-radius:6px;background:var(--card);color:var(--fg2);font:11px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow:auto}
+.dactions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.drun{padding:6px 0;border-bottom:1px solid var(--edge);font-size:11px}
+.drun:last-child{border-bottom:0}
+.drun a{color:var(--fg2);text-decoration:none}
+.drun a:hover{color:var(--fg)}
+.drun.live a{color:var(--ok)}
+.crow{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;padding:8px 12px;border-bottom:1px solid var(--edge);font-size:12px;color:var(--fg2);overflow-wrap:anywhere}
+.crow:last-child{border-bottom:0}
+.crow b{color:var(--fg);font-weight:600}
+.cnote{font-size:11px;color:var(--fg3)}
+.state-idle{opacity:.92}
+.bquick{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;opacity:0;transition:opacity .12s}.bcard:hover .bquick,.bcard:focus-within .bquick{opacity:1}
+.bqbtn{min-height:24px;padding:2px 8px;border:1px solid var(--edge2);border-radius:5px;background:transparent;color:var(--fg2);font:11px var(--sans);cursor:pointer;transition:color .12s,border-color .12s}
+.bqbtn:hover{color:var(--fg);border-color:var(--fg3)}
+.bqbtn.back:hover{color:var(--warn);border-color:rgba(251,191,36,.35)}
+.dhist{margin-top:6px;border:1px solid var(--edge);border-radius:6px;background:var(--card);padding:4px 12px}
+.dhrow{display:flex;align-items:baseline;gap:8px;padding:7px 0;border-bottom:1px solid var(--edge);font-size:11.5px;color:var(--fg2)}
+.dhrow:last-child{border-bottom:0}
+.dhdot{flex:none;width:5px;height:5px;border-radius:50%;background:var(--edge2);margin-top:5px}
+.dhmain{flex:1;min-width:0;overflow-wrap:anywhere}
+.dhmain b{color:var(--fg);font-weight:600}
+.dhby{color:var(--fg3)}
+.dhtime{flex:none;font:10.5px var(--mono);color:var(--fg3);white-space:nowrap}
+#dcomment{display:block;box-sizing:border-box;width:100%;min-height:72px;max-height:220px;margin-top:6px;padding:9px 10px;border:1px solid var(--edge2);border-radius:8px;background:var(--sunken);color:var(--fg);font:12px/1.6 var(--sans);outline:none;resize:vertical;transition:border-color .12s,box-shadow .12s}
+#dcomment:focus{border-color:rgba(56,189,248,.55);box-shadow:0 0 0 3px rgba(56,189,248,.12)}
 .run{margin-top:8px;border:1px solid var(--edge);border-radius:6px;background:var(--card);overflow:hidden}
 .run-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--edge)}
 .run-idx{font:11px var(--mono);color:var(--fg)}
@@ -408,7 +442,7 @@ let BUSY = false, TOAST_TIMER = null, OPEN_SEQ = 0;
 let CUR_REV = null, CUR_SOURCE = null, CUR_SOURCE_ERR = null;
 const PENDING = new Map();
 const POSTED = new Map();
-let SHOW_EMPTY = localStorage.getItem('sb-show-empty') !== '0';
+let SHOW_EMPTY = true;
 
 function esc(s) {
   const d = document.createElement('div');
@@ -578,13 +612,30 @@ async function openIssue(issue) {
   dbody.innerHTML = "<div class='dnote'>加载中…</div>";
   let runs = {runs: [], agent: null, trouble: null};
   let source = null, sourceErr = null;
-  try { runs = await (await fetch('/api/runs/' + encodeURIComponent(issue))).json(); } catch (e) {}
-  try {
-    const sr = await fetch('/api/source/' + encodeURIComponent(issue));
-    const sd = await sr.json().catch(function () { return {}; });
-    if (sr.ok) { source = sd; }
-    else { sourceErr = sd.error || ('来源接口返回 ' + sr.status); }
-  } catch (e) { sourceErr = '网络异常'; }
+  // 先渲染本地已有数据（状态/修订/标签/分支），GitHub 内容后补，
+  // 避免抽屉打开前等一次完整网络往返。
+  const fact = FACTS[issue] || {};
+  CUR_REV = (fact.rev === undefined || fact.rev === null) ? null : fact.rev;
+  const preCard = boardEl.querySelector(".bcard[data-issue='" + issue + "']");
+  const preTitle = preCard ? preCard.getAttribute('data-title') : issue;
+  dhead.innerHTML = "<button class='dclose' id='dclose' title='关闭'>&#8249;</button>" +
+    "<div class='dtitle'>" + esc(preTitle || issue) +
+    "<div class='dsub'>" + esc(issue) + '</div></div>';
+  renderDrawer(fact, null, null, true);
+  const [runsRes, srcRes] = await Promise.allSettled([
+    fetch('/api/runs/' + encodeURIComponent(issue)).then(function (r) { return r.json(); }),
+    fetch('/api/source/' + encodeURIComponent(issue)).then(async function (r) {
+      const body = await r.json().catch(function () { return {}; });
+      return {ok: r.ok, status: r.status, body: body};
+    })
+  ]);
+  if (runsRes.status === 'fulfilled' && runsRes.value) { runs = runsRes.value; }
+  if (srcRes.status === 'fulfilled' && srcRes.value) {
+    if (srcRes.value.ok) { source = srcRes.value.body; }
+    else { sourceErr = srcRes.value.body.error || ('来源接口返回 ' + srcRes.value.status); }
+  } else {
+    sourceErr = '网络异常';
+  }
   if (seq !== OPEN_SEQ || CUR !== issue) { return; }
   RUNS = runs.runs || [];
   AGENT = runs.agent;
@@ -609,7 +660,7 @@ async function openIssue(issue) {
   renderDrawer(f, source, sourceErr);
 }
 
-function renderDrawer(f, source, sourceError) {
+function renderDrawer(f, source, sourceError, loading) {
   const dbody = document.getElementById('dbody');
   const state = f.state || 'Backlog';
   const rev = (f.rev === undefined || f.rev === null) ? '—' : f.rev;
@@ -629,7 +680,9 @@ function renderDrawer(f, source, sourceError) {
   html += "<div class='dgrid'>" + meta.map(function (kv) {
     return "<div class='dk'>" + esc(kv[0]) + "</div><div class='dv'>" + esc(kv[1]) + '</div>';
   }).join('') + '</div>';
-  if (sourceError) {
+  if (loading) {
+    html += '<h3>源 Issue</h3><div class="dnote">加载中…</div>';
+  } else if (sourceError) {
     html += '<h3>源 Issue</h3><div class="dnote warn">来源加载失败：' +
       esc(sourceError) + '；可关闭抽屉重新打开重试。</div>';
   } else if (source && source.issue) {
@@ -646,6 +699,18 @@ function renderDrawer(f, source, sourceError) {
     const p = source.pull_request;
     html += '<h3>PR</h3><div class="dnote">#' + esc(p.number) + ' ' + esc(p.title || '') +
       ' · ' + esc(p.state || '') + (p.merged ? ' · 已合并' : '') + '</div>';
+  }
+  const hist = (source && source.task && source.task.history) || [];
+  if (hist.length) {
+    html += '<h3>活动</h3><div class="dhist">' + hist.slice().reverse().map(function (h) {
+      const from = h.from ? esc(h.from) : '新建';
+      const to = esc(h.to || '');
+      const by = h.by ? esc(h.by) : '';
+      return "<div class='dhrow'><span class='dhdot'></span>" +
+        "<span class='dhmain'>" + from + ' → <b>' + to + '</b>' +
+        (by ? " <span class='dhby'>· " + by + '</span>' : '') + '</span>' +
+        "<span class='dhtime'>" + esc(fmtWhen(h.at)) + '</span></div>';
+    }).join('') + '</div>';
   }
   html += '<h3>移动到</h3><div class="dactions">' + STATES.map(function (s) {
     const dis = (s === state) ? ' disabled' : '';
@@ -707,8 +772,59 @@ document.addEventListener('keydown', function (e) {
 });
 
 boardEl.addEventListener('click', function (e) {
+  const qb = e.target.closest('.bqbtn');
+  if (qb) {
+    e.preventDefault();
+    e.stopPropagation();
+    submitMove(qb.getAttribute('data-issue'), qb.getAttribute('data-target'), '');
+    return;
+  }
   const card = e.target.closest('.bcard');
   if (card && !e.target.closest('a')) { openIssue(card.getAttribute('data-issue')); }
+});
+
+// --- 拖拽改状态：卡片拖到另一列即可流转 ---------------------------------
+const COL_STATE = {
+  backlog: 'Backlog', todo: 'Todo', in_progress: 'In Progress',
+  human_review: 'Human Review', merging: 'Merging', rework: 'Rework', done: 'Done'
+};
+
+boardEl.addEventListener('dragstart', function (e) {
+  const card = e.target.closest('.bcard');
+  if (!card) { return; }
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', card.getAttribute('data-issue'));
+  card.classList.add('dragging');
+});
+boardEl.addEventListener('dragend', function (e) {
+  const card = e.target.closest('.bcard');
+  if (card) { card.classList.remove('dragging'); }
+  document.querySelectorAll('.col.drop-target').forEach(function (c) {
+    c.classList.remove('drop-target');
+  });
+});
+
+document.querySelectorAll('.col').forEach(function (col) {
+  const lane = col.getAttribute('data-col');
+  col.addEventListener('dragover', function (e) {
+    if (!COL_STATE[lane]) { return; }
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    col.classList.add('drop-target');
+  });
+  col.addEventListener('dragleave', function (e) {
+    if (!col.contains(e.relatedTarget)) { col.classList.remove('drop-target'); }
+  });
+  col.addEventListener('drop', function (e) {
+    e.preventDefault();
+    col.classList.remove('drop-target');
+    const issue = e.dataTransfer.getData('text/plain');
+    const target = COL_STATE[lane];
+    if (!issue || !target) { return; }
+    const f = FACTS[issue] || {};
+    if (f.state === target) { return; }
+    submitMove(issue, target, '');
+  });
 });
 
 function applyFilter() {
@@ -722,6 +838,7 @@ function applyFilter() {
 document.getElementById('q').addEventListener('input', function () {
   applyFilter();
   applyShowEmpty();
+  syncUrl();
 });
 
 function applyShowEmpty() {
@@ -736,12 +853,74 @@ function applyShowEmpty() {
 }
 document.getElementById('showEmpty').addEventListener('change', function (e) {
   SHOW_EMPTY = e.target.checked;
-  localStorage.setItem('sb-show-empty', e.target.checked ? '1' : '0');
   applyShowEmpty();
+  syncUrl();
 });
+
+// --- URL 同步：视图/搜索/空列写回地址栏，刷新后仍保留 -------------------
+let CUR_VIEW = 'active';
+
+function syncUrl() {
+  const p = new URLSearchParams();
+  if (CUR_VIEW !== 'active') { p.set('view', CUR_VIEW); }
+  const q = (document.getElementById('q').value || '').trim();
+  if (q) { p.set('q', q); }
+  if (!SHOW_EMPTY) { p.set('empty', '0'); }
+  const s = p.toString();
+  history.replaceState(null, '', s ? '?' + s : location.pathname);
+}
+
+function restoreFromUrl() {
+  const p = new URLSearchParams(location.search);
+  const view = p.get('view');
+  if (view && view !== CUR_VIEW) { switchView(view); }
+  const q = p.get('q');
+  if (q) {
+    document.getElementById('q').value = q;
+    applyFilter();
+  }
+  if (p.get('empty') === '0') {
+    SHOW_EMPTY = false;
+    document.getElementById('showEmpty').checked = false;
+    applyShowEmpty();
+  }
+}
+
+// --- 运行时长每秒刷新（卡片上的 data-since） ---------------------------
+function fmtWhen(iso) {
+  if (!iso) { return ''; }
+  const t = Date.parse(iso);
+  if (isNaN(t)) { return String(iso); }
+  const s = Math.floor((Date.now() - t) / 1000);
+  if (s < 60) { return '刚刚'; }
+  if (s < 3600) { return Math.floor(s / 60) + ' 分钟前'; }
+  if (s < 86400) { return Math.floor(s / 3600) + ' 小时前'; }
+  const d = new Date(t);
+  const pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+    pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function fmtDuration(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h) { return h + 'h' + m + 'm'; }
+  if (m) { return m + 'm' + s + 's'; }
+  return s + 's';
+}
+
+setInterval(function () {
+  document.querySelectorAll('[data-since]').forEach(function (el) {
+    const started = Date.parse(el.getAttribute('data-since'));
+    if (!isNaN(started)) { el.textContent = '已运行 ' + fmtDuration(Date.now() - started); }
+  });
+}, 1000);
 
 const COMPLETED = {issues: [], today: '', loaded: false};
 function switchView(view) {
+  CUR_VIEW = view;
   document.querySelectorAll('[data-view]').forEach(function (b) {
     b.classList.toggle('on', b.getAttribute('data-view') === view);
   });
@@ -755,6 +934,7 @@ function switchView(view) {
     panel.hidden = false;
     loadCompleted(true);
   }
+  syncUrl();
 }
 document.querySelectorAll('[data-view]').forEach(function (b) {
   b.addEventListener('click', function () { switchView(b.getAttribute('data-view')); });
@@ -819,6 +999,7 @@ setInterval(function () {
   if (!document.getElementById('completed-panel').hidden) { loadCompleted(false); }
 }, 60000);
 
+restoreFromUrl();
 refreshIssues();
 setInterval(refreshIssues, 15000);
 </script>
@@ -1111,14 +1292,36 @@ def board_tasks():
     return _tasks_cache["data"]
 
 
+_source_cache = {}
+_source_lock = threading.Lock()
+SOURCE_TTL = 30.0
+
+
+def invalidate_task_source(number):
+    with _source_lock:
+        _source_cache.pop(number, None)
+
+
 def fetch_task_source(number):
-    # The scheduler proxies sequential GitHub calls (issue + comment pages +
-    # optional PR); real-world latency measured ~19s, so give it headroom.
+    # The scheduler proxies GitHub calls (issue + comment pages + optional PR);
+    # they now run concurrently there, but a repeat open of the same task is
+    # still a full network round trip. Cache briefly and drop the entry on any
+    # local write so the drawer never shows stale workflow state.
+    now = time.time()
+    with _source_lock:
+        hit = _source_cache.get(number)
+        if hit and now - hit[0] < SOURCE_TTL:
+            return hit[1]
     try:
-        return scheduler_request("GET", "/api/v1/tasks/%d/source" % number, timeout=45)
+        payload = scheduler_request("GET", "/api/v1/tasks/%d/source" % number,
+                                    timeout=45)
     except (urllib.error.URLError, urllib.error.HTTPError, OSError,
             ValueError, http.client.HTTPException):
         return None
+    if isinstance(payload, dict):
+        with _source_lock:
+            _source_cache[number] = (time.time(), payload)
+    return payload
 
 
 def request_task_comment(number, body):
@@ -1337,6 +1540,18 @@ BOARD_STATES = {
     "Rework", "Done", "Closed", "Cancelled", "Canceled", "Duplicate",
 }
 
+# 卡片快捷操作：只暴露人工决策的下一步，避免把调度器职责搬到界面上。
+QUICK_NEXT = {
+    "Backlog": (("Todo", "→ Todo"),),
+    "In Progress": (("Human Review", "→ 审核"),),
+    "Human Review": (("Merging", "→ 合并"),),
+    "Rework": (("In Progress", "→ 继续"),),
+}
+QUICK_BACK = {
+    "In Progress": ("Rework", "退回"),
+    "Human Review": ("Rework", "退回"),
+}
+
 STATE_TO_LANE = {
     "Backlog": "backlog",
     "Todo": "todo",
@@ -1525,6 +1740,16 @@ def build_cards():
             pr_html = ("<a class='bpr' href='%s' target='_blank' rel='noopener noreferrer'>PR #%s</a>"
                        % (esc(pr_url), esc(pr_number)))
         search = ("%s %s %s" % (name, title, repo or "")).lower()
+        task_state = record.get("state") or "Backlog"
+        quick = ""
+        for target, label in QUICK_NEXT.get(task_state, ()):
+            quick += ("<button class='bqbtn' data-issue='%s' data-target='%s'>%s</button>"
+                      % (esc(name), esc(target), esc(label)))
+        back = QUICK_BACK.get(task_state)
+        if back:
+            quick += ("<button class='bqbtn back' data-issue='%s' data-target='%s'>%s</button>"
+                      % (esc(name), esc(back[0]), esc(back[1])))
+        quick = "<div class='bquick'>%s</div>" % quick if quick else ""
         rendered.append(
             {
                 "state": st,
@@ -1532,7 +1757,7 @@ def build_cards():
                 "runs": runs,
                 "updated": record.get("updated_at") or "",
                 "html": (
-                    "<div class='bcard %(state)s%(live)s' data-issue='%(name)s' "
+                    "<div class='bcard %(state)s%(live)s' data-issue='%(name)s' draggable='true' "
                     "data-title='%(title)s' data-url='%(url)s' data-state='%(state)s' "
                     "data-state-text='%(text)s' data-task-state='%(task_state)s' "
                     "data-rev='%(rev)s' data-source-state='%(native)s' "
@@ -1544,7 +1769,7 @@ def build_cards():
                     "title='在 GitHub 打开'>%(ext)s</a></div>"
                     "<div class='brow'><span class='bstat tone-%(state)s'>%(icon)s%(text)s</span>"
                     "%(right)s</div>"
-                    "</div>%(err)s</div>"
+                    "</div>%(err)s%(quick)s</div>"
                 )
                 % {
                     "state": esc(st),
@@ -1565,6 +1790,7 @@ def build_cards():
                     "pr": pr_html,
                     "right": right,
                     "err": err_html,
+                    "quick": quick,
                 },
             }
         )
@@ -2618,6 +2844,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(502, {"error": "操作结果待核对，请勿重复提交",
                                         "comment_posted": bool(self._completed_writes)})
         clear_board_cache()
+        invalidate_task_source(number)
         refresh_queued = request_scheduler_refresh()
         task = (record or {}).get("task") or {}
         return self.send_json(200, {
