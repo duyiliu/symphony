@@ -385,6 +385,9 @@ def _finalize(settings):
     if tracker.kind == "linear" and tracker.endpoint is None:
         tracker.endpoint = "https://api.linear.app/graphql"
     tracker.project_slug = provider.get("project_slug", tracker.project_slug)
+    if tracker.kind == "linear":
+        tracker.project_slug = resolve_env_setting(
+            tracker.project_slug, "LINEAR_PROJECT_SLUG")
     tracker.api_key = provider.get("api_key", tracker.api_key)
     tracker.assignee = provider.get("assignee", tracker.assignee)
 
