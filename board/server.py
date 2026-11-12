@@ -169,8 +169,6 @@ a{color:inherit;text-decoration:none}
 .tone-awaiting{color:var(--info)}
 .tone-idle{color:var(--fg2)}
 .tone-done{color:var(--ok)}
-#shade{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:opacity .15s}
-#shade.open{opacity:1;pointer-events:auto}
 .drawer{position:fixed;top:0;right:0;bottom:0;z-index:41;display:flex;flex-direction:column;width:720px;max-width:94vw;background:var(--panel);border-left:1px solid var(--edge);box-shadow:-24px 0 70px rgba(0,0,0,.55);opacity:0;transform:translateX(28px);pointer-events:none;transition:opacity .18s,transform .18s ease-out}
 .drawer.open{opacity:1;transform:none;pointer-events:auto}
 .dgrip{position:absolute;top:0;left:-5px;bottom:0;width:11px;cursor:col-resize;touch-action:none;z-index:2}
@@ -288,6 +286,9 @@ body.dialog-open{overflow:hidden}
 .drun a{color:var(--fg2);text-decoration:none}
 .drun a:hover{color:var(--fg)}
 .drun.live a{color:var(--ok)}
+.drhead{display:flex;align-items:center;gap:8px}
+.drhead a{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.drhead .logbtn{flex:none}
 .crow{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;padding:8px 12px;border-bottom:1px solid var(--edge);font-size:12px;color:var(--fg2);overflow-wrap:anywhere}
 .crow:last-child{border-bottom:0}
 .crow b{color:var(--fg);font-weight:600}
@@ -458,6 +459,8 @@ const STATES = ['Backlog', 'Todo', 'In Progress', 'Human Review', 'Merging',
 const boardEl = document.getElementById('board');
 let CUR = null, RUNS = [], AGENT = null, TROUBLE = null, FACTS = {};
 let BUSY = false, TOAST_TIMER = null, OPEN_SEQ = 0;
+let LOG = null, LOG_TIMER = null;
+const LOG_MAX_MSGS = 400;
 let CUR_REV = null, CUR_SOURCE = null, CUR_SOURCE_ERR = null;
 const PENDING = new Map();
 const POSTED = new Map();
@@ -624,7 +627,7 @@ async function openIssue(issue) {
   const drawer = document.getElementById('drawer');
   const dhead = document.getElementById('dhead');
   const dbody = document.getElementById('dbody');
-  document.getElementById('shade').className = 'on';
+  // 抽屉是非模态侧栏：不遮罩看板，左侧仍可继续操作。
   drawer.classList.add('open');
   dhead.innerHTML = "<button class='dclose' id='dclose' title='关闭'>&#8249;</button>" +
     "<div class='dtitle'>" + esc(issue) + '</div>';
@@ -747,14 +750,38 @@ function renderDrawer(f, source, sourceError, loading) {
   }
   html += '<h3>会话记录</h3>';
   html += RUNS.length ? RUNS.map(function (r) {
-    return "<div class='drun" + (r.active ? ' live' : '') + "'>" +
-      "<a href='/run/" + encodeURIComponent(CUR) + '/' + esc(r.short) + "'>" +
-      esc(r.started) + ' · ' + esc(r.messages) + ' 条消息 · ' + esc(r.size) + '</a></div>';
+    const sh = esc(r.short);
+    return "<div class='drun" + (r.active ? ' live' : '') + "' data-short='" + sh + "'>" +
+      "<div class='drhead'><a href='/run/" + encodeURIComponent(CUR) + '/' + sh + "'>" +
+      esc(r.started) + ' · ' + esc(r.messages) + ' 条消息 · ' + esc(r.size) + '</a>' +
+      "<button class='logbtn' data-log='" + sh + "' aria-pressed='false'>日志</button></div>" +
+      "<div class='log' id='log-" + sh + "' hidden>" +
+      "<div class='log-tools'><span class='log-meta' id='lm-" + sh + "'></span>" +
+      "<span class='grow'></span>" +
+      "<a class='fbtn' id='fl-" + sh + "' href='/live/" + encodeURIComponent(CUR) + "'>完整视图</a>" +
+      "<button class='fbtn' id='fb-" + sh + "' data-follow='" + sh + "' aria-pressed='true'>跟随中</button></div>" +
+      "<div class='log-body' id='lb-" + sh + "'></div></div></div>";
   }).join('') : "<div class='dnote'>还没有运行记录</div>";
   dbody.innerHTML = html;
+  if (LOG) { restoreLog(); }
 }
 
 document.getElementById('dbody').addEventListener('click', function (e) {
+  const logBtn = e.target.closest('.logbtn');
+  if (logBtn) {
+    e.preventDefault();
+    const short = logBtn.getAttribute('data-log');
+    if (LOG && LOG.short === short) { stopLog(); } else { openLog(short); }
+    return;
+  }
+  const followBtn = e.target.closest('[data-follow]');
+  if (followBtn && LOG) {
+    e.preventDefault();
+    LOG.following = !LOG.following;
+    updateFollowBtn();
+    if (LOG.following) { scrollLogToEnd(); }
+    return;
+  }
   const moveBtn = e.target.closest('[data-move]');
   if (moveBtn && CUR) {
     const target = moveBtn.getAttribute('data-move');
@@ -782,13 +809,145 @@ function closeDrawer() {
   CUR_SOURCE = null;
   CUR_SOURCE_ERR = null;
   OPEN_SEQ += 1;
+  stopLog();
   document.getElementById('drawer').classList.remove('open');
-  document.getElementById('shade').className = '';
 }
-document.getElementById('shade').addEventListener('click', closeDrawer);
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape' && CUR) { closeDrawer(); }
 });
+
+// --- 抽屉内嵌会话日志：增量轮询 + 跟随最新 -------------------------------
+function logEls(short) {
+  return {
+    sec: document.getElementById('log-' + short),
+    body: document.getElementById('lb-' + short),
+    meta: document.getElementById('lm-' + short),
+    btn: document.querySelector(".logbtn[data-log='" + short + "']"),
+    follow: document.getElementById('fb-' + short)
+  };
+}
+
+function openLog(short) {
+  if (LOG && LOG.short === short) { return; }
+  stopLog();
+  LOG = {short: short, offset: -1, following: true, busy: false, dead: false, skipped: 0,
+    src: Math.random().toString(36).slice(2, 10)};
+  const el = logEls(short);
+  if (el.sec) { el.sec.hidden = false; }
+  if (el.body) { el.body.innerHTML = ''; }
+  if (el.meta) { el.meta.textContent = '加载中…'; el.meta.className = 'log-meta'; }
+  if (el.btn) { el.btn.setAttribute('aria-pressed', 'true'); }
+  updateFollowBtn();
+  pollLog();
+  LOG_TIMER = setInterval(pollLog, 1200);
+}
+
+function stopLog() {
+  if (LOG) {
+    const el = logEls(LOG.short);
+    if (el.sec) { el.sec.hidden = true; }
+    if (el.btn) { el.btn.setAttribute('aria-pressed', 'false'); }
+  }
+  LOG = null;
+  if (LOG_TIMER) { clearInterval(LOG_TIMER); LOG_TIMER = null; }
+}
+
+function restoreLog() {
+  if (!LOG) { return; }
+  const short = LOG.short;
+  const el = logEls(short);
+  if (!el.sec) { stopLog(); return; }
+  el.sec.hidden = false;
+  if (el.btn) { el.btn.setAttribute('aria-pressed', 'true'); }
+  if (el.body) { el.body.innerHTML = ''; }
+  LOG.offset = -1;
+  LOG.busy = false;
+  LOG.dead = false;
+  updateFollowBtn();
+  pollLog();
+}
+
+function updateFollowBtn() {
+  if (!LOG) { return; }
+  const el = logEls(LOG.short);
+  if (!el.follow) { return; }
+  el.follow.textContent = LOG.following ? '跟随中' : '恢复跟随';
+  el.follow.setAttribute('aria-pressed', String(!!LOG.following));
+}
+
+function scrollLogToEnd() {
+  if (!LOG) { return; }
+  const el = logEls(LOG.short);
+  if (el.body) { el.body.scrollTop = el.body.scrollHeight; }
+}
+
+function trimLog(box) {
+  if (!box) { return; }
+  const msgs = box.querySelectorAll('.msg');
+  const excess = msgs.length - LOG_MAX_MSGS;
+  for (let i = 0; i < excess; i++) { msgs[i].remove(); }
+  if (excess > 0 && LOG) { LOG.skipped += excess; }
+}
+
+async function pollLog() {
+  if (!LOG || LOG.busy || LOG.dead || !CUR) { return; }
+  const short = LOG.short;
+  const issue = CUR;
+  const sent = LOG.offset;
+  LOG.busy = true;
+  try {
+    const url = '/api/run/' + encodeURIComponent(issue) + '/' + short +
+      '?src=' + LOG.src + (sent >= 0 ? '&offset=' + sent : '');
+    const res = await fetch(url);
+    if (!LOG || LOG.short !== short) { return; }
+    const el = logEls(short);
+    if (res.status === 404) {
+      LOG.dead = true;
+      if (el.meta) { el.meta.textContent = '记录已被清理'; el.meta.className = 'log-meta warn'; }
+      return;
+    }
+    if (!res.ok) { return; }
+    const data = await res.json();
+    if (!LOG || LOG.short !== short) { return; }
+    if (data.reset) {
+      if (el.body) { el.body.innerHTML = ''; }
+      LOG.offset = -1;
+      return;
+    }
+    const first = sent === -1;
+    if (!first && el.body && data.start !== sent) {
+      el.body.insertAdjacentHTML('beforeend', "<div class='ln mark err'>… 记录已截断，从当前位置继续 …</div>");
+      LOG.skipped = 0;
+    }
+    LOG.offset = data.offset;
+    if (first && data.truncated && el.body) {
+      el.body.insertAdjacentHTML('beforeend', "<div class='ln mark'>… 更早的记录已省略，仅显示最近部分 …</div>");
+    }
+    if (el.body) {
+      if (data.ops && data.ops.length) {
+        for (const op of data.ops) {
+          const node = el.body.querySelector("[data-bid='" + op.id + "']");
+          if (op.op === 'del') { if (node) { node.remove(); } }
+          else if (node) { node.outerHTML = op.html; }
+          else { el.body.insertAdjacentHTML('beforeend', op.html); }
+        }
+      } else if (data.html) {
+        el.body.insertAdjacentHTML('beforeend', data.html);
+      }
+      trimLog(el.body);
+      if (LOG.following) { el.body.scrollTop = el.body.scrollHeight; }
+    }
+    if (el.meta) {
+      el.meta.textContent = (data.active ? '实时更新中' : '已结束') +
+        (LOG.skipped ? ' · 顶部已省略 ' + LOG.skipped + ' 条' : '');
+      el.meta.className = 'log-meta' + (data.active ? ' live' : '');
+    }
+  } catch (err) {
+    /* 网络抖动下一轮继续 */
+  } finally {
+    if (LOG && LOG.short === short) { LOG.busy = false; }
+  }
+}
 
 boardEl.addEventListener('click', function (e) {
   const qb = e.target.closest('.bqbtn');
@@ -1922,7 +2081,6 @@ def issues_page():
         "<p id='completed-status' role='status' aria-live='polite'></p>"
         "<div class='completed-list' id='completed-list'></div></main>"
         "</div>"
-        "<div id='shade' onclick='closeDrawer()'></div>"
         "<div id='toast' role='status' aria-live='polite'>"
         "<span class='ticon' aria-hidden='true'></span><span class='tmsg'></span></div>"
         "<div id='modal' aria-hidden='true'>"
