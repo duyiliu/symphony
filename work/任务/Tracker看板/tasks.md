@@ -61,7 +61,8 @@
 - 链路结果（issue #4）：导入 Backlog(rev1) → 看板 Todo(rev2) → 首次派发因 git 网络失败重试（已暂停回 Backlog）→ 修复后 Todo(rev4) → worker 真执行 In Progress(rev5) → PR #5 双 check SUCCESS + symphony 标签 + workpad → Human Review(rev7) 停驻不自批 → 看板评论+转 Rework(rev8，响应 3.6s) → 旧 PR #5 CLOSED 未合并、旧 workpad 清空、新分支 gh-4-rework-1、新 PR #6 双绿、新 workpad → Human Review(rev12) → 评论+确认弹窗 → Merging(rev13) → squash-merge PR #6（7e9678f）→ Done(rev14) → issue #4 自动 CLOSED(COMPLETED) → 看板 Done 列、抽屉显示源已关闭+PR 已合并。
 - 额外观测：远程（Windows）直连 214 的 `/api/v1/*` 返回 403，符合 R201 的 loopback/Bearer 访问控制；看板本身可正常远程访问。终态 workspace 已清理。
 - 证据：214 上 `/root/symphony-e2e/evidence-final.json`、`evidence-lifecycle.jsonl`、`sessions/`（3 个真会话）、`sessions-live/`；Windows 侧 `.tmp/linear-live-20261112/browser-214-final.json`、`rework-214.md`、`issue-214.md`。
-- 收尾：`symphony-e2e-api` / `symphony-e2e-board` 已停止，18320/18322 已释放；浏览器 space 3 页面已关闭；symphony 仓库仍无 commit（HEAD e5acc05）。部署物料保留在 214 便于复测。
+- 收尾：`symphony-e2e-api` / `symphony-e2e-board` 已停止并 **disable（不再开机自启）**，备份 cron 已移除，18320/18322 已释放；浏览器 space 3 页面已关闭；symphony 仓库无本次未提交改动。部署物料与证据（`/root/symphony-e2e`，480MB）保留在 214 便于随时复测，不自动运行。
+- 定位说明：214 实例为**临时测试用途**，验收完成后已关闭；若要正式生产，重新 `systemctl enable --now symphony-e2e-api symphony-e2e-board` 并恢复备份 cron 即可（见 `deploy/e2e-214/README.md`）。
 
 ## v2 验收覆盖
 
