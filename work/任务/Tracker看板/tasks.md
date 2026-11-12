@@ -64,6 +64,21 @@
 - 收尾：`symphony-e2e-api` / `symphony-e2e-board` 已停止并 **disable（不再开机自启）**，备份 cron 已移除，18320/18322 已释放；浏览器 space 3 页面已关闭；symphony 仓库无本次未提交改动。部署物料与证据（`/root/symphony-e2e`，480MB）保留在 214 便于随时复测，不自动运行。
 - 定位说明：214 实例为**临时测试用途**，验收完成后已关闭；若要正式生产，重新 `systemctl enable --now symphony-e2e-api symphony-e2e-board` 并恢复备份 cron 即可（见 `deploy/e2e-214/README.md`）。
 
+## V303 容器化部署验证（2026-11-12）
+
+- 状态：done
+- 目标：验证容器方案可行性（验证后已关闭，不常驻）。
+- 镜像：`deploy/e2e-container/Dockerfile`，基于 `node:22-bookworm`（自带 Node 22 + Python 3.11 + 新 glibc），装 `python3-yaml` 与 `pi 1.5.2`，镜像名 `symphony-tracker:local`。
+- 编排：`docker-compose.yml` 两个容器（api 18330 / board 18332），共享 `./data`（tasks/workspaces/sessions），pi 配置可写副本 `./pi-agent`。
+- 实测链路（issue #7）：导入 Backlog(rev1) → 看板 Todo(rev2) → 容器内真 worker In Progress(rev3) → 分支 gh-7/PR #8/三项 check SUCCESS/标签/workpad(rev4) → Human Review(rev5) 停驻不自批 → 看板评论+确认弹窗 → Merging(rev6) → squash-merge PR #8（79aa596）→ Done(rev7) → issue #7 自动 CLOSED；看板 Done 列且抽屉显示源已关闭+PR 已合并。
+- 容器特有缺陷与修复：
+  1. `pi` 需在配置目录写 `auth.json.lock`，只读挂载报 `EROFS` → 改为可写副本挂载。
+  2. compose 漏传 `SYMPHONY_API_TOKEN` → board→api 非 loopback 访问 403；补齐两边 env 并定 `server.api_token`，保持 board 不持有 GitHub token。
+  3. 容器内无 gh CLI → git 凭据改用 credential store（hook 从 `$GITHUB_TOKEN` 写入 600 文件）。
+- 结果：容器方案与 systemd 方案行为一致；优势是免 glibc 折腾、依赖可复现。
+- 证据：`deploy/e2e-container/README.md`（含坑与差异对比）、214 上 `/root/symphony-container/evidence-tasks.json`；Windows 侧 `.tmp/linear-live-20261112/browser-container-final.json`。
+- 收尾：`docker compose down` 已执行，18330/18332 已释放；镜像 `symphony-tracker:local` 保留在 214；物料已入库（`deploy/e2e-container/`），_data/pi-agent/.env 已入 .gitignore。
+
 ## v2 验收覆盖
 
 | AC | 任务 | 当前证据 |
