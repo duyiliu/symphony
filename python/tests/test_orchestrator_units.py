@@ -216,6 +216,26 @@ class StallTest(unittest.TestCase):
         self.assertIn("stalled", orch.retry_attempts["1"]["error"])
         orch.retry_attempts["1"]["timer"].cancel()
 
+    def test_pi_uses_runtime_stall_timeout(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+        settings.runtime.kind = "pi"
+        settings.runtime.stall_timeout_ms = 1_500_000
+        settings.codex.stall_timeout_ms = 1_000
+        orch.running["1"] = {
+            "ref": 1,
+            "identifier": "GH-1",
+            "issue": _issue(),
+            "started_at": datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=1_000),
+            "last_codex_timestamp": None,
+            "handle": _FakeHandle(),
+        }
+        orch.claimed.add("1")
+        orch._reconcile_stalled_running_issues(settings)
+        self.assertIn("1", orch.running)
+        self.assertNotIn("1", orch.retry_attempts)
+
 
 class _FakeHandle:
     def __init__(self):

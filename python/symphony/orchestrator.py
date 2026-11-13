@@ -889,7 +889,7 @@ class Orchestrator:
             self._release_issue_claim(issue.id)
 
     def _reconcile_stalled_running_issues(self, settings):
-        timeout_ms = settings.codex.stall_timeout_ms
+        timeout_ms = _stall_timeout_ms(settings)
         if timeout_ms <= 0 or not self.running:
             return
         now = _now()
@@ -1168,6 +1168,24 @@ def _running_seconds(started_at, now):
     if isinstance(started_at, datetime.datetime):
         return max(0, int((now - started_at).total_seconds()))
     return 0
+
+
+def _stall_timeout_ms(settings):
+    """Use the active runtime's stall timeout.
+
+    The Python port originally only supported Codex and read
+    ``codex.stall_timeout_ms``. The Pi workflow configures
+    ``runtime.stall_timeout_ms``; reading the Codex value silently reduces
+    Pi's configured timeout to the Codex default.
+    """
+    runtime = getattr(settings, "runtime", None)
+    if getattr(runtime, "kind", None) == "pi":
+        value = getattr(runtime, "stall_timeout_ms", None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    codex = getattr(settings, "codex", None)
+    value = getattr(codex, "stall_timeout_ms", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _codex_message_method(message):
