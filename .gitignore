@@ -9,3 +9,4 @@ deploy/e2e-container/.env
 /.env.local
 /deploy/local.env
 !/deploy/WORKFLOW.local.md
+.env
