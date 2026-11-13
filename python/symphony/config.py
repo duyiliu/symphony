@@ -575,14 +575,15 @@ def _finalize(settings):
     if tracker.kind == "linear":
         secret_names = ["LINEAR_API_KEY"] + env_reference_names(
             [tracker.api_key])
+        secret_names += [
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "SYMPHONY_GITHUB_TOKEN",
+        ]
         if delivery.enabled:
-            secret_names += [
-                "GITHUB_TOKEN",
-                "GH_TOKEN",
-                "GITHUB_ENTERPRISE_TOKEN",
-                "GH_ENTERPRISE_TOKEN",
-                "SYMPHONY_GITHUB_TOKEN",
-            ] + env_reference_names([delivery.token])
+            secret_names += env_reference_names([delivery.token])
     elif tracker.kind in ("github", "board"):
         secret_names = [
             "GITHUB_TOKEN",

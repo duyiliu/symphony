@@ -94,14 +94,7 @@ def _open_session(workspace, config, settings):
     secret_names = list(settings.tracker.secret_environment_names or [])
     git_config = None
     gh_config = None
-    if settings.delivery.enabled and settings.tracker.kind == "linear":
-        secret_names += [
-            "GITHUB_TOKEN",
-            "GH_TOKEN",
-            "GITHUB_ENTERPRISE_TOKEN",
-            "GH_ENTERPRISE_TOKEN",
-            "SYMPHONY_GITHUB_TOKEN",
-        ]
+    if settings.tracker.kind == "linear":
         pi_dir = os.path.join(workspace, ".pi")
         gh_config = os.path.join(pi_dir, "gh")
         git_config = os.path.join(pi_dir, "gitconfig")

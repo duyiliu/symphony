@@ -48,6 +48,8 @@ class LinearTrackerTests(unittest.TestCase):
         self.assertEqual(cfg.tracker.project_slug, "example-project")
         self.assertEqual(cfg.tracker.endpoint, "https://api.linear.app/graphql")
         self.assertIn("LINEAR_API_KEY", cfg.tracker.secret_environment_names)
+        self.assertIn("GITHUB_TOKEN", cfg.tracker.secret_environment_names)
+        self.assertIn("SYMPHONY_GITHUB_TOKEN", cfg.tracker.secret_environment_names)
         linear.validate_config(cfg.tracker)
 
     def test_poll_pagination_and_mapping(self):
