@@ -68,8 +68,9 @@ class _Call:
 
 
 class Orchestrator:
-    def __init__(self, store):
+    def __init__(self, store, session_reporter=None):
         self._store = store
+        self.session_reporter = session_reporter
         self._mailbox = queue.Queue()
         self._thread = None
         self._stop = threading.Event()
@@ -91,6 +92,11 @@ class Orchestrator:
         self.codex_totals = dict(_EMPTY_TOTALS)
         self.codex_rate_limits = None
         self._published = None
+        self.last_poll_started_at = None
+        self.last_poll_completed_at = None
+        self.last_poll_success_at = None
+        self.last_poll_error = None
+        self.poll_count = 0
 
     # -- lifecycle ------------------------------------------------------
 
@@ -134,7 +140,12 @@ class Orchestrator:
         # back to the mailbox call.
         published = self._published
         if published is not None:
-            return published
+            # A cached snapshot is useful even when a poll is slow, but it
+            # must not hide a dead scheduler thread or an old publication.
+            result = dict(published)
+            result["scheduler_alive"] = bool(
+                self._thread and self._thread.is_alive())
+            return result
 
         def handler(state):
             self._refresh_runtime_config()
@@ -226,13 +237,18 @@ class Orchestrator:
         self._mailbox.put(("run_poll_cycle",))
 
     def _on_run_poll_cycle(self):
+        self.last_poll_started_at = _now()
         try:
             self._refresh_runtime_config()
             self._maybe_dispatch()
-        except Exception:  # noqa: BLE001 - the poll loop must keep ticking
+        except Exception as error:  # noqa: BLE001 - the poll loop must keep ticking
+            self.last_poll_error = getattr(error, "reason", type(error).__name__)
             log.exception("poll cycle failed")
-        self._schedule_tick(self.poll_interval_ms)
-        self.poll_check_in_progress = False
+        finally:
+            self.last_poll_completed_at = _now()
+            self.poll_count += 1
+            self._schedule_tick(self.poll_interval_ms)
+            self.poll_check_in_progress = False
 
     def _schedule_tick(self, delay_ms):
         if self.tick_timer:
@@ -276,6 +292,7 @@ class Orchestrator:
         try:
             self._store.force_reload()
         except WorkflowError as error:
+            self.last_poll_error = error.reason
             self._log_config_error(error)
             return
         settings = self._store.settings()
@@ -288,8 +305,13 @@ class Orchestrator:
         try:
             issues = tracker_adapter.fetch_candidate_issues(settings.tracker)
         except Exception as error:  # noqa: BLE001
+            self.last_poll_error = getattr(error, "reason", type(error).__name__)
             log.error("Failed to fetch from issue tracker: %r", error)
             return
+        if self.last_poll_error:
+            log.info("Issue tracker polling recovered")
+        self.last_poll_success_at = _now()
+        self.last_poll_error = None
         if self._available_slots() > 0:
             self._choose_issues(issues, settings)
 
@@ -496,6 +518,16 @@ class Orchestrator:
             thread.start()
         except Exception as error:  # noqa: BLE001
             log.error("Unable to spawn agent for %s: %r", _issue_context(issue), error)
+            next_attempt = (attempt + 1) if isinstance(attempt, int) and attempt > 0 else 1
+            if self._retry_limit_exceeded(next_attempt, settings):
+                block_error = self._retry_limit_error(
+                    next_attempt, settings, "failed to spawn agent: %r" % error)
+                self._block_issue_from_entry(issue.id, {
+                    "identifier": issue.identifier,
+                    "issue": issue,
+                    "worker_host": worker_host,
+                }, block_error)
+                return
             self._schedule_issue_retry(issue.id, attempt + 1 if attempt else None, {
                 "identifier": issue.identifier,
                 "issue_url": issue.url,
@@ -510,6 +542,9 @@ class Orchestrator:
         self.running[issue.id] = entry
         self.claimed.add(issue.id)
         self.retry_attempts.pop(issue.id, None)
+        if self.session_reporter:
+            self.session_reporter.started(
+                issue, attempt=attempt, model=settings.runtime.model)
 
     # -- worker lifecycle -------------------------------------------------
 
@@ -520,6 +555,7 @@ class Orchestrator:
         entry = self.running.pop(issue_id)
         self._record_session_completion_totals(entry)
         session_id = entry.get("session_id") or "n/a"
+        self._finish_agent_session(entry, reason)
         if reason == agent_runner.DONE_SKIPPED:
             # Claim-time recheck found the task out of active states;
             # release so a later poll can pick it up if it returns.
@@ -552,6 +588,15 @@ class Orchestrator:
             "Agent task finished for issue_id=%s session_id=%s reason=%r",
             issue_id, session_id, reason)
 
+    def _finish_agent_session(self, entry, reason):
+        issue = entry.get("issue")
+        if issue is None or not self.session_reporter:
+            return
+        if reason == agent_runner.DONE_SKIPPED:
+            return
+        normal = reason == agent_runner.DONE_NORMAL
+        self.session_reporter.worker_finished(issue, normal)
+
     def _block_input_required(self, issue_id, entry, session_id, reason):
         error = self._blocker_error(entry, "agent exited: %r" % (reason,))
         log.warning(
@@ -561,10 +606,20 @@ class Orchestrator:
         self._block_issue_from_entry(issue_id, entry, error)
 
     def _retry_agent_down(self, issue_id, entry, session_id, reason):
+        settings = self._store.settings()
+        next_attempt = self._next_retry_attempt_from_running(entry) or 1
+        if self._retry_limit_exceeded(next_attempt, settings):
+            error = self._retry_limit_error(
+                next_attempt, settings, "agent exited: %r" % (reason,))
+            log.error(
+                "Agent retry limit exceeded for issue_id=%s issue_identifier=%s "
+                "session_id=%s; blocking: %s",
+                issue_id, entry.get("identifier"), session_id, error)
+            self._stop_and_block_issue(issue_id, entry, error)
+            return
         log.warning(
             "Agent task exited for issue_id=%s session_id=%s reason=%r; "
             "scheduling retry", issue_id, session_id, reason)
-        next_attempt = self._next_retry_attempt_from_running(entry)
         self._schedule_issue_retry(issue_id, next_attempt, {
             "identifier": entry.get("identifier"),
             "issue_url": entry["issue"].url if entry.get("issue") else None,
@@ -588,6 +643,8 @@ class Orchestrator:
             return
         if "event" not in update or "timestamp" not in update:
             return
+        if self.session_reporter:
+            self.session_reporter.progress(entry.get("issue"), update)
         token_delta = self._extract_token_delta(entry, update)
         entry["codex_input_tokens"] = entry.get("codex_input_tokens", 0) + token_delta["input_tokens"]
         entry["codex_output_tokens"] = entry.get("codex_output_tokens", 0) + token_delta["output_tokens"]
@@ -674,6 +731,24 @@ class Orchestrator:
             FAILURE_RETRY_BASE_MS * (1 << power),
             settings.agent.max_retry_backoff_ms)
 
+    @staticmethod
+    def _retry_limit_exceeded(attempt, settings):
+        limit = getattr(settings.agent, "max_retry_attempts", 0)
+        return (
+            isinstance(limit, int) and limit > 0
+            and isinstance(attempt, int) and attempt > limit
+        )
+
+    @staticmethod
+    def _retry_limit_error(attempt, settings, reason):
+        limit = getattr(settings.agent, "max_retry_attempts", 0)
+        return (
+            "retry limit exceeded after %d failed attempt(s) "
+            "(agent.max_retry_attempts=%d retries allowed): %s; "
+            "manual intervention required"
+            % (attempt, limit, reason)
+        )
+
     def _on_retry_issue(self, issue_id, token):
         entry = self.retry_attempts.get(issue_id)
         if entry is None or entry.get("retry_token") != token:
@@ -725,6 +800,21 @@ class Orchestrator:
         self._release_issue_claim(issue_id)
 
     def _handle_active_retry(self, issue, attempt, metadata, settings):
+        if metadata.get("delay_type") != "continuation" \
+                and self._retry_limit_exceeded(attempt, settings):
+            error = self._retry_limit_error(
+                attempt, settings,
+                metadata.get("error") or "retry limit reached before dispatch")
+            log.error(
+                "Retry limit exceeded before dispatch for %s; blocking: %s",
+                _issue_context(issue), error)
+            self._block_issue_from_entry(issue.id, {
+                "identifier": issue.identifier,
+                "issue": issue,
+                "worker_host": metadata.get("worker_host"),
+                "workspace_path": metadata.get("workspace_path"),
+            }, error)
+            return
         terminal = self._terminal_state_set(settings)
         active = self._active_state_set(settings)
         slots = self._candidate_issue(issue, active, terminal, settings) and (
@@ -789,6 +879,8 @@ class Orchestrator:
             retry["timer"].cancel()
         self.claimed.add(issue_id)
         self.blocked[issue_id] = blocked_entry
+        if self.session_reporter:
+            self.session_reporter.blocked(entry.get("issue"))
 
     # -- reconciliation -------------------------------------------------------
 
@@ -823,11 +915,15 @@ class Orchestrator:
             log.info(
                 "Issue moved to terminal state: %s state=%s; stopping active agent",
                 _issue_context(issue), issue.state)
+            if self.session_reporter:
+                self.session_reporter.stopped(issue)
             self._terminate_running_issue(issue.id, True, settings)
         elif not tracker_adapter.routable(issue, settings.tracker):
             log.info(
                 "Issue no longer routed to this worker: %s assignee=%r; "
                 "stopping active agent", _issue_context(issue), issue.assignee_id)
+            if self.session_reporter:
+                self.session_reporter.stopped(issue)
             self._terminate_running_issue(issue.id, False, settings)
         elif state_name in active:
             entry = self.running.get(issue.id)
@@ -837,6 +933,13 @@ class Orchestrator:
             log.info(
                 "Issue moved to non-active state: %s state=%s; stopping active agent",
                 _issue_context(issue), issue.state)
+            if self.session_reporter:
+                if settings.delivery.enabled and state_name in {
+                        normalize_issue_state(settings.delivery.review_state),
+                        normalize_issue_state(settings.delivery.merge_state)}:
+                    self.session_reporter.worker_finished(issue, True)
+                else:
+                    self.session_reporter.stopped(issue)
             self._terminate_running_issue(issue.id, False, settings)
 
     def _reconcile_blocked_issues(self):
@@ -889,7 +992,7 @@ class Orchestrator:
             self._release_issue_claim(issue.id)
 
     def _reconcile_stalled_running_issues(self, settings):
-        timeout_ms = settings.codex.stall_timeout_ms
+        timeout_ms = _stall_timeout_ms(settings)
         if timeout_ms <= 0 or not self.running:
             return
         now = _now()
@@ -919,13 +1022,24 @@ class Orchestrator:
                     "Issue stalled: issue_id=%s issue_identifier=%s session_id=%s "
                     "elapsed_ms=%s; restarting with backoff",
                     issue_id, identifier, session_id, elapsed_ms)
-                next_attempt = self._next_retry_attempt_from_running(entry)
-                self._terminate_running_issue(issue_id, False, settings)
-                self._schedule_issue_retry(issue_id, next_attempt, {
-                    "identifier": identifier,
-                    "issue_url": entry["issue"].url if entry.get("issue") else None,
-                    "error": "stalled for %dms without codex activity" % elapsed_ms,
-                })
+                next_attempt = self._next_retry_attempt_from_running(entry) or 1
+                if self._retry_limit_exceeded(next_attempt, settings):
+                    error = self._retry_limit_error(
+                        next_attempt, settings,
+                        "stalled for %dms without codex activity" % elapsed_ms)
+                    log.error(
+                        "Issue stalled and retry limit exceeded: issue_id=%s "
+                        "issue_identifier=%s session_id=%s; blocking: %s",
+                        issue_id, identifier, session_id, error)
+                    self._record_session_completion_totals(entry)
+                    self._stop_and_block_issue(issue_id, entry, error)
+                else:
+                    self._terminate_running_issue(issue_id, False, settings)
+                    self._schedule_issue_retry(issue_id, next_attempt, {
+                        "identifier": identifier,
+                        "issue_url": entry["issue"].url if entry.get("issue") else None,
+                        "error": "stalled for %dms without codex activity" % elapsed_ms,
+                    })
 
     def _log_missing_running_issue(self, issue_id):
         entry = self.running.get(issue_id)
@@ -1149,12 +1263,19 @@ class Orchestrator:
                 "last_codex_event": entry.get("last_codex_event"),
             })
         return {
+            "published_at": now,
+            "scheduler_alive": bool(self._thread and self._thread.is_alive()),
             "running": running,
             "retrying": retrying,
             "blocked": blocked,
             "codex_totals": self.codex_totals,
             "rate_limits": self.codex_rate_limits,
             "polling": {
+                "last_started_at": self.last_poll_started_at,
+                "last_completed_at": self.last_poll_completed_at,
+                "last_success_at": self.last_poll_success_at,
+                "last_error": self.last_poll_error,
+                "count": self.poll_count,
                 "checking": self.poll_check_in_progress is True,
                 "next_poll_in_ms": (
                     max(0, self.next_poll_due_at_ms - now_ms)
@@ -1168,6 +1289,24 @@ def _running_seconds(started_at, now):
     if isinstance(started_at, datetime.datetime):
         return max(0, int((now - started_at).total_seconds()))
     return 0
+
+
+def _stall_timeout_ms(settings):
+    """Use the active runtime's stall timeout.
+
+    The Python port originally only supported Codex and read
+    ``codex.stall_timeout_ms``. The Pi workflow configures
+    ``runtime.stall_timeout_ms``; reading the Codex value silently reduces
+    Pi's configured timeout to the Codex default.
+    """
+    runtime = getattr(settings, "runtime", None)
+    if getattr(runtime, "kind", None) == "pi":
+        value = getattr(runtime, "stall_timeout_ms", None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    codex = getattr(settings, "codex", None)
+    value = getattr(codex, "stall_timeout_ms", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _codex_message_method(message):

@@ -24,7 +24,7 @@ POLL_INTERVAL_S = 1.0
 def _validate_settings(settings):
     if settings.tracker.kind is None:
         raise WorkflowError("missing_tracker_kind")
-    if settings.tracker.kind not in ("github", "board"):
+    if settings.tracker.kind not in ("linear", "github", "board"):
         raise WorkflowError("unsupported_tracker_kind", settings.tracker.kind)
     from . import tracker as tracker_adapter
 

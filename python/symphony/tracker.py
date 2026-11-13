@@ -1,12 +1,17 @@
 """Tracker facade: dispatch tracker operations on ``tracker.kind``.
 
-``github`` is the plain native tracker (open/closed only); ``board`` is the
+``linear`` is the official upstream integration, ``github`` is the plain native tracker; ``board`` is the
 local task-record tracker that carries the Linear-style workflow state.
 Orchestrator/runner only ever talk to this facade; every function takes
 ``tracker_settings`` like the old single-kind adapter.
 """
 
 from .github import adapter as github_adapter
+from . import linear as linear_adapter
+
+
+def _is_linear(settings):
+    return getattr(settings, "kind", None) == "linear"
 
 
 def _board():
@@ -21,19 +26,25 @@ def _is_board(tracker_settings):
 def validate_config(settings):
     """Full-settings entry used by WorkflowStore."""
     tracker = settings.tracker
-    if _is_board(tracker):
+    if _is_linear(tracker):
+        linear_adapter.validate_config(tracker)
+    elif _is_board(tracker):
         _board().validate_config(tracker)
     else:
         github_adapter.validate_config(tracker)
 
 
 def fetch_candidate_issues(tracker_settings):
+    if _is_linear(tracker_settings):
+        return linear_adapter.fetch_candidate_issues(tracker_settings)
     if _is_board(tracker_settings):
         return _board().fetch_candidate_issues(tracker_settings)
     return github_adapter.fetch_candidate_issues(tracker_settings)
 
 
 def fetch_issues_by_states(tracker_settings, state_names):
+    if _is_linear(tracker_settings):
+        return linear_adapter.fetch_issues_by_states(tracker_settings, state_names)
     if _is_board(tracker_settings):
         return _board().fetch_issues_by_states(
             tracker_settings, state_names)
@@ -42,6 +53,8 @@ def fetch_issues_by_states(tracker_settings, state_names):
 
 
 def fetch_issues_by_ids(tracker_settings, issue_ids):
+    if _is_linear(tracker_settings):
+        return linear_adapter.fetch_issues_by_ids(tracker_settings, issue_ids)
     if _is_board(tracker_settings):
         return _board().fetch_issues_by_ids(tracker_settings, issue_ids)
     return github_adapter.fetch_issues_by_ids(tracker_settings, issue_ids)
@@ -68,6 +81,8 @@ def begin_run_issue(issue, tracker_settings):
 
 
 def routable(issue, tracker_settings):
+    if _is_linear(tracker_settings):
+        return linear_adapter.routable(issue, tracker_settings)
     if _is_board(tracker_settings):
         return _board().routable(issue, tracker_settings)
     return github_adapter.routable(issue, tracker_settings)
@@ -80,13 +95,43 @@ def record_issue_failure(issue, tracker_settings, reason):
 
 def tool_specs(tracker_settings=None):
     from .github import agent_tool
+    if tracker_settings is None:
+        from .workflow_store import get_store
+        store = get_store()
+        tracker_settings = store.settings().tracker if store else None
+    if tracker_settings and _is_linear(tracker_settings):
+        specs = linear_adapter.tool_specs()
+        delivery = _delivery_settings()
+        if delivery is not None and delivery.enabled:
+            specs = specs + agent_tool.delivery_tool_specs()
+        return specs
     return agent_tool.tool_specs(tracker_settings)
 
 
 def execute_agent_tool(tool_name, arguments, tracker_settings=None):
     from .github import agent_tool
+    if tracker_settings is None:
+        from .workflow_store import get_store
+        store = get_store()
+        tracker_settings = store.settings().tracker if store else None
+    if tracker_settings and _is_linear(tracker_settings):
+        if tool_name == "github_api":
+            delivery = _delivery_settings()
+            if delivery is None or not delivery.enabled:
+                return {"error": {"code": "unknown_tool", "detail": tool_name}}
+            return agent_tool.execute_delivery_tool(arguments, delivery)
+        return linear_adapter.execute_agent_tool(tracker_settings, tool_name, arguments)
     return agent_tool.execute_agent_tool(tool_name, arguments,
                                          tracker_settings)
+
+
+def _delivery_settings():
+    from .workflow_store import get_store
+
+    store = get_store()
+    if store is None:
+        return None
+    return store.settings().delivery
 
 
 def secret_environment_names(tracker_settings):

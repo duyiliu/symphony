@@ -57,6 +57,63 @@ def tool_specs(tracker_settings=None):
     return specs
 
 
+def delivery_tool_specs():
+    return [_GITHUB_API_SPEC]
+
+
+def execute_delivery_tool(arguments, delivery):
+    """Execute github_api for a Linear delivery project.
+
+    ``delivery`` is a :class:`symphony.config.DeliverySettings`; it carries a
+    host-only token. The policy allowlist is read/PR/comment only and never
+    includes merge.
+    """
+    if not isinstance(arguments, dict):
+        return {"error": {"code": "invalid_arguments"}}
+    method = arguments.get("method")
+    path = arguments.get("path")
+    params = arguments.get("params")
+    body = arguments.get("body")
+    if not isinstance(method, str) or not isinstance(path, str):
+        return {"error": {"code": "invalid_arguments"}}
+    if "://" in path or not path.startswith("/") \
+            or "?" in path or "#" in path:
+        return {"error": {"code": "invalid_arguments"}}
+    if params is not None and not _valid_params(params):
+        return {"error": {"code": "invalid_arguments"}}
+    api_root = (delivery.api_url or "https://api.github.com").rstrip("/")
+    url = api_root + path
+    try:
+        allowed = policy.allow_request_for(
+            delivery.repo, method, url, body)
+    except Exception:  # noqa: BLE001 - policy failures must not leak detail
+        log.exception("delivery github_api policy evaluation failed")
+        return {"error": {"code": "forbidden"}}
+    if not allowed:
+        return {"error": {"code": "forbidden"}}
+    from urllib.parse import urlsplit
+    api_path = urlsplit(url).path
+    gh_settings = gh_client.GitHubSettings(
+        api_root, delivery.repo, delivery.token)
+    try:
+        result = gh_client.perform_request(
+            method, api_path, params or {}, body, gh_settings)
+    except Exception as error:  # noqa: BLE001
+        log.exception("delivery github_api request failed")
+        return {"error": {"code": "github_request_failed",
+                          "detail": getattr(error, "reason", str(error))}}
+    response = {
+        "status": result["status"],
+        "body": _sanitize_body(result["body"]),
+    }
+    if not (200 <= result["status"] <= 299):
+        response["error"] = {
+            "code": "github_status",
+            "status": result["status"],
+        }
+    return response
+
+
 def execute_agent_tool(tool_name, arguments, tracker_settings=None):
     settings = tracker_settings or _tracker_settings()
     if settings is None:

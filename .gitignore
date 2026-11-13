@@ -5,3 +5,7 @@ __pycache__/
 deploy/e2e-container/data/
 deploy/e2e-container/pi-agent/
 deploy/e2e-container/.env
+/.env
+/.env.local
+/deploy/local.env
+!/deploy/WORKFLOW.local.md

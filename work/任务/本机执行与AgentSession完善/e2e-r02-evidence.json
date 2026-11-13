@@ -1,0 +1,26 @@
+{
+  "issue": {
+    "identifier": "YIL-181",
+    "state": {
+      "name": "Done"
+    }
+  },
+  "session": {
+    "id": "7aecc331-7c38-477d-bad4-78cc63bc7af9",
+    "status": "complete",
+    "summary": "YIL-181 · GitHub PR 已确认合并，Linear 已更新为 Done。",
+    "url": "https://linear.app/yiliu/agent-session/7aecc331-7c38-477d-bad4-78cc63bc7af9",
+    "activity_count": 8,
+    "response_count": 1,
+    "responses": [
+      {
+        "id": "297afed7-6d49-435f-8517-480113acba1a",
+        "createdAt": "2026-11-13T11:15:53.723Z",
+        "content": {
+          "__typename": "AgentActivityResponseContent",
+          "body": "GitHub PR 已确认合并，Linear 已更新为 Done。\n\n原因：宿主已核验 GitHub 合并结果；HEAD 4b79581db855d4ef676e4fd5c120d3bc8f6f80e3。\nPR：https://github.com/duyiliu/symphony-e2e/pull/20\nHEAD：4b79581db855d4ef676e4fd5c120d3bc8f6f80e3"
+        }
+      }
+    ]
+  }
+}

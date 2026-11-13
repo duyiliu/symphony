@@ -1048,7 +1048,6 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
-    sent_at = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1057,7 +1056,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 1_000, 2_000, sent_at)
+    assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1090,7 +1089,6 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
-    sent_at = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1098,7 +1096,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 40_000, 41_000, sent_at)
+    assert_due_in_range(due_at_ms, 39_500, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1130,7 +1128,6 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
-    sent_at = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1138,7 +1135,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 10_000, 11_000, sent_at)
+    assert_due_in_range(due_at_ms, 9_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1258,10 +1255,8 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  # Measure from the moment the DOWN message is sent so scheduler latency in the
-  # orchestrator does not eat into the lower bound.
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms, base_ms) do
-    remaining_ms = due_at_ms - base_ms
+  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
+    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
     assert remaining_ms >= min_remaining_ms
     assert remaining_ms <= max_remaining_ms

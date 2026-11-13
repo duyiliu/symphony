@@ -94,7 +94,8 @@ def _to_mcp_result(result):
         text = json.dumps(result, ensure_ascii=False, indent=2)
     except (TypeError, ValueError):
         text = repr(result)
-    return {"content": [{"type": "text", "text": text}], "isError": False}
+    return {"content": [{"type": "text", "text": text}],
+            "isError": isinstance(result, dict) and bool(result.get("error") or result.get("errors"))}
 
 
 class _Handler(BaseHTTPRequestHandler):

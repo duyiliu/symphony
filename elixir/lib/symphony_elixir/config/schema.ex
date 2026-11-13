@@ -56,7 +56,6 @@ defmodule SymphonyElixir.Config.Schema do
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
-      field(:github_workflow, :map, default: %{})
       field(:active_states, {:array, :string})
       field(:terminal_states, {:array, :string})
     end
@@ -74,7 +73,6 @@ defmodule SymphonyElixir.Config.Schema do
           :assignee,
           :provider,
           :required_labels,
-          :github_workflow,
           :active_states,
           :terminal_states
         ],
@@ -170,40 +168,6 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
-    end
-  end
-
-  defmodule Runtime do
-    @moduledoc false
-    use Ecto.Schema
-    import Ecto.Changeset
-
-    @kinds ~w(codex pi)
-
-    @primary_key false
-    embedded_schema do
-      field(:kind, :string, default: "codex")
-      field(:command, :string)
-      field(:model, :string)
-      field(:thinking, :string)
-      field(:turn_timeout_ms, :integer, default: 3_600_000)
-      field(:stall_timeout_ms, :integer, default: 300_000)
-      field(:mcp, :map, default: %{})
-      field(:live_log_dir, :string)
-    end
-
-    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
-    def changeset(schema, attrs) do
-      schema
-      |> cast(
-        attrs,
-        [:kind, :command, :model, :thinking, :turn_timeout_ms, :stall_timeout_ms, :mcp, :live_log_dir],
-        empty_values: []
-      )
-      |> update_change(:kind, &(&1 |> String.trim() |> String.downcase()))
-      |> validate_inclusion(:kind, @kinds)
-      |> validate_number(:turn_timeout_ms, greater_than: 0)
-      |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     end
   end
 
@@ -331,7 +295,6 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
-    embeds_one(:runtime, Runtime, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
@@ -426,7 +389,6 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
-    |> cast_embed(:runtime, with: &Runtime.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
@@ -498,25 +460,7 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex, runtime: finalize_runtime(settings)}
-  end
-
-  defp finalize_runtime(settings) do
-    %{
-      settings.runtime
-      | command: runtime_command(settings),
-        mcp: normalize_optional_map(settings.runtime.mcp) || %{}
-    }
-  end
-
-  defp runtime_command(settings) do
-    case settings.runtime.command do
-      command when is_binary(command) and command != "" ->
-        command
-
-      _ ->
-        if settings.runtime.kind == "codex", do: settings.codex.command, else: nil
-    end
+    %{settings | tracker: tracker, workspace: workspace, codex: codex}
   end
 
   defp normalize_keys(value) when is_map(value) do

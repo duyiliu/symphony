@@ -226,15 +226,24 @@ def _remove_local(settings, path):
         except HookError as error:
             log.warning(
                 "before_remove hook failed workspace=%s error=%s", path, error)
-    try:
-        if os.path.isdir(path) and not os.path.islink(path):
-            _rmtree_compat(path)
-        else:
-            os.remove(path)
-        return True
-    except OSError as error:
-        log.warning("workspace remove failed path=%s error=%s", path, error)
-        return False
+    last_error = None
+    for attempt in range(3):
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                _rmtree_compat(path)
+            else:
+                os.remove(path)
+            return True
+        except OSError as error:
+            last_error = error
+            if os.name != "nt" or attempt == 2 \
+                    or getattr(error, "winerror", None) not in (5, 32):
+                break
+            # Windows can hold a deleted directory handle briefly after a
+            # child process exits. Retry only transient sharing/lock errors.
+            time.sleep(0.1 * (attempt + 1))
+    log.warning("workspace remove failed path=%s error=%s", path, last_error)
+    return False
 
 
 def remove_issue_workspaces(settings, issue_identifiers, workflow_path=None,

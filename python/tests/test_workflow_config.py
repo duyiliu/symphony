@@ -33,6 +33,7 @@ hooks:
 agent:
   max_concurrent_agents: 3
   max_turns: 12
+  max_retry_attempts: 4
 runtime:
   kind: pi
   command: pi --mode rpc --tools read,bash
@@ -92,6 +93,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(settings.polling.interval_ms, 10000)
         self.assertEqual(settings.agent.max_concurrent_agents, 3)
         self.assertEqual(settings.agent.max_turns, 12)
+        self.assertEqual(settings.agent.max_retry_attempts, 4)
         self.assertEqual(settings.runtime.kind, "pi")
         self.assertEqual(settings.runtime.model, "test/model")
         self.assertTrue(settings.runtime.mcp["enabled"])
@@ -106,6 +108,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(settings.polling.interval_ms, 30000)
         self.assertEqual(settings.agent.max_concurrent_agents, 10)
         self.assertEqual(settings.agent.max_turns, 20)
+        self.assertEqual(settings.agent.max_retry_attempts, 10)
         self.assertEqual(settings.runtime.kind, "codex")
         self.assertEqual(settings.server.host, "127.0.0.1")
 
@@ -125,6 +128,14 @@ class ConfigTest(unittest.TestCase):
                 "tracker": {"kind": "github",
                             "provider": {"repo": "a/b", "token": "t"}},
                 "agent": {"max_concurrent_agents": "three"},
+            })
+
+    def test_invalid_max_retry_attempts(self):
+        with self.assertRaises(WorkflowError):
+            config.parse_settings({
+                "tracker": {"kind": "github",
+                            "provider": {"repo": "a/b", "token": "t"}},
+                "agent": {"max_retry_attempts": -1},
             })
 
     def test_env_root_resolution(self):

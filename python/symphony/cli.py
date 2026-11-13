@@ -12,6 +12,8 @@ import signal
 import sys
 
 from . import http_api, logging_setup, mcp_bridge, workflow_store
+from .delivery import DeliveryController
+from .agent_sessions import Reporter
 from .orchestrator import Orchestrator
 from .workflow import WorkflowError
 
@@ -56,9 +58,12 @@ def main(argv=None):
     parser.add_argument(
         "--log-level", default=None,
         help="Log level (default: SYMPHONY_LOG_LEVEL or INFO)")
+    parser.add_argument(
+        "--log-file", default=None,
+        help="Write UTF-8 rotating logs directly (or SYMPHONY_LOG_FILE)")
     args = parser.parse_args(argv)
 
-    logging_setup.setup(args.log_level)
+    logging_setup.setup(args.log_level, args.log_file)
 
     path = _resolve_workflow_path(args.workflow)
     if path is None:
@@ -85,8 +90,10 @@ def main(argv=None):
         return 2
 
     mcp_bridge.start()
-    orchestrator = Orchestrator(store)
+    reporter = Reporter(store).start()
+    orchestrator = Orchestrator(store, session_reporter=reporter)
     orchestrator.start()
+    delivery = DeliveryController(store, session_reporter=reporter).start()
     server = http_api.start(orchestrator, store, path, host, port)
 
     stop = {"flag": False}
@@ -113,7 +120,10 @@ def main(argv=None):
             server.shutdown()
         except Exception:  # noqa: BLE001
             pass
+        if delivery is not None:
+            delivery.stop()
         orchestrator.stop()
+        reporter.stop()
         mcp_bridge.stop()
         workflow_store.stop_store()
     return 0

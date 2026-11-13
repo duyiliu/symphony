@@ -6,6 +6,7 @@ switches to one JSON object per record for aggregation.
 
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 
@@ -33,14 +34,27 @@ class _JsonFormat(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
-def setup(level=None):
+def setup(level=None, log_file=None):
     fmt = os.environ.get("SYMPHONY_LOG_FORMAT", "text")
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(
+    formatter = (
         _JsonFormat() if fmt == "json"
         else _TextFormat("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    handler.setFormatter(formatter)
+    handlers = [handler]
+    path = log_file or os.environ.get("SYMPHONY_LOG_FILE")
+    if path:
+        path = os.path.abspath(os.path.expanduser(path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        file_handler = RotatingFileHandler(
+            path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
     root = logging.getLogger()
-    root.handlers[:] = [handler]
+    previous = root.handlers[:]
+    root.handlers[:] = handlers
+    for old in previous:
+        old.close()
     root.setLevel((level or os.environ.get("SYMPHONY_LOG_LEVEL", "INFO")).upper())
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     return root

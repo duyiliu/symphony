@@ -23,5 +23,3 @@ def snapshot(settings, issue_number, pr_number):
 
 def pending(delivery, feedback):
     return delivery.get("feedback_digest", "") != feedback["digest"]
-
-

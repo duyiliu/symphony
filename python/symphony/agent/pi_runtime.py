@@ -91,8 +91,19 @@ def start_session(workspace, settings, worker_host=None):
 
 def _open_session(workspace, config, settings):
     session_id = _new_session_id()
+    secret_names = list(settings.tracker.secret_environment_names or [])
+    git_config = None
+    gh_config = None
+    if settings.tracker.kind == "linear":
+        pi_dir = os.path.join(workspace, ".pi")
+        gh_config = os.path.join(pi_dir, "gh")
+        git_config = os.path.join(pi_dir, "gitconfig")
+        os.makedirs(gh_config, mode=0o700, exist_ok=True)
+        with open(git_config, "w", encoding="utf-8") as handle:
+            handle.write("")
     script = _build_script(
-        config, settings.tracker.secret_environment_names, session_id)
+        config, list(dict.fromkeys(secret_names)), session_id,
+        git_config=git_config, gh_config=gh_config)
     log.info(
         "Starting pi runtime workspace=%s session=%s command=%s",
         workspace, session_id, config.command)
@@ -173,7 +184,8 @@ def _inject_mcp_args(command, config):
     return command
 
 
-def _build_script(config, secret_names, session_id):
+def _build_script(config, secret_names, session_id, git_config=None,
+                  gh_config=None):
     unsets = "".join("unset %s;" % name for name in secret_names or [])
     parts = [_inject_mcp_args(config.command, config)]
     if not re.search(r"--session[\s=]|--session-id[\s=]", config.command or ""):
@@ -182,7 +194,14 @@ def _build_script(config, secret_names, session_id):
         parts.append("--model %s" % _shell_quote(config.model))
     if config.thinking:
         parts.append("--thinking %s" % _shell_quote(config.thinking))
-    return " ".join(part for part in [unsets, "exec", " ".join(parts)] if part)
+    isolation = ""
+    if git_config:
+        isolation += "export GIT_CONFIG_GLOBAL=%s;" % _shell_quote(git_config)
+        isolation += "export GIT_CONFIG_NOSYSTEM=1;"
+    if gh_config:
+        isolation += "export GH_CONFIG_DIR=%s;" % _shell_quote(gh_config)
+    return " ".join(
+        part for part in [unsets, isolation, "exec", " ".join(parts)] if part)
 
 
 def _sanitise_pi_dir(workspace):
@@ -441,6 +460,13 @@ def stop_session(session):
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             pass
+    finally:
+        for stream in (process.stdin, process.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
 
 
 def _emit(on_message, event, fields):

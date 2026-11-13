@@ -455,6 +455,11 @@ Fields:
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
+- `max_retry_attempts` (non-negative integer)
+  - Default: `10`
+  - Limits failure-driven retries for one issue; `0` disables the limit.
+  - When exceeded, the issue is blocked and requires manual intervention.
+  - Normal continuation retries are not blocked by this limit.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`trim + lowercase`) for lookup.
@@ -489,11 +494,6 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
-- `live_log_dir` (string, optional)
-  - When set for the `pi` runtime, the orchestrator mirrors the raw RPC stdout
-    stream into `<dir>/<timestamp>_<session_id>.live.jsonl` with a synthetic
-    `session` header line, so external monitors can follow the run in real
-    time without waiting on the agent's own session-file flush.
 
 ### 5.4 Prompt Template Contract
 
@@ -628,6 +628,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.max_retry_attempts`: non-negative integer, default `10` (`0` = unlimited)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -804,6 +805,9 @@ Backoff formula:
 - Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
+- If `attempt > agent.max_retry_attempts` (when non-zero), the issue is blocked with a
+  `retry limit exceeded ... manual intervention required` error instead of being retried.
+  The check runs when a worker fails or stalls; normal continuation retries are not blocked.
 
 Retry handling behavior:
 
@@ -2315,27 +2319,3 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
-
-## Appendix B. Optional GitHub Workflow Extension
-
-The Elixir implementation provides an opt-in GitHub-specific policy described in
-[`elixir/docs/github-workflow.md`](elixir/docs/github-workflow.md). It does not change the default
-Linear workflow or the all-required-labels routing contract.
-
-- Open issues execute with `agent`; `needs-human` pauses execution. Both together are invalid.
-  `merge-approved` is a legacy label and does not authorize a merge. Resuming after `needs-human`
-  opens a new cycle; the host MUST comment with the actor and previous pause reason and state that
-  resuming is not merge authorization.
-- The host MUST freeze and durably store the delivered PR, head SHA and base branch before handoff.
-- Before merging, the host MUST require all reported GitHub checks and statuses on the delivered SHA
-  to pass. GitHub branch protection governs checks not yet reported, including when none exist.
-- Agent tools MUST NOT create authorization labels, directly merge, close unmerged work, or bypass
-  host policy. This extension assumes a trusted deployment; shared credentials and unrestricted
-  shells are outside its tool-enforced boundary, and human identity cannot be proven separately.
-- Repairs producing commits require a fresh delivery; merge MUST use an expected head SHA and obey
-  GitHub protection. Risky changes require a valid review approval for the delivered SHA.
-- Worker-start budgets and merge intent MUST survive restart. Confirmed merges MUST be verified
-  before host-side issue closure. The minimal implementation stores per-issue JSON receipts and
-  rechecks interrupted merges on the next call; finalization outside label-based polling requires
-  explicit host-side recovery. No background recovery service or workflow database is required.
-- Board actions MUST NOT substitute for a required review approval.
