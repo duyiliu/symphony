@@ -20,6 +20,7 @@ import time
 
 from . import config as config_mod
 from . import workspace as workspace_mod
+from . import agent_sessions
 from .agent import runner as agent_runner
 from . import tracker as tracker_adapter
 from .util import normalize_issue_state, present_string
@@ -520,6 +521,14 @@ class Orchestrator:
         self.running[issue.id] = entry
         self.claimed.add(issue.id)
         self.retry_attempts.pop(issue.id, None)
+        agent_session_id = agent_sessions.ensure_session(settings, issue)
+        if agent_session_id:
+            entry["agent_session_id"] = agent_session_id
+            agent_sessions.post_activity(
+                settings, issue, agent_session_id, "thought",
+                "Symphony claimed %s and started Pi worker (attempt=%r, "
+                "worker_host=%s)." % (
+                    issue.identifier, attempt, worker_host or "local"))
 
     # -- worker lifecycle -------------------------------------------------
 
@@ -530,6 +539,7 @@ class Orchestrator:
         entry = self.running.pop(issue_id)
         self._record_session_completion_totals(entry)
         session_id = entry.get("session_id") or "n/a"
+        self._finish_agent_session(entry, reason)
         if reason == agent_runner.DONE_SKIPPED:
             # Claim-time recheck found the task out of active states;
             # release so a later poll can pick it up if it returns.
@@ -561,6 +571,31 @@ class Orchestrator:
         log.info(
             "Agent task finished for issue_id=%s session_id=%s reason=%r",
             issue_id, session_id, reason)
+
+    def _finish_agent_session(self, entry, reason):
+        issue = entry.get("issue")
+        agent_session_id = entry.get("agent_session_id")
+        if issue is None or not agent_session_id:
+            return
+        settings = self._store.settings()
+        if reason == agent_runner.DONE_SKIPPED:
+            return
+        if reason == agent_runner.DONE_NORMAL:
+            agent_sessions.post_activity(
+                settings, issue, agent_session_id, "response",
+                "Pi worker finished %s; awaiting review/delivery."
+                % issue.identifier)
+            agent_sessions.finish_session(
+                settings, issue, agent_session_id,
+                "Completed by Symphony (Pi). Session %s." % (
+                    entry.get("session_id") or "n/a"))
+        else:
+            agent_sessions.post_activity(
+                settings, issue, agent_session_id, "error",
+                "Pi worker for %s exited: %r" % (issue.identifier, reason))
+            agent_sessions.finish_session(
+                settings, issue, agent_session_id,
+                "Failed: %r" % (reason,))
 
     def _block_input_required(self, issue_id, entry, session_id, reason):
         error = self._blocker_error(entry, "agent exited: %r" % (reason,))
