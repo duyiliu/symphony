@@ -644,7 +644,21 @@ def state_payload(orchestrator):
     running = [_running_entry_payload(entry) for entry in snapshot["running"]]
     retrying = [_retry_entry_payload(entry) for entry in snapshot["retrying"]]
     blocked = [_blocked_entry_payload(entry) for entry in snapshot["blocked"]]
-    return {
+    polling = dict(snapshot.get("polling") or {})
+    for key in ("last_started_at", "last_completed_at", "last_success_at"):
+        polling[key] = _iso_full(polling.get(key))
+    published = snapshot.get("published_at")
+    age = (
+        max(0, (datetime.datetime.now(datetime.timezone.utc) - published).total_seconds())
+        if isinstance(published, datetime.datetime) else None)
+    stale_after = max(90, (polling.get("poll_interval_ms") or 30000) / 1000 * 3)
+    alive = snapshot.get("scheduler_alive")
+    status = (
+        "stopped" if alive is False else
+        "stale" if age is not None and age > stale_after else
+        "degraded" if polling.get("last_error") else
+        "healthy" if polling.get("last_success_at") else "starting")
+    result = {
         "generated_at": generated_at,
         "counts": {
             "running": len(running),
@@ -656,7 +670,17 @@ def state_payload(orchestrator):
         "blocked": blocked,
         "codex_totals": snapshot["codex_totals"],
         "rate_limits": snapshot["rate_limits"],
+        "polling": polling,
+        "health": {
+            "status": status,
+            "scheduler_alive": alive,
+            "snapshot_age_seconds": round(age, 3) if age is not None else None,
+        },
     }
+    reporter = getattr(orchestrator, "session_reporter", None)
+    if reporter is not None:
+        result["agent_sessions"] = reporter.snapshot()
+    return result
 
 
 def issue_payload(identifier, orchestrator, settings=None, workflow_path=None):

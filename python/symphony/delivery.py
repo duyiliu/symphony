@@ -21,6 +21,7 @@ import os
 import re
 import threading
 import urllib.parse
+from types import SimpleNamespace
 
 from . import linear
 from . import tracker as tracker_adapter
@@ -455,12 +456,39 @@ class DeliveryRecordStore:
         os.replace(temp, path)
         return payload
 
+    def load_pending_sync(self):
+        """Return confirmed merges whose Linear state still needs syncing.
+
+        These records must stay discoverable after an issue reaches a terminal
+        state because the active-state poll will no longer return it.
+        """
+        try:
+            names = sorted(os.listdir(self.directory))
+        except OSError:
+            return []
+        pending = []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            issue_id = name[:-5]
+            record = self.load(SimpleNamespace(id=issue_id))
+            if record.get("phase") != "merged_pending_sync":
+                continue
+            stored_id = record.get("issue_id")
+            if isinstance(stored_id, str) and stored_id:
+                issue_id = stored_id
+            record = dict(record)
+            record.setdefault("issue_id", issue_id)
+            pending.append(record)
+        return pending
+
 
 class DeliveryController:
     """Background host checker. It never starts an Agent."""
 
-    def __init__(self, store):
+    def __init__(self, store, session_reporter=None):
         self.store = store
+        self.session_reporter = session_reporter
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread = None
@@ -509,8 +537,137 @@ class DeliveryController:
             settings.tracker,
             [delivery.review_state, delivery.merge_state],
         )
+        records = DeliveryRecordStore(delivery.state_dir)
+        pending_by_id = {
+            record["issue_id"]: record
+            for record in records.load_pending_sync()
+            if isinstance(record.get("issue_id"), str) and record["issue_id"]
+        }
+        found_ids = {issue.id for issue in issues}
+        missing_ids = [
+            issue_id for issue_id in pending_by_id
+            if issue_id not in found_ids
+        ]
+        if missing_ids:
+            try:
+                issues.extend(tracker_adapter.fetch_issues_by_ids(
+                    settings.tracker, missing_ids))
+            except Exception as error:  # noqa: BLE001
+                log.warning(
+                    "delivery pending-sync issue refresh failed ids=%s error=%s",
+                    missing_ids, error)
+
+        seen = set()
         for issue in issues:
-            self.check(settings, issue)
+            if issue.id in seen:
+                continue
+            seen.add(issue.id)
+            pending = pending_by_id.get(issue.id)
+            if pending is not None:
+                self._resume_pending_sync(settings, issue, pending)
+            else:
+                self.check(settings, issue)
+
+    def _resume_pending_sync(self, settings, issue, record):
+        """Finish a merge whose GitHub result was already durably confirmed."""
+        lock = self._lock_for(issue.id)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            records = DeliveryRecordStore(settings.delivery.state_dir)
+            current = records.load(issue)
+            if current.get("phase") != "merged_pending_sync":
+                return
+            if not self._pending_sync_belongs_to_current_lifecycle(
+                    settings, issue, current):
+                self._supersede_pending_sync(settings, issue, records, current)
+                return
+            pr_number = current.get("pr")
+            expected_sha = current.get("head_sha") or current.get("gated_sha")
+            if not isinstance(pr_number, int) or not _valid_sha(expected_sha):
+                raise DeliveryError(
+                    "invalid_pending_merge_record",
+                    (pr_number, expected_sha))
+            github = GitHub(settings.delivery)
+            pr = github.request(
+                "GET",
+                _repo_path(settings.delivery.repo, "/pulls/%s" % pr_number))
+            if not isinstance(pr, dict):
+                raise DeliveryError("github_unknown_payload", "pull request")
+            actual_sha = (pr.get("head") or {}).get("sha")
+            if pr.get("merged") is not True or actual_sha != expected_sha:
+                raise DeliveryError(
+                    "pending_merge_still_unconfirmed",
+                    (pr_number, expected_sha, actual_sha))
+            self._confirm_merge(
+                settings, issue, records, current, pr, github)
+        except DeliveryError as error:
+            log.warning(
+                "delivery pending-sync deferred identifier=%s reason=%s detail=%s",
+                issue.identifier, error.reason, error.detail)
+        except Exception:  # noqa: BLE001 - one issue must not stop recovery
+            log.exception(
+                "delivery pending-sync failed identifier=%s", issue.identifier)
+        finally:
+            lock.release()
+
+    def _pending_sync_belongs_to_current_lifecycle(
+            self, settings, issue, record):
+        """Fail closed if a terminal merge was followed by a new task run.
+
+        A pending-sync record may be left after Linear reached Done and the
+        final local save was lost. It may also be left while Linear still sits
+        in the delivery states before that transition. In both cases Done is a
+        valid recovery target. An issue back in the ordinary active states is a
+        new lifecycle and must not be completed from the old PR.
+        """
+        from .util import normalize_issue_state
+
+        delivery = settings.delivery
+        state = normalize_issue_state(issue.state or "")
+        done = normalize_issue_state(delivery.done_state)
+        terminal = {
+            normalize_issue_state(value)
+            for value in (settings.tracker.terminal_states or [])
+        }
+        if state == done or state in terminal:
+            return True
+        allowed = {
+            normalize_issue_state(delivery.review_state),
+            normalize_issue_state(delivery.merge_state),
+        }
+        if state not in allowed:
+            return False
+        expected_state = normalize_issue_state(
+            record.get("pre_sync_state") or "")
+        expected_updated = record.get("pre_sync_updated_at")
+        return (
+            state == expected_state
+            and bool(expected_updated)
+            and expected_updated == _iso(issue.updated_at)
+        )
+
+    def _superseded_delivery_matches(self, record, pr_number):
+        superseded_pr = record.get("pr")
+        return (
+            superseded_pr is None
+            or pr_number is None
+            or pr_number == superseded_pr
+        )
+
+    def _supersede_pending_sync(self, settings, issue, records, record):
+        self._save(records, issue, record, {
+            "phase": "superseded_pending_sync",
+            "session_phase": "superseded_pending_sync",
+            "reason": (
+                "任务在合并同步完成前已进入新的生命周期；旧交付记录不再"
+                "推进当前状态。"
+            ),
+            "superseded_at": _utc_now(),
+        })
+        log.warning(
+            "delivery pending-sync superseded identifier=%s state=%s",
+            issue.identifier, issue.state)
 
     def check(self, settings, issue):
         delivery = settings.delivery
@@ -545,6 +702,16 @@ class DeliveryController:
             return
         records = DeliveryRecordStore(delivery.state_dir)
         record = records.load(issue)
+        if record.get("phase") == "superseded_pending_sync" \
+                and self._superseded_delivery_matches(record, pr_number):
+            log.info(
+                "delivery ignored superseded PR identifier=%s pr=%s",
+                issue.identifier, pr_number)
+            return
+        if record.get("phase") == "superseded_pending_sync":
+            # A different PR is a new delivery object; do not carry rework
+            # counters or gate fingerprints from the superseded lifecycle.
+            record = {}
         github = GitHub(delivery)
 
         pr = github.request(
@@ -603,6 +770,7 @@ class DeliveryController:
                 "pr": pr_number,
                 "head_sha": sha,
             })
+            self._report_session(issue, "waiting", reason, pr_number, sha)
             return
         if action == "pause":
             self._pause(settings, issue, records, record, pr_number, sha,
@@ -622,7 +790,37 @@ class DeliveryController:
                     "unknown delivery decision: %s" % action, fingerprint)
 
     def _save(self, records, issue, record, changes):
-        return records.save(issue, {**record, **changes})
+        payload = {**record, **changes}
+        payload["issue_id"] = issue.id
+        payload["identifier"] = issue.identifier
+        if issue.url:
+            payload["issue_url"] = issue.url
+        phase = changes.get("phase")
+        if phase is not None:
+            payload.pop("agent_session_report", None)
+            if self.session_reporter and phase in (
+                    "merged", "merged_pending_sync", "paused"):
+                report_phase = (
+                    changes.get("session_phase", "merged_pending_sync")
+                    if phase == "merged" else phase)
+                sha = payload.get("head_sha")
+                reason = (
+                    "宿主已核验 GitHub 合并结果；HEAD %s。" % sha
+                    if phase in ("merged", "merged_pending_sync")
+                    else payload.get("reason", "paused"))
+                try:
+                    envelope = self.session_reporter.delivery_event(
+                        issue, report_phase, reason, payload.get("pr"), sha)
+                    if isinstance(envelope, dict):
+                        payload["agent_session_report"] = envelope
+                except Exception as error:  # noqa: BLE001 - reporting stays optional
+                    log.warning("Agent delivery envelope unavailable reason=%s",
+                                getattr(error, "reason", type(error).__name__))
+        return records.save(issue, payload)
+
+    def _report_session(self, issue, phase, reason, pr_number, sha):
+        if self.session_reporter:
+            self.session_reporter.delivery(issue, phase, reason, pr_number, sha)
 
     def _notice(self, settings, issue, records, record, key, body):
         if record.get("last_notice_key") == key:
@@ -713,6 +911,7 @@ class DeliveryController:
             "head_sha": sha,
             "paused_fingerprint": fingerprint,
         })
+        self._report_session(issue, "paused", reason, pr_number, sha)
 
     def _rework(self, settings, issue, records, record, pr_number, sha,
                 reason):
@@ -756,6 +955,7 @@ class DeliveryController:
         })
         try:
             self._transition(settings, issue, settings.delivery.rework_state)
+            self._report_session(issue, "rework", reason, pr_number, sha)
         except Exception as error:  # noqa: BLE001
             log.warning("delivery rework transition failed identifier=%s error=%s",
                         issue.identifier, error)
@@ -839,6 +1039,7 @@ class DeliveryController:
 
     def _confirm_merge(self, settings, issue, records, record, pr, github):
         delivery = settings.delivery
+        was_pending_sync = record.get("phase") == "merged_pending_sync"
         sha = (pr.get("head") or {}).get("sha")
         gated = record.get("gated_sha")
         pr_number = pr.get("number")
@@ -854,6 +1055,22 @@ class DeliveryController:
                 "merge was not confirmed by GitHub",
                 {"head_sha": sha, "issue_updated_at": _iso(issue.updated_at)})
             return
+
+        # GitHub is now the durable source of truth. Persist that confirmation
+        # before mutating Linear so a crash cannot strand a Done issue without
+        # a recoverable terminal delivery record.
+        record = self._save(records, issue, record, {
+            "phase": "merged_pending_sync",
+            "session_phase": "merged_pending_sync",
+            "reason": "GitHub PR 已确认合并，正在同步 Linear 终态。",
+            "pr": pr_number,
+            "head_sha": sha,
+            "gated_sha": sha,
+            "merged_at": _utc_now(),
+            "issue_updated_at": _iso(issue.updated_at),
+            "pre_sync_state": issue.state,
+            "pre_sync_updated_at": _iso(issue.updated_at),
+        })
         from .util import normalize_issue_state
 
         current = self._refresh_issue(settings, issue)
@@ -865,11 +1082,45 @@ class DeliveryController:
         current_state = normalize_issue_state(
             current.state if current is not None else issue.state or "")
         linear_done = current is not None and current_state == done
+        terminal_without_done = (
+            current is not None
+            and current_state in terminal
+            and current_state != done
+        )
+        if current is not None and not linear_done and not terminal_without_done:
+            allowed = {
+                normalize_issue_state(delivery.review_state),
+                normalize_issue_state(delivery.merge_state),
+            }
+            if current_state not in allowed or (
+                    was_pending_sync
+                    and not self._pending_sync_belongs_to_current_lifecycle(
+                        settings, issue, record)):
+                self._supersede_pending_sync(
+                    settings, issue, records, record)
+                return
+            refreshed_state = current.state
+            refreshed_updated = _iso(current.updated_at)
+            if record.get("pre_sync_state") != refreshed_state \
+                    or record.get("pre_sync_updated_at") != refreshed_updated:
+                record = self._save(records, issue, record, {
+                    "phase": "merged_pending_sync",
+                    "session_phase": "merged_pending_sync",
+                    "reason": (
+                        "GitHub PR 已确认合并，正在确认 Linear 生命周期后"
+                        "同步终态。"
+                    ),
+                    "pr": pr_number,
+                    "head_sha": sha,
+                    "gated_sha": sha,
+                    "pre_sync_state": refreshed_state,
+                    "pre_sync_updated_at": refreshed_updated,
+                })
         if current is None:
             log.error(
                 "merged PR but Linear state refresh failed identifier=%s",
                 issue.identifier)
-        elif current_state in terminal and current_state != done:
+        elif terminal_without_done:
             log.warning(
                 "merged PR but issue is already terminal identifier=%s state=%s",
                 issue.identifier, current.state)
@@ -881,6 +1132,29 @@ class DeliveryController:
                 log.error(
                     "merged PR but Linear transition failed identifier=%s "
                     "error=%s", issue.identifier, error)
+
+        if not linear_done and not terminal_without_done:
+            # Keep the intermediate record discoverable. A later poll can
+            # query this issue by ID even if a lost response actually moved it
+            # to Done before the controller observed the result.
+            self._save(records, issue, record, {
+                "phase": "merged_pending_sync",
+                "session_phase": "merged_pending_sync",
+                "reason": "GitHub PR 已确认合并，Linear 终态同步尚未确认。",
+                "pr": pr_number,
+                "head_sha": sha,
+                "gated_sha": sha,
+            })
+            self._report_session(
+                issue, "merged_pending_sync",
+                "宿主已核验 GitHub 合并结果；Linear 终态同步尚未确认。",
+                pr_number, sha)
+            log.warning(
+                "delivery merge confirmed; Linear sync pending "
+                "identifier=%s pr=%s sha=%s",
+                issue.identifier, pr_number, sha)
+            return
+
         key = _digest("merged", delivery.repo, pr_number, sha)
         if linear_done:
             result_text = (
@@ -899,11 +1173,15 @@ class DeliveryController:
             settings, issue, records, record, key, result_text)
         self._save(records, issue, record, {
             "phase": "merged",
+            "session_phase": "merged" if linear_done else "merged_pending_sync",
             "reason": "merged",
             "pr": pr_number,
             "head_sha": sha,
             "gated_sha": sha,
         })
+        self._report_session(
+            issue, "merged" if linear_done else "merged_pending_sync",
+            "宿主已核验 GitHub 合并结果；HEAD %s。" % sha, pr_number, sha)
         log.info(
             "delivery merged identifier=%s pr=%s sha=%s",
             issue.identifier, pr_number, sha)

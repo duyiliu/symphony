@@ -20,7 +20,6 @@ import time
 
 from . import config as config_mod
 from . import workspace as workspace_mod
-from . import agent_sessions
 from .agent import runner as agent_runner
 from . import tracker as tracker_adapter
 from .util import normalize_issue_state, present_string
@@ -69,8 +68,9 @@ class _Call:
 
 
 class Orchestrator:
-    def __init__(self, store):
+    def __init__(self, store, session_reporter=None):
         self._store = store
+        self.session_reporter = session_reporter
         self._mailbox = queue.Queue()
         self._thread = None
         self._stop = threading.Event()
@@ -92,6 +92,11 @@ class Orchestrator:
         self.codex_totals = dict(_EMPTY_TOTALS)
         self.codex_rate_limits = None
         self._published = None
+        self.last_poll_started_at = None
+        self.last_poll_completed_at = None
+        self.last_poll_success_at = None
+        self.last_poll_error = None
+        self.poll_count = 0
 
     # -- lifecycle ------------------------------------------------------
 
@@ -135,7 +140,12 @@ class Orchestrator:
         # back to the mailbox call.
         published = self._published
         if published is not None:
-            return published
+            # A cached snapshot is useful even when a poll is slow, but it
+            # must not hide a dead scheduler thread or an old publication.
+            result = dict(published)
+            result["scheduler_alive"] = bool(
+                self._thread and self._thread.is_alive())
+            return result
 
         def handler(state):
             self._refresh_runtime_config()
@@ -227,13 +237,18 @@ class Orchestrator:
         self._mailbox.put(("run_poll_cycle",))
 
     def _on_run_poll_cycle(self):
+        self.last_poll_started_at = _now()
         try:
             self._refresh_runtime_config()
             self._maybe_dispatch()
-        except Exception:  # noqa: BLE001 - the poll loop must keep ticking
+        except Exception as error:  # noqa: BLE001 - the poll loop must keep ticking
+            self.last_poll_error = getattr(error, "reason", type(error).__name__)
             log.exception("poll cycle failed")
-        self._schedule_tick(self.poll_interval_ms)
-        self.poll_check_in_progress = False
+        finally:
+            self.last_poll_completed_at = _now()
+            self.poll_count += 1
+            self._schedule_tick(self.poll_interval_ms)
+            self.poll_check_in_progress = False
 
     def _schedule_tick(self, delay_ms):
         if self.tick_timer:
@@ -277,6 +292,7 @@ class Orchestrator:
         try:
             self._store.force_reload()
         except WorkflowError as error:
+            self.last_poll_error = error.reason
             self._log_config_error(error)
             return
         settings = self._store.settings()
@@ -289,8 +305,13 @@ class Orchestrator:
         try:
             issues = tracker_adapter.fetch_candidate_issues(settings.tracker)
         except Exception as error:  # noqa: BLE001
+            self.last_poll_error = getattr(error, "reason", type(error).__name__)
             log.error("Failed to fetch from issue tracker: %r", error)
             return
+        if self.last_poll_error:
+            log.info("Issue tracker polling recovered")
+        self.last_poll_success_at = _now()
+        self.last_poll_error = None
         if self._available_slots() > 0:
             self._choose_issues(issues, settings)
 
@@ -521,14 +542,9 @@ class Orchestrator:
         self.running[issue.id] = entry
         self.claimed.add(issue.id)
         self.retry_attempts.pop(issue.id, None)
-        agent_session_id = agent_sessions.ensure_session(settings, issue)
-        if agent_session_id:
-            entry["agent_session_id"] = agent_session_id
-            agent_sessions.post_activity(
-                settings, issue, agent_session_id, "thought",
-                "Symphony claimed %s and started Pi worker (attempt=%r, "
-                "worker_host=%s)." % (
-                    issue.identifier, attempt, worker_host or "local"))
+        if self.session_reporter:
+            self.session_reporter.started(
+                issue, attempt=attempt, model=settings.runtime.model)
 
     # -- worker lifecycle -------------------------------------------------
 
@@ -574,28 +590,12 @@ class Orchestrator:
 
     def _finish_agent_session(self, entry, reason):
         issue = entry.get("issue")
-        agent_session_id = entry.get("agent_session_id")
-        if issue is None or not agent_session_id:
+        if issue is None or not self.session_reporter:
             return
-        settings = self._store.settings()
         if reason == agent_runner.DONE_SKIPPED:
             return
-        if reason == agent_runner.DONE_NORMAL:
-            agent_sessions.post_activity(
-                settings, issue, agent_session_id, "response",
-                "Pi worker finished %s; awaiting review/delivery."
-                % issue.identifier)
-            agent_sessions.finish_session(
-                settings, issue, agent_session_id,
-                "Completed by Symphony (Pi). Session %s." % (
-                    entry.get("session_id") or "n/a"))
-        else:
-            agent_sessions.post_activity(
-                settings, issue, agent_session_id, "error",
-                "Pi worker for %s exited: %r" % (issue.identifier, reason))
-            agent_sessions.finish_session(
-                settings, issue, agent_session_id,
-                "Failed: %r" % (reason,))
+        normal = reason == agent_runner.DONE_NORMAL
+        self.session_reporter.worker_finished(issue, normal)
 
     def _block_input_required(self, issue_id, entry, session_id, reason):
         error = self._blocker_error(entry, "agent exited: %r" % (reason,))
@@ -643,6 +643,8 @@ class Orchestrator:
             return
         if "event" not in update or "timestamp" not in update:
             return
+        if self.session_reporter:
+            self.session_reporter.progress(entry.get("issue"), update)
         token_delta = self._extract_token_delta(entry, update)
         entry["codex_input_tokens"] = entry.get("codex_input_tokens", 0) + token_delta["input_tokens"]
         entry["codex_output_tokens"] = entry.get("codex_output_tokens", 0) + token_delta["output_tokens"]
@@ -877,6 +879,8 @@ class Orchestrator:
             retry["timer"].cancel()
         self.claimed.add(issue_id)
         self.blocked[issue_id] = blocked_entry
+        if self.session_reporter:
+            self.session_reporter.blocked(entry.get("issue"))
 
     # -- reconciliation -------------------------------------------------------
 
@@ -911,11 +915,15 @@ class Orchestrator:
             log.info(
                 "Issue moved to terminal state: %s state=%s; stopping active agent",
                 _issue_context(issue), issue.state)
+            if self.session_reporter:
+                self.session_reporter.stopped(issue)
             self._terminate_running_issue(issue.id, True, settings)
         elif not tracker_adapter.routable(issue, settings.tracker):
             log.info(
                 "Issue no longer routed to this worker: %s assignee=%r; "
                 "stopping active agent", _issue_context(issue), issue.assignee_id)
+            if self.session_reporter:
+                self.session_reporter.stopped(issue)
             self._terminate_running_issue(issue.id, False, settings)
         elif state_name in active:
             entry = self.running.get(issue.id)
@@ -925,6 +933,13 @@ class Orchestrator:
             log.info(
                 "Issue moved to non-active state: %s state=%s; stopping active agent",
                 _issue_context(issue), issue.state)
+            if self.session_reporter:
+                if settings.delivery.enabled and state_name in {
+                        normalize_issue_state(settings.delivery.review_state),
+                        normalize_issue_state(settings.delivery.merge_state)}:
+                    self.session_reporter.worker_finished(issue, True)
+                else:
+                    self.session_reporter.stopped(issue)
             self._terminate_running_issue(issue.id, False, settings)
 
     def _reconcile_blocked_issues(self):
@@ -1248,12 +1263,19 @@ class Orchestrator:
                 "last_codex_event": entry.get("last_codex_event"),
             })
         return {
+            "published_at": now,
+            "scheduler_alive": bool(self._thread and self._thread.is_alive()),
             "running": running,
             "retrying": retrying,
             "blocked": blocked,
             "codex_totals": self.codex_totals,
             "rate_limits": self.codex_rate_limits,
             "polling": {
+                "last_started_at": self.last_poll_started_at,
+                "last_completed_at": self.last_poll_completed_at,
+                "last_success_at": self.last_poll_success_at,
+                "last_error": self.last_poll_error,
+                "count": self.poll_count,
                 "checking": self.poll_check_in_progress is True,
                 "next_poll_in_ms": (
                     max(0, self.next_poll_due_at_ms - now_ms)

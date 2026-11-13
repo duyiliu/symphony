@@ -542,9 +542,6 @@ def test_github_api_allowlist(tmp_path):
         ("PATCH", "%s/issues/1" % repo, {"state": "closed"}),
         ("PATCH", "%s/pulls/1" % repo, {"state": "closed"}),
         ("PATCH", "%s/issues/comments/9" % repo, {"body": "new"}),
-        ("PUT", "%s/pulls/1/merge" % repo,
-         {"sha": "a" * 40, "merge_method": "squash",
-          "commit_title": "t", "commit_message": "m"}),
         ("DELETE", "%s/issues/comments/9" % repo, None),
     ]
     with patch.object(gh_client, "request") as call:
@@ -568,6 +565,9 @@ def test_github_api_forbidden_paths_and_bodies(tmp_path):
         ("DELETE", "/repos/o/r/git/refs/heads/x", None),
         ("PUT", "/repos/o/r/pulls/1", {"x": 1}),             # non-merge
         ("PUT", "/repos/o/r/pulls/1/merge", {"evil": True}),
+        ("PUT", "/repos/o/r/pulls/1/merge",
+         {"sha": "a" * 40, "merge_method": "squash",
+          "commit_title": "t", "commit_message": "m"}),       # host-only merge
         ("POST", "/repos/o/r/issues/1/comments",
          {"body": "x", "admin": True}),                      # bad key
         ("PATCH", "/repos/o/r/pulls/1", {"merged": True}),

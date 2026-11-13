@@ -575,6 +575,36 @@ def _finalize(settings):
     if tracker.kind == "linear":
         secret_names = ["LINEAR_API_KEY"] + env_reference_names(
             [tracker.api_key])
+        session_conf = provider.get("agent_sessions") or {}
+        if not isinstance(session_conf, dict):
+            raise _invalid("tracker.provider.agent_sessions must be a map")
+        if "enabled" in session_conf and not isinstance(session_conf["enabled"], bool):
+            raise _invalid("tracker.provider.agent_sessions.enabled must be boolean")
+        for key in ("state_dir", "status_url"):
+            if key in session_conf and not isinstance(session_conf[key], str):
+                raise _invalid("tracker.provider.agent_sessions.%s must be a string" % key)
+        interval = session_conf.get("progress_interval_seconds", 30)
+        if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 2:
+            raise _invalid("agent session progress_interval_seconds must be >= 2")
+        limit = session_conf.get("max_progress_activities", 20)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 50:
+            raise _invalid("agent session max_progress_activities must be between 0 and 50")
+        oauth = session_conf.get("oauth") or {}
+        if not isinstance(oauth, dict):
+            raise _invalid("tracker.provider.agent_sessions.oauth must be a map")
+        for key, value in oauth.items():
+            if key in ("client_id", "client_secret", "token_url", "scope") \
+                    and not isinstance(value, str):
+                raise _invalid("agent session oauth.%s must be a string" % key)
+        secret_names += [
+            "LINEAR_OAUTH_CLIENT_ID",
+            "LINEAR_OAUTH_CLIENT_SECRET",
+            "LINEAR_OAUTH_ACCESS_TOKEN",
+            "LINEAR_WEBHOOK_SIGNING_SECRET",
+        ] + env_reference_names([
+            oauth.get("client_id"), oauth.get("client_secret"),
+            oauth.get("access_token"),
+        ])
         secret_names += [
             "GITHUB_TOKEN",
             "GH_TOKEN",

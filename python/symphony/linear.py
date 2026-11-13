@@ -92,14 +92,14 @@ def validate_config(settings):
         raise WorkflowError("missing_tracker_states")
 
 
-def graphql(settings, query, variables=None):
+def graphql(settings, query, variables=None, authorization=None, timeout=30):
     if not isinstance(query, str) or not query.strip():
         raise WorkflowError("missing_linear_query")
     if variables is None:
         variables = {}
     if not isinstance(variables, dict):
         raise WorkflowError("invalid_linear_variables")
-    token = _token(settings)
+    token = authorization if authorization is not None else _token(settings)
     if not token:
         raise WorkflowError("missing_linear_api_token")
     data = json.dumps({"query": query, "variables": variables}).encode("utf-8")
@@ -108,13 +108,29 @@ def graphql(settings, query, variables=None):
         headers={"Authorization": token, "Content-Type": "application/json"},
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=timeout) as response:
             payload = json.load(response)
-    except (HTTPError, URLError, ValueError, OSError) as error:
+    except HTTPError as error:
+        # Never include response bodies: OAuth errors may contain credentials.
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        raise WorkflowError("linear_api_http_error", {
+            "status": error.code, "retry_after": retry_after,
+        }) from None
+    except (URLError, ValueError, OSError) as error:
         raise WorkflowError("linear_api_request", str(error)) from error
     if not isinstance(payload, dict):
         raise WorkflowError("linear_unknown_payload")
     if payload.get("errors"):
+        # The session reporter needs machine-readable rate-limit/auth signals;
+        # preserve the existing message contract for tracker callers.
+        codes = [
+            (item.get("extensions") or {}).get("code")
+            for item in payload["errors"] if isinstance(item, dict)
+        ]
+        if "RATELIMITED" in codes:
+            raise WorkflowError("linear_rate_limited")
+        if "AUTHENTICATION_ERROR" in codes or "UNAUTHENTICATED" in codes:
+            raise WorkflowError("linear_unauthenticated")
         raise WorkflowError("linear_graphql_errors", str(payload["errors"])[:500])
     return payload
 

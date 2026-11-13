@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -355,12 +355,15 @@ class ControllerTest(unittest.TestCase):
 
     def test_low_risk_pr_is_merged_and_linear_done(self):
         fake = _FakeGitHub(self.cfg.delivery)
+        reporter = Mock()
+        self.controller.session_reporter = reporter
         with patch.object(delivery, "GitHub", return_value=fake):
             self.controller.poll_once()
         self.assertEqual(self.transitions, ["Merging", "Done"])
         self.assertTrue(any("已由宿主安全门禁合并" in body
                             for body in self.comments))
         self.assertTrue(any(call[0] == "PUT" for call in fake.calls))
+        self.assertEqual(reporter.delivery.call_args.args[1], "merged")
 
     def test_merge_is_not_repeated_after_restart(self):
         fake = _FakeGitHub(
@@ -378,12 +381,15 @@ class ControllerTest(unittest.TestCase):
     def test_high_risk_pr_is_paused_without_merge(self):
         fake = _FakeGitHub(
             self.cfg.delivery, files=[{"filename": "auth/login.js"}])
+        reporter = Mock()
+        self.controller.session_reporter = reporter
         with patch.object(delivery, "GitHub", return_value=fake):
             self.controller.poll_once()
         self.assertNotIn("Done", self.transitions)
         self.assertTrue(any("自动交付已暂停" in body
                             for body in self.comments))
         self.assertFalse(any(call[0] == "PUT" for call in fake.calls))
+        self.assertEqual(reporter.delivery.call_args.args[1], "paused")
 
     def test_failed_checks_move_to_rework(self):
         fake = _FakeGitHub(self.cfg.delivery)
