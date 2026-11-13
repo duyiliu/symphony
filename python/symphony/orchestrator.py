@@ -706,8 +706,9 @@ class Orchestrator:
     def _retry_limit_error(attempt, settings, reason):
         limit = getattr(settings.agent, "max_retry_attempts", 0)
         return (
-            "retry limit exceeded after %d attempt(s) "
-            "(agent.max_retry_attempts=%d): %s; manual intervention required"
+            "retry limit exceeded after %d failed attempt(s) "
+            "(agent.max_retry_attempts=%d retries allowed): %s; "
+            "manual intervention required"
             % (attempt, limit, reason)
         )
 
