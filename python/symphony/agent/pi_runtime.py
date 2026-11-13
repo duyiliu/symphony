@@ -441,6 +441,13 @@ def stop_session(session):
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             pass
+    finally:
+        for stream in (process.stdin, process.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
 
 
 def _emit(on_message, event, fields):
