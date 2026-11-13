@@ -496,6 +496,16 @@ class Orchestrator:
             thread.start()
         except Exception as error:  # noqa: BLE001
             log.error("Unable to spawn agent for %s: %r", _issue_context(issue), error)
+            next_attempt = (attempt + 1) if isinstance(attempt, int) and attempt > 0 else 1
+            if self._retry_limit_exceeded(next_attempt, settings):
+                block_error = self._retry_limit_error(
+                    next_attempt, settings, "failed to spawn agent: %r" % error)
+                self._block_issue_from_entry(issue.id, {
+                    "identifier": issue.identifier,
+                    "issue": issue,
+                    "worker_host": worker_host,
+                }, block_error)
+                return
             self._schedule_issue_retry(issue.id, attempt + 1 if attempt else None, {
                 "identifier": issue.identifier,
                 "issue_url": issue.url,
@@ -561,10 +571,20 @@ class Orchestrator:
         self._block_issue_from_entry(issue_id, entry, error)
 
     def _retry_agent_down(self, issue_id, entry, session_id, reason):
+        settings = self._store.settings()
+        next_attempt = self._next_retry_attempt_from_running(entry) or 1
+        if self._retry_limit_exceeded(next_attempt, settings):
+            error = self._retry_limit_error(
+                next_attempt, settings, "agent exited: %r" % (reason,))
+            log.error(
+                "Agent retry limit exceeded for issue_id=%s issue_identifier=%s "
+                "session_id=%s; blocking: %s",
+                issue_id, entry.get("identifier"), session_id, error)
+            self._stop_and_block_issue(issue_id, entry, error)
+            return
         log.warning(
             "Agent task exited for issue_id=%s session_id=%s reason=%r; "
             "scheduling retry", issue_id, session_id, reason)
-        next_attempt = self._next_retry_attempt_from_running(entry)
         self._schedule_issue_retry(issue_id, next_attempt, {
             "identifier": entry.get("identifier"),
             "issue_url": entry["issue"].url if entry.get("issue") else None,
@@ -674,6 +694,23 @@ class Orchestrator:
             FAILURE_RETRY_BASE_MS * (1 << power),
             settings.agent.max_retry_backoff_ms)
 
+    @staticmethod
+    def _retry_limit_exceeded(attempt, settings):
+        limit = getattr(settings.agent, "max_retry_attempts", 0)
+        return (
+            isinstance(limit, int) and limit > 0
+            and isinstance(attempt, int) and attempt > limit
+        )
+
+    @staticmethod
+    def _retry_limit_error(attempt, settings, reason):
+        limit = getattr(settings.agent, "max_retry_attempts", 0)
+        return (
+            "retry limit exceeded after %d attempt(s) "
+            "(agent.max_retry_attempts=%d): %s; manual intervention required"
+            % (attempt, limit, reason)
+        )
+
     def _on_retry_issue(self, issue_id, token):
         entry = self.retry_attempts.get(issue_id)
         if entry is None or entry.get("retry_token") != token:
@@ -725,6 +762,21 @@ class Orchestrator:
         self._release_issue_claim(issue_id)
 
     def _handle_active_retry(self, issue, attempt, metadata, settings):
+        if metadata.get("delay_type") != "continuation" \
+                and self._retry_limit_exceeded(attempt, settings):
+            error = self._retry_limit_error(
+                attempt, settings,
+                metadata.get("error") or "retry limit reached before dispatch")
+            log.error(
+                "Retry limit exceeded before dispatch for %s; blocking: %s",
+                _issue_context(issue), error)
+            self._block_issue_from_entry(issue.id, {
+                "identifier": issue.identifier,
+                "issue": issue,
+                "worker_host": metadata.get("worker_host"),
+                "workspace_path": metadata.get("workspace_path"),
+            }, error)
+            return
         terminal = self._terminal_state_set(settings)
         active = self._active_state_set(settings)
         slots = self._candidate_issue(issue, active, terminal, settings) and (
@@ -919,13 +971,24 @@ class Orchestrator:
                     "Issue stalled: issue_id=%s issue_identifier=%s session_id=%s "
                     "elapsed_ms=%s; restarting with backoff",
                     issue_id, identifier, session_id, elapsed_ms)
-                next_attempt = self._next_retry_attempt_from_running(entry)
-                self._terminate_running_issue(issue_id, False, settings)
-                self._schedule_issue_retry(issue_id, next_attempt, {
-                    "identifier": identifier,
-                    "issue_url": entry["issue"].url if entry.get("issue") else None,
-                    "error": "stalled for %dms without codex activity" % elapsed_ms,
-                })
+                next_attempt = self._next_retry_attempt_from_running(entry) or 1
+                if self._retry_limit_exceeded(next_attempt, settings):
+                    error = self._retry_limit_error(
+                        next_attempt, settings,
+                        "stalled for %dms without codex activity" % elapsed_ms)
+                    log.error(
+                        "Issue stalled and retry limit exceeded: issue_id=%s "
+                        "issue_identifier=%s session_id=%s; blocking: %s",
+                        issue_id, identifier, session_id, error)
+                    self._record_session_completion_totals(entry)
+                    self._stop_and_block_issue(issue_id, entry, error)
+                else:
+                    self._terminate_running_issue(issue_id, False, settings)
+                    self._schedule_issue_retry(issue_id, next_attempt, {
+                        "identifier": identifier,
+                        "issue_url": entry["issue"].url if entry.get("issue") else None,
+                        "error": "stalled for %dms without codex activity" % elapsed_ms,
+                    })
 
     def _log_missing_running_issue(self, issue_id):
         entry = self.running.get(issue_id)

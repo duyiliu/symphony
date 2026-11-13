@@ -455,6 +455,11 @@ Fields:
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
+- `max_retry_attempts` (non-negative integer)
+  - Default: `10`
+  - Limits failure-driven retries for one issue; `0` disables the limit.
+  - When exceeded, the issue is blocked and requires manual intervention.
+  - Normal continuation retries are not blocked by this limit.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`trim + lowercase`) for lookup.
@@ -623,6 +628,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.max_retry_attempts`: non-negative integer, default `10` (`0` = unlimited)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -799,6 +805,9 @@ Backoff formula:
 - Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
+- If `attempt > agent.max_retry_attempts` (when non-zero), the issue is blocked with a
+  `retry limit exceeded ... manual intervention required` error instead of being retried.
+  The check runs when a worker fails or stalls; normal continuation retries are not blocked.
 
 Retry handling behavior:
 

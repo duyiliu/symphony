@@ -61,6 +61,7 @@ class AgentSettings:
     max_concurrent_agents: int = 10
     max_turns: int = 20
     max_retry_backoff_ms: int = 300_000
+    max_retry_attempts: int = 10
     max_concurrent_agents_by_state: dict = field(default_factory=dict)
 
 
@@ -291,6 +292,10 @@ def parse_settings(config):
         max_turns=_opt_int(agent.get("max_turns"), "agent.max_turns", 1, errors) or 20,
         max_retry_backoff_ms=_opt_int(
             agent.get("max_retry_backoff_ms"), "agent.max_retry_backoff_ms", 1, errors) or 300_000,
+        max_retry_attempts=(
+            _opt_int(agent.get("max_retry_attempts"), "agent.max_retry_attempts", 0, errors)
+            if agent.get("max_retry_attempts") is not None else 10
+        ),
         max_concurrent_agents_by_state=state_limits,
     )
 

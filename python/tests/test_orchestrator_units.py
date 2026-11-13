@@ -169,6 +169,134 @@ class RetryDelayTest(unittest.TestCase):
             orch._retry_delay(2, {"delay_type": "continuation"}, settings), 20000)
 
 
+class RetryLimitTest(unittest.TestCase):
+    def _limited_settings(self, limit):
+        return _settings(agent={
+            "max_concurrent_agents": 2,
+            "max_retry_backoff_ms": 300000,
+            "max_retry_attempts": limit,
+        })
+
+    def test_retry_agent_down_blocks_at_limit(self):
+        orch = _orchestrator(self._limited_settings(2))
+        entry = {
+            "ref": 1,
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "retry_attempt": 2,
+            "handle": _FakeHandle(),
+        }
+        orch.running["1"] = entry
+        orch.claimed.add("1")
+        orch._retry_agent_down("1", entry, "sess", "boom")
+        self.assertIn("1", orch.blocked)
+        self.assertIn("retry limit exceeded", orch.blocked["1"]["error"])
+        self.assertIn("1", orch.claimed)
+        self.assertNotIn("1", orch.running)
+        self.assertNotIn("1", orch.retry_attempts)
+
+    def test_retry_agent_down_schedules_within_limit(self):
+        orch = _orchestrator(self._limited_settings(2))
+        entry = {
+            "ref": 1,
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "retry_attempt": 0,
+            "handle": _FakeHandle(),
+        }
+        with patch.object(orch, "_schedule_issue_retry") as schedule:
+            orch._retry_agent_down("1", entry, "sess", "boom")
+        schedule.assert_called_once()
+        self.assertEqual(schedule.call_args.args[1], 1)
+        self.assertNotIn("1", orch.blocked)
+
+    def test_stall_blocks_at_retry_limit(self):
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        settings.runtime.kind = "pi"
+        settings.runtime.stall_timeout_ms = 1000
+        handle = _FakeHandle()
+        entry = {
+            "ref": 1,
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "retry_attempt": 2,
+            "started_at": datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=4000),
+            "last_codex_timestamp": None,
+            "handle": handle,
+        }
+        orch.running["1"] = entry
+        orch.claimed.add("1")
+        orch._reconcile_stalled_running_issues(settings)
+        self.assertIn("1", orch.blocked)
+        self.assertIn("retry limit exceeded", orch.blocked["1"]["error"])
+        self.assertTrue(handle.cancelled)
+        self.assertNotIn("1", orch.retry_attempts)
+
+    def test_retry_limit_blocks_before_dispatch(self):
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        orch._handle_active_retry(
+            _issue("1"), 3, {"identifier": "GH-1", "error": "boom"}, settings)
+        self.assertIn("1", orch.blocked)
+        self.assertIn("retry limit exceeded", orch.blocked["1"]["error"])
+
+    def test_continuation_is_not_blocked_by_retry_limit(self):
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        orch.max_concurrent_agents = 1
+        orch.running["other"] = {"issue": _issue("other")}
+        with patch.object(orch, "_schedule_issue_retry") as schedule:
+            orch._handle_active_retry(
+                _issue("1"), 3,
+                {"delay_type": "continuation", "identifier": "GH-1"},
+                settings)
+        schedule.assert_called_once()
+        self.assertNotIn("1", orch.blocked)
+
+
+class ReconciliationTest(unittest.TestCase):
+    def _running(self, orch, handle):
+        orch.running["1"] = {
+            "ref": 1,
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "handle": handle,
+        }
+        orch.claimed.add("1")
+
+    def test_non_active_state_stops_running_agent(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+        handle = _FakeHandle()
+        self._running(orch, handle)
+        orch._reconcile_issue_state(
+            _issue("1", state="human review"),
+            orch._active_state_set(settings),
+            orch._terminal_state_set(settings),
+            settings)
+        self.assertTrue(handle.cancelled)
+        self.assertNotIn("1", orch.running)
+        self.assertNotIn("1", orch.claimed)
+
+    def test_terminal_state_stops_running_agent(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+        handle = _FakeHandle()
+        self._running(orch, handle)
+        with patch.object(orch, "_cleanup_issue_workspace") as cleanup:
+            orch._reconcile_issue_state(
+                _issue("1", state="closed"),
+                orch._active_state_set(settings),
+                orch._terminal_state_set(settings),
+                settings)
+        cleanup.assert_called_once()
+        self.assertTrue(handle.cancelled)
+        self.assertNotIn("1", orch.running)
+        self.assertNotIn("1", orch.claimed)
+
+
 class TokenDeltaTest(unittest.TestCase):
     def test_turn_completed_usage(self):
         orch = _orchestrator()

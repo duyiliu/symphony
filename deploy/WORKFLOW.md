@@ -38,6 +38,7 @@ agent:
   max_concurrent_agents: 3
   max_turns: 20
   max_retry_backoff_ms: 300000
+  max_retry_attempts: 10
 
 runtime:
   kind: pi
