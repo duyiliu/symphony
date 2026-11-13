@@ -41,7 +41,7 @@ agent:
 
 runtime:
   kind: pi
-  command: pi --mode rpc --no-extensions --skill /opt/symphony-src/.codex/skills/land --no-prompt-templates --approve --tools read,bash,edit,write,grep,find,ls --session-dir /root/symphony/sessions
+  command: pi --mode rpc --no-extensions --skill /opt/symphony-src/.codex/skills --no-prompt-templates --approve --tools read,bash,edit,write,grep,find,ls --session-dir /root/symphony/sessions
   turn_timeout_ms: 3600000
   stall_timeout_ms: 1500000
   mcp:
