@@ -243,6 +243,10 @@ class ChecksTest(unittest.TestCase):
 
 
 class DiscoveryTest(unittest.TestCase):
+    def test_error_message_tolerates_tuple_detail(self):
+        error = delivery.DeliveryError("github_status", (500, "GET", "/x"))
+        self.assertEqual(str(error), "github_status: (500, 'GET', '/x')")
+
     def test_single_pr(self):
         self.assertEqual(delivery.discover_pr(issue(), "o/r"), 7)
 

@@ -36,8 +36,10 @@ class DeliveryError(Exception):
     def __init__(self, reason, detail=None):
         self.reason = reason
         self.detail = detail
-        super().__init__(
-            "%s%s" % (reason, ": %s" % detail if detail is not None else ""))
+        message = str(reason)
+        if detail is not None:
+            message = "%s: %s" % (message, detail)
+        super().__init__(message)
 
 
 class _NotFoundType:
