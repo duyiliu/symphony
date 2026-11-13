@@ -17,6 +17,8 @@ class Issue:
     branch_name: str = None
     url: str = None
     assignee_id: str = None
+    team_id: str = None
+    attachments: list = field(default_factory=list)
     blocked_by: list = field(default_factory=list)
     labels: list = field(default_factory=list)
     dispatchable: bool = False
@@ -49,6 +51,8 @@ class Issue:
             "branch_name": self.branch_name,
             "url": self.url,
             "assignee_id": self.assignee_id,
+            "team_id": self.team_id,
+            "attachments": list(self.attachments or []),
             "blocked_by": self.blocked_by or [],
             "labels": list(self.labels or []),
             "dispatchable": self.dispatchable,

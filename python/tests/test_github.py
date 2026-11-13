@@ -83,7 +83,7 @@ class AllowRequestTest(unittest.TestCase):
         self.assertTrue(self._ok(
             "POST", "https://api.github.com/repos/o/r/issues/1/comments",
             {"body": "hi"}))
-        self.assertTrue(self._ok(
+        self.assertFalse(self._ok(
             "PUT", "https://api.github.com/repos/o/r/pulls/1/merge",
             {"sha": "a" * 40, "merge_method": "squash"}))
         self.assertTrue(self._ok(

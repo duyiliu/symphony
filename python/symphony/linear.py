@@ -18,9 +18,13 @@ log = logging.getLogger("symphony.linear")
 PAGE_SIZE = 50
 FIELDS = """
   id identifier title description priority branchName url createdAt updatedAt
+  team { id }
   state { name }
   assignee { id }
   labels { nodes { name } }
+  attachments(first: 50) {
+    nodes { id title subtitle url sourceType metadata }
+  }
   inverseRelations(first: 50) {
     nodes { type issue { id identifier state { name } } }
   }
@@ -56,6 +60,8 @@ TOOL_SPEC = {
         },
     },
 }
+
+_STATE_CACHE = {}
 
 
 def _provider(settings):
@@ -166,11 +172,27 @@ def _normalize(row, settings, assignee_id=None):
     priority = row.get("priority")
     if isinstance(priority, bool) or not isinstance(priority, int):
         priority = None
+    team = row.get("team") or {}
+    team_id = team.get("id") if isinstance(team, dict) else None
+    attachments = []
+    attachment_nodes = (row.get("attachments") or {}).get("nodes") or []
+    for item in attachment_nodes:
+        if not isinstance(item, dict) or not present_string(item.get("url")):
+            continue
+        attachments.append({
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "subtitle": item.get("subtitle"),
+            "url": item.get("url"),
+            "source_type": item.get("sourceType"),
+            "metadata": item.get("metadata"),
+        })
     return Issue(
         id=row["id"], identifier=row["identifier"], title=row["title"],
         description=row.get("description"), priority=priority, state=state_name,
         branch_name=row.get("branchName"), url=row.get("url"),
-        assignee_id=assigned, blocked_by=blockers, labels=labels,
+        assignee_id=assigned, team_id=team_id, attachments=attachments,
+        blocked_by=blockers, labels=labels,
         dispatchable=(not is_blocked and (assignee_id is None or assigned == assignee_id)),
         created_at=parse_datetime(row.get("createdAt")),
         updated_at=parse_datetime(row.get("updatedAt")),
@@ -234,6 +256,68 @@ def fetch_issues_by_ids(settings, issue_ids):
                 raise WorkflowError("linear_unknown_payload")
             found[issue.id] = issue
     return [found[issue_id] for issue_id in ids if issue_id in found]
+
+
+def clear_state_cache():
+    _STATE_CACHE.clear()
+
+
+def state_id(settings, team_id, state_name):
+    if not present_string(team_id) or not present_string(state_name):
+        raise WorkflowError("missing_linear_state_identity")
+    key = (_endpoint(settings), team_id)
+    states = _STATE_CACHE.get(key)
+    if states is None:
+        payload = graphql(
+            settings,
+            "query SymphonyLinearTeamStates($teamId: String!) {"
+            " team(id: $teamId) { states(first: 100) { nodes { id name } } } }",
+            {"teamId": team_id},
+        )
+        data = payload.get("data") or {}
+        team = data.get("team") if isinstance(data, dict) else None
+        nodes = ((team or {}).get("states") or {}).get("nodes")
+        if not isinstance(nodes, list):
+            raise WorkflowError("linear_unknown_payload")
+        states = {}
+        for node in nodes:
+            if isinstance(node, dict) and present_string(node.get("id")) \
+                    and present_string(node.get("name")):
+                states[normalize_issue_state(node["name"])] = node["id"]
+        _STATE_CACHE[key] = states
+    wanted = normalize_issue_state(state_name)
+    if wanted not in states:
+        raise WorkflowError("unknown_linear_state", state_name)
+    return states[wanted]
+
+
+def update_issue_state(settings, issue_id, team_id, state_name):
+    resolved = state_id(settings, team_id, state_name)
+    payload = graphql(
+        settings,
+        "mutation SymphonyLinearUpdateIssue($id: String!, $input: IssueUpdateInput!) {"
+        " issueUpdate(id: $id, input: $input) { success issue { id state { name } } } }",
+        {"id": issue_id, "input": {"stateId": resolved}},
+    )
+    result = (payload.get("data") or {}).get("issueUpdate")
+    if not isinstance(result, dict) or result.get("success") is not True:
+        raise WorkflowError("linear_issue_update_failed")
+    return result
+
+
+def create_comment(settings, issue_id, body):
+    if not present_string(issue_id) or not present_string(body):
+        raise WorkflowError("invalid_linear_comment")
+    payload = graphql(
+        settings,
+        "mutation SymphonyLinearCreateComment($input: CommentCreateInput!) {"
+        " commentCreate(input: $input) { success comment { id } } }",
+        {"input": {"issueId": issue_id, "body": body}},
+    )
+    result = (payload.get("data") or {}).get("commentCreate")
+    if not isinstance(result, dict) or result.get("success") is not True:
+        raise WorkflowError("linear_comment_create_failed")
+    return result
 
 
 def routable(issue, tracker_settings):

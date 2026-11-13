@@ -100,7 +100,11 @@ def tool_specs(tracker_settings=None):
         store = get_store()
         tracker_settings = store.settings().tracker if store else None
     if tracker_settings and _is_linear(tracker_settings):
-        return linear_adapter.tool_specs()
+        specs = linear_adapter.tool_specs()
+        delivery = _delivery_settings()
+        if delivery is not None and delivery.enabled:
+            specs = specs + agent_tool.delivery_tool_specs()
+        return specs
     return agent_tool.tool_specs(tracker_settings)
 
 
@@ -111,9 +115,23 @@ def execute_agent_tool(tool_name, arguments, tracker_settings=None):
         store = get_store()
         tracker_settings = store.settings().tracker if store else None
     if tracker_settings and _is_linear(tracker_settings):
+        if tool_name == "github_api":
+            delivery = _delivery_settings()
+            if delivery is None or not delivery.enabled:
+                return {"error": {"code": "unknown_tool", "detail": tool_name}}
+            return agent_tool.execute_delivery_tool(arguments, delivery)
         return linear_adapter.execute_agent_tool(tracker_settings, tool_name, arguments)
     return agent_tool.execute_agent_tool(tool_name, arguments,
                                          tracker_settings)
+
+
+def _delivery_settings():
+    from .workflow_store import get_store
+
+    store = get_store()
+    if store is None:
+        return None
+    return store.settings().delivery
 
 
 def secret_environment_names(tracker_settings):

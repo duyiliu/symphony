@@ -12,6 +12,7 @@ import signal
 import sys
 
 from . import http_api, logging_setup, mcp_bridge, workflow_store
+from .delivery import DeliveryController
 from .orchestrator import Orchestrator
 from .workflow import WorkflowError
 
@@ -87,6 +88,7 @@ def main(argv=None):
     mcp_bridge.start()
     orchestrator = Orchestrator(store)
     orchestrator.start()
+    delivery = DeliveryController(store).start()
     server = http_api.start(orchestrator, store, path, host, port)
 
     stop = {"flag": False}
@@ -113,6 +115,8 @@ def main(argv=None):
             server.shutdown()
         except Exception:  # noqa: BLE001
             pass
+        if delivery is not None:
+            delivery.stop()
         orchestrator.stop()
         mcp_bridge.stop()
         workflow_store.stop_store()

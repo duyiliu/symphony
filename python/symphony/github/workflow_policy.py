@@ -97,12 +97,13 @@ _POST_PR_COMMENT_KEYS = {
 _PATCH_ISSUE_KEYS = {"title", "body", "state", "state_reason", "labels"}
 _PATCH_PR_KEYS = {"title", "body", "state", "base"}
 _PATCH_COMMENT_KEYS = {"body"}
-_PUT_MERGE_KEYS = {"sha", "merge_method", "commit_title", "commit_message"}
+def allow_request_for(repo_name, method, url, body):
+    """True when a worker github_api call stays inside ``repo_name``.
 
-
-def allow_request(settings, method, url, body):
-    """True when the github_api call stays inside the configured repo and
-    the method/path/key allowlist. Worker token never leaves the host."""
+    Merge is deliberately absent from every method branch: workers may read,
+    create/update PRs, and comment, but only the host delivery controller can
+    merge.
+    """
     if not _allowed_url(url):
         return False
     parts = _path_parts(urlsplit(url).path)
@@ -110,7 +111,7 @@ def allow_request(settings, method, url, body):
         return False
     if parts[0] != "repos" or len(parts) < 3:
         return False
-    if "/".join(parts[1:3]) != repo(settings):
+    if "/".join(parts[1:3]) != repo_name:
         return False
     tail = parts[3:]
     method = method.upper()
@@ -123,8 +124,7 @@ def allow_request(settings, method, url, body):
         return len(tail) == 3 and tail[0] == "issues" \
             and tail[1] == "comments"
     if method == "PUT":
-        return len(tail) == 3 and tail[0] == "pulls" \
-            and tail[2] == "merge" and _keys(body, _PUT_MERGE_KEYS)
+        return False
     if method == "PATCH":
         if len(tail) == 3 and tail[0] == "issues" and tail[1] == "comments":
             return _keys(body, _PATCH_COMMENT_KEYS)
@@ -153,3 +153,8 @@ def allow_request(settings, method, url, body):
     if len(tail) == 3 and tail[0] == "pulls" and tail[2] == "comments":
         return _keys(body, _POST_PR_COMMENT_KEYS)
     return False
+
+
+def allow_request(settings, method, url, body):
+    """Backward-compatible call for tracker-backed github_api settings."""
+    return allow_request_for(repo(settings), method, url, body)

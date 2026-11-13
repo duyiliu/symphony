@@ -120,6 +120,65 @@ class ServerSettings:
     api_token: str = None
 
 
+DEFAULT_DELIVERY_RISK_PATHS = [
+    "**/migrations/**",
+    "**/migration/**",
+    "**/*migration*",
+    "**/*.sql",
+    "**/db/**",
+    "**/schema*",
+    "**/auth/**",
+    "**/login/**",
+    "**/security/**",
+    "**/permissions/**",
+    "**/permission/**",
+    "**/rbac/**",
+    "**/*auth*",
+    "**/*permission*",
+    ".github/workflows/**",
+    ".github/actions/**",
+    "deploy/**",
+    "docker/**",
+    "Dockerfile*",
+    "**/Dockerfile*",
+    "**/*.service",
+    "**/k8s/**",
+    "**/helm/**",
+    "**/terraform/**",
+    "**/ansible/**",
+    ".env*",
+    "**/secrets/**",
+    "**/*.pem",
+    "**/*.key",
+]
+
+DEFAULT_DELIVERY_RISK_LABELS = ["high-risk", "security", "database"]
+
+
+@dataclass
+class DeliverySettings:
+    enabled: bool = False
+    api_url: str = "https://api.github.com"
+    repo: str = None
+    token: str = None
+    base_branch: str = "main"
+    review_state: str = "Human Review"
+    merge_state: str = "Merging"
+    rework_state: str = "Rework"
+    done_state: str = "Done"
+    poll_interval_ms: int = 30_000
+    state_dir: str = None
+    allow_auto_merge: bool = True
+    require_branch_protection: bool = True
+    allow_without_branch_protection: bool = False
+    required_approvals: int = 0
+    max_auto_files: int = 10
+    max_rework_attempts: int = 2
+    merge_method: str = "squash"
+    risk_paths: list = field(default_factory=lambda: list(DEFAULT_DELIVERY_RISK_PATHS))
+    risk_labels: list = field(default_factory=lambda: list(DEFAULT_DELIVERY_RISK_LABELS))
+
+
 @dataclass
 class Settings:
     tracker: TrackerSettings = field(default_factory=TrackerSettings)
@@ -132,6 +191,7 @@ class Settings:
     hooks: HooksSettings = field(default_factory=HooksSettings)
     observability: ObservabilitySettings = field(default_factory=ObservabilitySettings)
     server: ServerSettings = field(default_factory=ServerSettings)
+    delivery: DeliverySettings = field(default_factory=DeliverySettings)
 
 
 def _invalid(message):
@@ -375,6 +435,65 @@ def parse_settings(config):
         api_token=_opt_str(server.get("api_token"), "server.api_token", errors),
     )
 
+    delivery = _section(config, "delivery", errors)
+    enabled = _opt_bool(delivery.get("enabled"), "delivery.enabled", errors)
+    api_url = _opt_str(delivery.get("api_url"), "delivery.api_url", errors)
+    risk_paths = _opt_str_list(
+        delivery.get("risk_paths"), "delivery.risk_paths", errors)
+    risk_labels = _opt_str_list(
+        delivery.get("risk_labels"), "delivery.risk_labels", errors)
+    merge_method = _opt_str(
+        delivery.get("merge_method"), "delivery.merge_method", errors)
+    if merge_method is not None and merge_method not in ("squash", "merge", "rebase"):
+        errors.append("delivery.merge_method must be one of: squash, merge, rebase")
+    allow_auto_merge = _opt_bool(
+        delivery.get("allow_auto_merge"),
+        "delivery.allow_auto_merge", errors)
+    require_branch_protection = _opt_bool(
+        delivery.get("require_branch_protection"),
+        "delivery.require_branch_protection", errors)
+    allow_without_branch_protection = _opt_bool(
+        delivery.get("allow_without_branch_protection"),
+        "delivery.allow_without_branch_protection", errors)
+    max_rework_attempts = _opt_int(
+        delivery.get("max_rework_attempts"),
+        "delivery.max_rework_attempts", 0, errors)
+    settings.delivery = DeliverySettings(
+        enabled=False if enabled is None else enabled,
+        api_url=api_url or "https://api.github.com",
+        repo=_opt_str(delivery.get("repo"), "delivery.repo", errors),
+        token=_opt_str(delivery.get("token"), "delivery.token", errors),
+        base_branch=_opt_str(
+            delivery.get("base_branch"), "delivery.base_branch", errors) or "main",
+        review_state=_opt_str(
+            delivery.get("review_state"), "delivery.review_state", errors) or "Human Review",
+        merge_state=_opt_str(
+            delivery.get("merge_state"), "delivery.merge_state", errors) or "Merging",
+        rework_state=_opt_str(
+            delivery.get("rework_state"), "delivery.rework_state", errors) or "Rework",
+        done_state=_opt_str(
+            delivery.get("done_state"), "delivery.done_state", errors) or "Done",
+        poll_interval_ms=_opt_int(
+            delivery.get("poll_interval_ms"), "delivery.poll_interval_ms", 1, errors)
+        or 30_000,
+        state_dir=_opt_str(delivery.get("state_dir"), "delivery.state_dir", errors),
+        allow_auto_merge=True if allow_auto_merge is None else allow_auto_merge,
+        require_branch_protection=(
+            True if require_branch_protection is None else require_branch_protection),
+        allow_without_branch_protection=bool(allow_without_branch_protection),
+        required_approvals=_opt_int(
+            delivery.get("required_approvals"),
+            "delivery.required_approvals", 0, errors) or 0,
+        max_auto_files=_opt_int(
+            delivery.get("max_auto_files"),
+            "delivery.max_auto_files", 1, errors) or 10,
+        max_rework_attempts=(
+            2 if max_rework_attempts is None else max_rework_attempts),
+        merge_method=merge_method or "squash",
+        risk_paths=list(risk_paths) if risk_paths is not None else list(DEFAULT_DELIVERY_RISK_PATHS),
+        risk_labels=list(risk_labels) if risk_labels is not None else list(DEFAULT_DELIVERY_RISK_LABELS),
+    )
+
     if errors:
         raise _invalid("; ".join(errors))
 
@@ -396,10 +515,74 @@ def _finalize(settings):
     tracker.api_key = provider.get("api_key", tracker.api_key)
     tracker.assignee = provider.get("assignee", tracker.assignee)
 
+    delivery = settings.delivery
+    if delivery.enabled:
+        delivery.api_url = resolve_env_setting(
+            delivery.api_url, "SYMPHONY_GITHUB_API_URL")
+        delivery.repo = resolve_env_setting(
+            delivery.repo, "SYMPHONY_GITHUB_REPO")
+        delivery.token = resolve_env_setting(
+            delivery.token, "SYMPHONY_GITHUB_TOKEN")
+        delivery.api_url = (delivery.api_url or "https://api.github.com").rstrip("/")
+        if not isinstance(delivery.repo, str) \
+                or not re.fullmatch(r"[^\s/]+/[^\s/]+", delivery.repo):
+            raise _invalid("delivery.repo must be owner/name when delivery is enabled")
+        if not present_string(delivery.token):
+            raise _invalid("delivery.token is required when delivery is enabled")
+        if not delivery.api_url.startswith("https://"):
+            raise _invalid("delivery.api_url must use https")
+        if not present_string(delivery.base_branch) \
+                or delivery.base_branch.strip() == "":
+            raise _invalid("delivery.base_branch can't be blank")
+        states = [
+            delivery.review_state, delivery.merge_state,
+            delivery.rework_state, delivery.done_state,
+        ]
+        if any(not present_string(state) for state in states):
+            raise _invalid("delivery states can't be blank")
+        if len({normalize_issue_state(state) for state in states}) != len(states):
+            raise _invalid("delivery states must be distinct")
+        active = {
+            normalize_issue_state(state)
+            for state in (tracker.active_states or [])
+        }
+        terminal = {
+            normalize_issue_state(state)
+            for state in (tracker.terminal_states or [])
+        }
+        for name, state in (
+            ("review_state", delivery.review_state),
+            ("merge_state", delivery.merge_state),
+        ):
+            if normalize_issue_state(state) in active:
+                raise _invalid(
+                    "delivery.%s must not be an active tracker state; "
+                    "the host owns delivery and merge" % name)
+            if normalize_issue_state(state) in terminal:
+                raise _invalid(
+                    "delivery.%s must not be a terminal tracker state" % name)
+        if normalize_issue_state(delivery.done_state) not in terminal:
+            raise _invalid(
+                "delivery.done_state must be a terminal tracker state")
+        if delivery.state_dir is None:
+            delivery.state_dir = os.path.join(
+                os.path.abspath(settings.workspace.root or tempfile.gettempdir()),
+                "_delivery")
+        else:
+            delivery.state_dir = os.path.abspath(delivery.state_dir)
+
     secret_names = []
     if tracker.kind == "linear":
         secret_names = ["LINEAR_API_KEY"] + env_reference_names(
             [tracker.api_key])
+        if delivery.enabled:
+            secret_names += [
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+                "GITHUB_ENTERPRISE_TOKEN",
+                "GH_ENTERPRISE_TOKEN",
+                "SYMPHONY_GITHUB_TOKEN",
+            ] + env_reference_names([delivery.token])
     elif tracker.kind in ("github", "board"):
         secret_names = [
             "GITHUB_TOKEN",
