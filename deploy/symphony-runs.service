@@ -1,0 +1,17 @@
+[Unit]
+Description=Symphony run archive + Chinese issue board
+After=network-online.target symphony.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/symphony-src
+EnvironmentFile=-/root/symphony/board.env
+# 可选：导入项目注册表（默认 <WORKFLOW 所在目录>/projects.json）
+#Environment=SYMPHONY_PROJECTS=/root/symphony/config/projects.json
+ExecStart=/usr/bin/python3 /opt/symphony-src/board/server.py --port 8322 --bind 192.168.1.199
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
