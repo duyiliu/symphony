@@ -38,6 +38,7 @@ def _issue(id="1", state="open", labels=("agent",), priority=None,
 class _Store:
     def __init__(self, settings):
         self._settings = settings
+        self.path = "WORKFLOW.md"
 
     def settings(self):
         return self._settings
@@ -60,6 +61,116 @@ class SortTest(unittest.TestCase):
         prio = _issue("3", priority=1)
         result = orchestrator.Orchestrator._sort_issues([newer, older, prio])
         self.assertEqual([i.id for i in result], ["3", "1", "2"])
+
+
+class MetricsTest(unittest.TestCase):
+    def test_dispatch_latency_is_recorded_once(self):
+        orch = _orchestrator()
+        orch._first_seen_at["1"] = orchestrator._now() - datetime.timedelta(
+            seconds=2)
+
+        orch._record_dispatch_latency("1")
+        orch._record_dispatch_latency("1")
+
+        self.assertEqual(orch.metrics["dispatch_latency_samples"], 1)
+        self.assertGreaterEqual(orch.metrics["dispatch_latency_ms_last"], 1900)
+
+    def test_run_metrics_are_recorded_once(self):
+        orch = _orchestrator()
+        entry = {
+            "started_at": orchestrator._now() - datetime.timedelta(seconds=5),
+        }
+
+        orch._record_session_completion_totals(entry)
+        orch._record_session_completion_totals(entry)
+
+        self.assertEqual(orch.metrics["run_samples"], 1)
+        self.assertGreaterEqual(orch.metrics["run_seconds_total"], 4)
+
+    def test_snapshot_exposes_metrics_and_rates(self):
+        orch = _orchestrator()
+        orch.metrics["dispatch_count"] = 2
+        orch.metrics["retry_count"] = 1
+        orch.metrics["blocked_count"] = 1
+        orch.running["1"] = {"termination_unconfirmed": True}
+
+        snapshot = orch._snapshot(None)
+
+        self.assertEqual(snapshot["metrics"]["dispatch"]["count"], 2)
+        self.assertEqual(
+            snapshot["metrics"]["rates"]["retry_per_dispatch"], 0.5)
+        self.assertEqual(
+            snapshot["metrics"]["rates"]["blocked_per_dispatch"], 0.5)
+        self.assertEqual(snapshot["metrics"]["termination_unconfirmed"], 1)
+        self.assertFalse(snapshot["paused"])
+
+    def test_paused_scheduler_skips_tracker_fetch(self):
+        orch = _orchestrator()
+        orch.paused = True
+        with patch.object(orch, "_reconcile_running_issues"), \
+                patch.object(orch, "_reconcile_blocked_issues"), \
+                patch.object(
+                    orchestrator.tracker_adapter,
+                    "fetch_candidate_issues") as fetch:
+            orch._maybe_dispatch()
+        fetch.assert_not_called()
+        self.assertIsNotNone(orch.last_poll_success_at)
+
+    def test_identifier_active_covers_running_retry_and_blocked(self):
+        orch = _orchestrator()
+        orch.running["1"] = {"identifier": "GH-1"}
+        orch.retry_attempts["2"] = {"identifier": "GH-2"}
+        orch.blocked["3"] = {"identifier": "GH-3"}
+        self.assertTrue(orch._identifier_active("GH-1"))
+        self.assertTrue(orch._identifier_active("GH-2"))
+        self.assertTrue(orch._identifier_active("GH-3"))
+        self.assertFalse(orch._identifier_active("GH-4"))
+
+
+class UnconfirmedTerminationTest(unittest.TestCase):
+    @staticmethod
+    def _handle(force_result=True):
+        return SimpleNamespace(
+            force_terminate=lambda: force_result,
+            termination_is_confirmed=lambda: force_result,
+            release_confirmed_lease=lambda: None,
+        )
+
+    def test_recheck_releases_confirmed_orphan(self):
+        orch = _orchestrator()
+        orch.running["1"] = {
+            "identifier": "GH-1",
+            "termination_unconfirmed": True,
+            "handle": self._handle(True),
+            "stop_requested": {"kind": "release", "cleanup_workspace": False},
+        }
+        orch.claimed.add("1")
+
+        orch._recheck_unconfirmed_terminations()
+
+        self.assertNotIn("1", orch.running)
+        self.assertNotIn("1", orch.claimed)
+
+    def test_recheck_throttles_unconfirmed_orphan(self):
+        orch = _orchestrator()
+        calls = []
+        handle = SimpleNamespace(
+            force_terminate=lambda: calls.append(1) or False,
+            termination_is_confirmed=lambda: False,
+            release_confirmed_lease=lambda: None,
+        )
+        orch.running["1"] = {
+            "identifier": "GH-1",
+            "termination_unconfirmed": True,
+            "handle": handle,
+            "stop_requested": {"kind": "release", "cleanup_workspace": False},
+        }
+
+        orch._recheck_unconfirmed_terminations()
+        orch._recheck_unconfirmed_terminations()
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("1", orch.running)
 
 
 class CandidateTest(unittest.TestCase):
@@ -508,6 +619,34 @@ class RetryLimitTest(unittest.TestCase):
         self.assertIn("blocked before start", orch.blocked["1"]["error"])
         self.assertEqual(
             orch.blocked["1"]["deferred_code"], "missing_pi_command")
+
+    def test_turn_input_required_blocks_instead_of_retrying(self):
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        issue = _issue("1")
+        orch.running["1"] = {
+            "ref": 1,
+            "identifier": issue.identifier,
+            "issue": issue,
+            "session_id": "session-1",
+            "last_codex_event": "turn_input_required",
+            "last_codex_message": {
+                "event": "turn_input_required",
+                "message": {"method": "extension_ui_request"},
+            },
+            "last_codex_timestamp": datetime.datetime.now(
+                datetime.timezone.utc),
+        }
+        orch.claimed.add("1")
+
+        with patch.object(orch, "_schedule_issue_retry") as retry:
+            orch._on_worker_done("1", 1, "turn_input_required")
+
+        retry.assert_not_called()
+        self.assertIn("1", orch.blocked)
+        self.assertIn("operator input", orch.blocked["1"]["error"])
+        self.assertEqual(
+            orch.blocked["1"]["last_codex_event"], "turn_input_required")
 
     def test_live_run_lease_deferral_uses_wait_policy(self):
         from symphony.agent import runner
@@ -1037,6 +1176,283 @@ class RunnerDeferralTest(unittest.TestCase):
         self.assertTrue(lease.released)
 
 
+class ReconcileParityTest(unittest.TestCase):
+    def _running(self, orch, handle=None):
+        handle = handle or _FakeHandle()
+        orch.running["1"] = {
+            "ref": 1,
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "handle": handle,
+            "workspace_path": "/recorded/GH-1",
+            "worker_host": None,
+        }
+        orch.claimed.add("1")
+        return handle
+
+    def test_reassigned_issue_stops_without_cleanup(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+        handle = self._running(orch)
+        reassigned = _issue("1")
+        reassigned.dispatchable = False
+        with patch.object(orch, "_cleanup_issue_workspace") as cleanup:
+            orch._reconcile_issue_state(
+                reassigned, orch._active_state_set(settings),
+                orch._terminal_state_set(settings), settings)
+        self.assertTrue(handle.cancelled)
+        cleanup.assert_not_called()
+        self.assertNotIn("1", orch.running)
+        self.assertNotIn("1", orch.claimed)
+
+    def test_required_label_removed_stops_running_agent(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+        handle = self._running(orch)
+        with patch.object(orch, "_cleanup_issue_workspace") as cleanup:
+            orch._reconcile_issue_state(
+                _issue("1", labels=()),
+                orch._active_state_set(settings),
+                orch._terminal_state_set(settings), settings)
+        self.assertTrue(handle.cancelled)
+        cleanup.assert_not_called()
+        self.assertNotIn("1", orch.claimed)
+
+    def test_required_label_removed_releases_blocked_issue(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+        orch.blocked["1"] = {"issue": _issue("1")}
+        orch.claimed.add("1")
+        orch._reconcile_blocked_issue_state(
+            _issue("1", labels=()),
+            orch._active_state_set(settings),
+            orch._terminal_state_set(settings), settings)
+        self.assertNotIn("1", orch.blocked)
+        self.assertNotIn("1", orch.claimed)
+
+    def test_retry_releases_claim_when_label_removed(self):
+        orch = _orchestrator()
+        orch.claimed.add("1")
+        orch.retry_attempts["1"] = {
+            "attempt": 1, "retry_token": "tok", "timer": None,
+            "identifier": "GH-1",
+        }
+        with patch.object(
+                orchestrator.tracker_adapter, "fetch_issues_by_ids",
+                return_value=[_issue("1", labels=())]):
+            orch._on_retry_issue("1", "tok")
+        self.assertNotIn("1", orch.claimed)
+        self.assertNotIn("1", orch.retry_attempts)
+
+    def test_retry_releases_claim_when_issue_disappears(self):
+        orch = _orchestrator()
+        orch.claimed.add("1")
+        orch.retry_attempts["1"] = {
+            "attempt": 1, "retry_token": "tok", "timer": None,
+            "identifier": "GH-1",
+        }
+        with patch.object(
+                orchestrator.tracker_adapter, "fetch_issues_by_ids",
+                return_value=[]):
+            orch._on_retry_issue("1", "tok")
+        self.assertNotIn("1", orch.claimed)
+        self.assertNotIn("1", orch.retry_attempts)
+
+    def test_stale_retry_token_is_ignored(self):
+        orch = _orchestrator()
+        orch.claimed.add("1")
+        orch.retry_attempts["1"] = {
+            "attempt": 1, "retry_token": "new", "timer": None,
+            "identifier": "GH-1",
+        }
+        with patch.object(
+                orchestrator.tracker_adapter, "fetch_issues_by_ids") as fetch:
+            orch._on_retry_issue("1", "old")
+        fetch.assert_not_called()
+        self.assertIn("1", orch.retry_attempts)
+        self.assertIn("1", orch.claimed)
+
+    def test_manual_refresh_coalesces_repeated_requests(self):
+        orch = _orchestrator()
+        orch.next_poll_due_at_ms = None
+        with patch.object(orch, "_schedule_tick") as tick:
+            first = orch._request_refresh(None)
+        self.assertFalse(first["coalesced"])
+        tick.assert_called_once_with(0)
+
+        orch.poll_check_in_progress = True
+        with patch.object(orch, "_schedule_tick") as tick:
+            second = orch._request_refresh(None)
+        self.assertTrue(second["coalesced"])
+        tick.assert_not_called()
+
+        orch.poll_check_in_progress = False
+        orch.next_poll_due_at_ms = orchestrator._monotonic_ms() - 1
+        with patch.object(orch, "_schedule_tick") as tick:
+            third = orch._request_refresh(None)
+        self.assertTrue(third["coalesced"])
+        tick.assert_not_called()
+
+    def test_terminal_cleanup_uses_recorded_workspace(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+        lease = _FakeLease()
+        with patch.object(
+                orchestrator.workspace_mod, "acquire_path_run_lease",
+                return_value=lease), \
+                patch.object(
+                    orchestrator.workspace_mod, "remove_recorded",
+                    return_value=True) as remove:
+            result = orch._cleanup_issue_workspace(
+                _issue("1"), {"workspace_path": "/recorded/GH-1"}, settings)
+        self.assertTrue(result)
+        self.assertEqual(remove.call_args.args[1], "/recorded/GH-1")
+        self.assertTrue(lease.released)
+
+
+class WorkerHostSelectionTest(unittest.TestCase):
+    def _settings(self, hosts, limit=1):
+        return _settings(worker={
+            "ssh_hosts": hosts,
+            "max_concurrent_agents_per_host": limit,
+        })
+
+    def test_skips_full_hosts_under_shared_cap(self):
+        settings = self._settings(["h1", "h2"])
+        orch = _orchestrator(settings)
+        orch.running["a"] = {"issue": _issue("a"), "worker_host": "h1"}
+        self.assertEqual(orch._select_worker_host(settings, None), "h2")
+
+    def test_returns_no_capacity_when_every_host_is_full(self):
+        settings = self._settings(["h1"])
+        orch = _orchestrator(settings)
+        orch.running["a"] = {"issue": _issue("a"), "worker_host": "h1"}
+        self.assertEqual(
+            orch._select_worker_host(settings, None), "no_worker_capacity")
+
+    def test_keeps_preferred_host_when_it_has_capacity(self):
+        settings = self._settings(["h1", "h2"])
+        orch = _orchestrator(settings)
+        self.assertEqual(orch._select_worker_host(settings, "h2"), "h2")
+
+    def test_per_state_concurrency_limit(self):
+        settings = _settings(agent={
+            "max_concurrent_agents": 4,
+            "max_concurrent_agents_by_state": {"open": 1},
+        })
+        orch = _orchestrator(settings)
+        orch.running["a"] = {"issue": _issue("a")}
+        self.assertFalse(orch._state_slots_available(_issue("b"), settings))
+        orch.running["a"]["issue"] = _issue("a", state="closed")
+        self.assertTrue(orch._state_slots_available(_issue("b"), settings))
+
+
+class TokenAccountingParityTest(unittest.TestCase):
+    def _running(self, orch):
+        orch.running["1"] = {
+            "ref": 1,
+            "issue": _issue("1"),
+            "identifier": "GH-1",
+            "codex_input_tokens": 0,
+            "codex_output_tokens": 0,
+            "codex_total_tokens": 0,
+        }
+        return orch.running["1"]
+
+    @staticmethod
+    def _token_update(info):
+        return {
+            "event": "notification",
+            "timestamp": "2026-11-14T00:00:00Z",
+            "payload": {
+                "method": "codex/event/token_count",
+                "params": {"msg": {"type": "token_count", "info": info}},
+            },
+        }
+
+    def test_cumulative_token_usage_is_monotonic(self):
+        orch = _orchestrator()
+        self._running(orch)
+        orch._on_worker_update("1", self._token_update({
+            "total_token_usage": {
+                "input_tokens": "2", "output_tokens": 2, "total_tokens": 4,
+            },
+        }))
+        orch._on_worker_update("1", self._token_update({
+            "total_token_usage": {
+                "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+            },
+        }))
+        self.assertEqual(orch.running["1"]["codex_input_tokens"], 10)
+        self.assertEqual(orch.running["1"]["codex_output_tokens"], 5)
+        self.assertEqual(orch.running["1"]["codex_total_tokens"], 15)
+        self.assertEqual(orch.codex_totals["total_tokens"], 15)
+
+    def test_total_token_usage_is_preferred_over_last(self):
+        orch = _orchestrator()
+        self._running(orch)
+        orch._on_worker_update("1", {
+            "event": "notification",
+            "timestamp": "2026-11-14T00:00:00Z",
+            "payload": {
+                "method": "codex/event/token_count",
+                "params": {"msg": {
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {
+                        "last_token_usage": {
+                            "input_tokens": 2,
+                            "output_tokens": 1,
+                            "total_tokens": 3,
+                        },
+                        "total_token_usage": {
+                            "input_tokens": 200,
+                            "output_tokens": 100,
+                            "total_tokens": 300,
+                        },
+                    }},
+                }},
+            },
+        })
+        self.assertEqual(orch.running["1"]["codex_total_tokens"], 300)
+
+    def test_last_token_usage_without_cumulative_is_ignored(self):
+        orch = _orchestrator()
+        self._running(orch)
+        orch._on_worker_update("1", self._token_update({
+            "last_token_usage": {
+                "input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
+            },
+        }))
+        self.assertEqual(orch.running["1"]["codex_total_tokens"], 0)
+        self.assertEqual(orch.codex_totals["total_tokens"], 0)
+
+    def test_rate_limit_payload_is_exposed_in_snapshot(self):
+        orch = _orchestrator()
+        self._running(orch)
+        rate_limits = {
+            "limit_id": "codex",
+            "primary": {"remaining": 90, "limit": 100},
+            "secondary": None,
+            "credits": {
+                "has_credits": False, "unlimited": False, "balance": None,
+            },
+        }
+        orch._on_worker_update("1", {
+            "event": "notification",
+            "timestamp": "2026-11-14T00:00:00Z",
+            "payload": {
+                "method": "codex/event/token_count",
+                "params": {"msg": {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count", "rate_limits": rate_limits,
+                    },
+                }},
+            },
+        })
+        self.assertEqual(orch._snapshot(None)["rate_limits"], rate_limits)
+
+
 class SnapshotShapeTest(unittest.TestCase):
     def test_snapshot_keys(self):
         orch = _orchestrator()
@@ -1046,6 +1462,85 @@ class SnapshotShapeTest(unittest.TestCase):
             self.assertIn(key, snapshot)
         self.assertIn("input_tokens", snapshot["codex_totals"])
         self.assertIn("poll_interval_ms", snapshot["polling"])
+
+
+class RunningRefreshTest(unittest.TestCase):
+    def _running(self, orch):
+        handle = _FakeHandle()
+        orch.running["1"] = {
+            "issue_id": "1",
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "handle": handle,
+            "thread": None,
+            "stop_requested": None,
+        }
+        orch.claimed.add("1")
+        return handle
+
+    def test_missing_running_issue_is_stopped_without_cleanup(self):
+        orch = _orchestrator()
+        handle = self._running(orch)
+        with patch.object(
+                orchestrator.tracker_adapter, "fetch_issues_by_ids",
+                return_value=[]), \
+                patch.object(orch, "_cleanup_issue_workspace") as cleanup:
+            orch._reconcile_running_issues()
+        self.assertTrue(handle.cancelled)
+        self.assertNotIn("1", orch.running)
+        self.assertNotIn("1", orch.claimed)
+        cleanup.assert_not_called()
+
+    def test_refresh_failure_keeps_running_worker(self):
+        orch = _orchestrator()
+        handle = self._running(orch)
+        with patch.object(
+                orchestrator.tracker_adapter, "fetch_issues_by_ids",
+                side_effect=RuntimeError("tracker down")):
+            orch._reconcile_running_issues()
+        self.assertFalse(handle.cancelled)
+        self.assertIn("1", orch.running)
+
+    def test_active_issue_refreshes_running_entry(self):
+        orch = _orchestrator()
+        self._running(orch)
+        refreshed = _issue("1", state="open")
+        with patch.object(
+                orchestrator.tracker_adapter, "fetch_issues_by_ids",
+                return_value=[refreshed]):
+            orch._reconcile_running_issues()
+        self.assertIs(orch.running["1"]["issue"], refreshed)
+
+
+class DispatchRevalidationTest(unittest.TestCase):
+    def _dispatch(self, tracker_result):
+        orch = _orchestrator()
+        if isinstance(tracker_result, Exception):
+            patcher = patch.object(
+                orchestrator.tracker_adapter, "fetch_issues_by_ids",
+                side_effect=tracker_result)
+        else:
+            patcher = patch.object(
+                orchestrator.tracker_adapter, "fetch_issues_by_ids",
+                return_value=tracker_result)
+        with patcher, patch.object(orch, "_spawn_issue") as spawn:
+            orch._dispatch_issue(_issue("1"), orch._store.settings())
+        return spawn
+
+    def test_missing_issue_is_not_dispatched(self):
+        self._dispatch([]).assert_not_called()
+
+    def test_terminal_issue_is_not_dispatched(self):
+        self._dispatch([_issue("1", state="closed")]).assert_not_called()
+
+    def test_refresh_error_is_not_dispatched(self):
+        self._dispatch(RuntimeError("tracker down")).assert_not_called()
+
+    def test_refreshed_issue_is_dispatched(self):
+        refreshed = _issue("1", state="open")
+        spawn = self._dispatch([refreshed])
+        spawn.assert_called_once()
+        self.assertIs(spawn.call_args.args[0], refreshed)
 
 
 if __name__ == "__main__":

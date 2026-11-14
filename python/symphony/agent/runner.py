@@ -410,12 +410,19 @@ def _build_turn_prompt(issue, settings, turn_number, max_turns, attempt):
 
         store = workflow_store.get_store()
         if store is None:
-            raise WorkflowError("workflow_store_not_started")
+            raise RuntimeError(
+                "workflow_unavailable: workflow store is not running")
         workflow = store.current()
         prompt_template = workflow.prompt_template
         if not prompt_template or not prompt_template.strip():
             prompt_template = config_mod.DEFAULT_PROMPT_TEMPLATE
-        return template.render(prompt_template, {
+        try:
+            nodes = template.parse(prompt_template)
+        except template.TemplateError as error:
+            raise RuntimeError(
+                "template_parse_error: %s template=%r"
+                % (error, prompt_template)) from error
+        return template.render_nodes(nodes, {
             "issue": issue.to_template_map(),
             "attempt": attempt,
         })

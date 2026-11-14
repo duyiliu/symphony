@@ -20,8 +20,16 @@ polling:
 server:
   host: 127.0.0.1
   port: 18331
+  # 状态备份默认写到 <workspace.root>/_state_backups，每小时一次，保留 24 份。
+  # state_backup_dir: D:/symphony-backups
+  # state_backup_interval_ms: 3600000
+  # state_backup_keep: 24
 workspace:
   root: "$SYMPHONY_WORKSPACE_ROOT"
+# 可选：把 Pi 放到远程 Worker；不配置则在宿主本地运行。
+# worker:
+#   ssh_hosts: ["deploy@worker-a:2222", "worker-b"]
+#   max_concurrent_agents_per_host: 2
 delivery:
   enabled: true
   repo: "$SYMPHONY_REPO"

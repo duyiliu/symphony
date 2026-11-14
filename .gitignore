@@ -11,3 +11,8 @@ deploy/e2e-container/.env
 !/deploy/WORKFLOW.local.md
 .env
 /symphony-e2esessions/
+/log/
+python/log/
+_delivery/
+_agent_sessions/
+_state_backups/

@@ -51,7 +51,12 @@ if (-not $env:SYMPHONY_GIT_EMAIL) {
     $env:SYMPHONY_GIT_EMAIL = 'symphony@users.noreply.github.com'
 }
 $python = (Get-Command python -ErrorAction Stop).Source
-$arguments = @('-m', 'symphony', '--workflow', $WorkflowPath, '--port', "$Port")
+$arguments = @(
+    '-m', 'symphony',
+    '--workflow', $WorkflowPath,
+    '--port', "$Port",
+    '--i-understand-that-this-will-be-running-without-the-usual-guardrails'
+)
 if ($Check) {
     & $python @arguments --check
     exit $LASTEXITCODE

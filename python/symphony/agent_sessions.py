@@ -60,6 +60,11 @@ def _state_root(settings):
     return os.path.abspath(os.path.join(root, _scope_key(settings)))
 
 
+def state_root(settings):
+    """Public state root used by backup/restore tooling."""
+    return _state_root(settings)
+
+
 def _state_path(settings, issue_id):
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in issue_id)
     return os.path.join(_state_root(settings), "%s.json" % safe)

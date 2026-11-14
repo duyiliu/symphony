@@ -25,14 +25,15 @@ Tell your favorite coding agent to build Symphony in a programming language of y
 > Implement Symphony according to the following spec:
 > https://github.com/openai/symphony/blob/main/SPEC.md
 
-### Option 2. Use our experimental reference implementation
+### Option 2. Use this Python + Pi implementation
 
-Check out [elixir/README.md](elixir/README.md) for instructions on how to set up your environment
-and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
-help with the setup:
+The Python core in [python/README.md](python/README.md) is the product runtime for this
+repository: Python orchestrator, Pi JSON-RPC workers, Linear tracker, host-side safe delivery
+and the local board. Start from [deploy/WORKFLOW.local.md](deploy/WORKFLOW.local.md), which
+keeps merge authority on the host.
 
-> Set up Symphony for my repository based on
-> https://github.com/openai/symphony/blob/main/elixir/README.md
+`elixir/` is retained as the upstream reference implementation and behavior/test baseline. It is
+not the default runtime and its Burrito release workflow is manual only.
 
 ---
 

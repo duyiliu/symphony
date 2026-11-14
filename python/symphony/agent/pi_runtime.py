@@ -14,6 +14,7 @@ import datetime
 import json
 import logging
 import os
+import posixpath
 import queue
 import re
 import secrets
@@ -24,7 +25,7 @@ import threading
 import time
 import uuid
 
-from .. import util
+from .. import ssh, util
 from ..workflow import WorkflowError
 
 log = logging.getLogger("symphony.pi")
@@ -103,14 +104,16 @@ def start_session(workspace, settings, worker_host=None, run_lease=None,
                   issue=None):
     """Spawn the pi subprocess and prepare the workspace ``.pi`` directory."""
     config = settings.runtime
-    if worker_host is not None:
-        raise WorkflowError("pi_remote_worker_not_supported")
     if not config.command or not config.command.strip():
         raise WorkflowError("missing_pi_command")
 
-    _sanitise_pi_dir(workspace)
-    _exclude_pi_dir(workspace)
-    mcp_token = _write_mcp_config(workspace, settings, issue)
+    if worker_host is not None:
+        _prepare_remote_pi_dir(workspace, worker_host)
+    else:
+        _sanitise_pi_dir(workspace)
+        _exclude_pi_dir(workspace)
+    mcp_token = _write_mcp_config(
+        workspace, settings, issue, worker_host=worker_host)
     try:
         session_id = _new_session_id()
         if run_lease is not None:
@@ -120,40 +123,61 @@ def start_session(workspace, settings, worker_host=None, run_lease=None,
         raise
     return _open_session(
         workspace, config, settings, session_id, run_lease,
-        mcp_token=mcp_token)
+        mcp_token=mcp_token, worker_host=worker_host)
 
 
 def _open_session(workspace, config, settings, session_id, run_lease=None,
-                  mcp_token=None):
+                  mcp_token=None, worker_host=None):
     secret_names = list(settings.tracker.secret_environment_names or [])
     git_config = None
     gh_config = None
     if settings.tracker.kind == "linear":
-        pi_dir = os.path.join(workspace, ".pi")
-        gh_config = os.path.join(pi_dir, "gh")
-        git_config = os.path.join(pi_dir, "gitconfig")
-        os.makedirs(gh_config, mode=0o700, exist_ok=True)
-        with open(git_config, "w", encoding="utf-8") as handle:
-            handle.write("")
+        if worker_host is not None:
+            gh_config = posixpath.join(workspace, ".pi", "gh")
+            git_config = posixpath.join(workspace, ".pi", "gitconfig")
+            _prepare_remote_git_isolation(workspace, worker_host)
+        else:
+            pi_dir = os.path.join(workspace, ".pi")
+            gh_config = os.path.join(pi_dir, "gh")
+            git_config = os.path.join(pi_dir, "gitconfig")
+            os.makedirs(gh_config, mode=0o700, exist_ok=True)
+            with open(git_config, "w", encoding="utf-8") as handle:
+                handle.write("")
     script = _build_script(
         config, list(dict.fromkeys(secret_names)), session_id,
         git_config=git_config, gh_config=gh_config)
     log.info(
-        "Starting pi runtime workspace=%s session=%s command=%s",
-        workspace, session_id, config.command)
+        "Starting pi runtime workspace=%s session=%s command=%s "
+        "worker_host=%s",
+        workspace, session_id, config.command, worker_host or "local")
     try:
-        process = subprocess.Popen(
-            [util.posix_shell(), "-lc", script],
-            cwd=workspace,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=None,
-            start_new_session=True,
-            bufsize=0,
-        )
+        if worker_host is not None:
+            remote_forwards = None
+            if mcp_token is not None:
+                from .. import mcp_bridge
+
+                port = mcp_bridge.endpoint_port()
+                if port:
+                    remote_forwards = [(port, "127.0.0.1", port)]
+            remote_script = "cd %s && %s" % (
+                ssh.shell_escape(workspace), script)
+            process = ssh.start_port(
+                worker_host, remote_script,
+                remote_forwards=remote_forwards)
+        else:
+            process = subprocess.Popen(
+                [util.posix_shell(), "-lc", script],
+                cwd=workspace,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                start_new_session=True,
+                bufsize=0,
+            )
     except Exception as error:  # noqa: BLE001 - never leave a live scope behind
         _revoke_mcp_token(mcp_token)
-        raise WorkflowError("pi_start_failed", str(error)) from error
+        reason = getattr(error, "reason", None) or "pi_start_failed"
+        raise WorkflowError(reason, str(error)) from error
 
     session = PiSession(
         process, workspace, config, session_id, None, mcp_token=mcp_token)
@@ -166,10 +190,14 @@ def _open_session(workspace, config, settings, session_id, run_lease=None,
         _open_live_log(session, workspace, config)
         session.reader.start()
     except TerminationError:
+        _revoke_mcp_token(getattr(session, "mcp_token", None))
+        session.mcp_token = None
         raise
     except Exception as error:  # noqa: BLE001 - clean up a spawned process
         confirmed = force_terminate_session(session)
         if not confirmed:
+            _revoke_mcp_token(getattr(session, "mcp_token", None))
+            session.mcp_token = None
             raise TerminationError(
                 "pi process tree is still alive after startup failure",
                 session=session)
@@ -296,13 +324,16 @@ def _exclude_pi_dir(workspace):
         pass
 
 
-def _write_mcp_config(workspace, settings, issue):
+def _write_mcp_config(workspace, settings, issue, worker_host=None):
     from .. import mcp_bridge
 
     directory = os.path.join(workspace, ".pi")
     path = os.path.join(directory, "mcp.json")
     registered = mcp_bridge.client_config(workspace, settings, issue)
     if registered is None:
+        if worker_host is not None:
+            _remote_remove_mcp_config(workspace, worker_host)
+            return None
         try:
             os.remove(path)
         except FileNotFoundError:
@@ -311,6 +342,16 @@ def _write_mcp_config(workspace, settings, issue):
             raise WorkflowError("pi_mcp_config_failed", str(error))
         return None
     mcp_config, token = registered
+    if worker_host is not None:
+        try:
+            _remote_write_mcp_config(workspace, mcp_config, worker_host)
+        except Exception as error:  # noqa: BLE001 - revoke partial scope
+            _revoke_mcp_token(token)
+            if isinstance(error, WorkflowError):
+                raise
+            raise WorkflowError(
+                "pi_mcp_config_failed", str(error)) from error
+        return token
     temporary = os.path.join(
         directory, ".mcp-%s.tmp" % uuid.uuid4().hex)
     try:
@@ -339,6 +380,103 @@ def _write_mcp_config(workspace, settings, issue):
         except OSError:
             pass
     return token
+
+
+def _prepare_remote_pi_dir(workspace, worker_host):
+    """Create a private ``.pi`` dir and remove agent-injected project config."""
+    entries = " ".join(
+        ssh.shell_escape(".pi/" + entry) for entry in _PI_PROJECT_ENTRIES)
+    script = "\n".join([
+        "set -eu",
+        "cd %s" % ssh.shell_escape(workspace),
+        'if [ -L .pi ] || { [ -e .pi ] && [ ! -d .pi ]; }; then',
+        "  printf 'PI_DIR_UNSAFE\\n'",
+        "  exit 4",
+        "fi",
+        "mkdir -p .pi",
+        "chmod 700 .pi",
+        "rm -rf %s" % entries,
+        'if [ -L .git ] || { [ -e .git ] && [ ! -d .git ]; }; then',
+        "  printf 'PI_GIT_METADATA_UNSAFE\\n'",
+        "  exit 5",
+        "fi",
+        "if [ -d .git/info ]; then",
+        "  touch .git/info/exclude",
+        "  grep -qxF '.pi/' .git/info/exclude "
+        "|| printf '\\n.pi/\\n' >> .git/info/exclude",
+        "fi",
+    ])
+    output, status = _run_remote_prepare(worker_host, script)
+    if status == 0:
+        return
+    text = _remote_output_text(output)
+    if "PI_GIT_METADATA_UNSAFE" in text:
+        raise WorkflowError(
+            "pi_git_metadata_unsafe",
+            "workspace .git is not a real directory")
+    if "PI_DIR_UNSAFE" in text:
+        raise WorkflowError(
+            "unsafe_private_directory",
+            "path is not a real directory: %s/.pi" % workspace)
+    raise WorkflowError("pi_remote_prepare_failed", text)
+
+
+def _prepare_remote_git_isolation(workspace, worker_host):
+    script = "\n".join([
+        "set -eu",
+        "cd %s" % ssh.shell_escape(workspace),
+        "mkdir -p .pi/gh",
+        "chmod 700 .pi/gh",
+        ": > .pi/gitconfig",
+    ])
+    output, status = _run_remote_prepare(worker_host, script)
+    if status != 0:
+        raise WorkflowError(
+            "pi_remote_prepare_failed", _remote_output_text(output))
+
+
+def _remote_write_mcp_config(workspace, config, worker_host):
+    content = json.dumps(config, ensure_ascii=False, indent=2)
+    script = "\n".join([
+        "set -eu",
+        "cd %s" % ssh.shell_escape(workspace),
+        "mkdir -p .pi",
+        "chmod 700 .pi",
+        "printf '%%s' %s > .pi/.mcp.tmp" % ssh.shell_escape(content),
+        "chmod 600 .pi/.mcp.tmp",
+        "mv .pi/.mcp.tmp .pi/mcp.json",
+    ])
+    output, status = _run_remote_prepare(worker_host, script)
+    if status != 0:
+        raise WorkflowError(
+            "pi_mcp_config_failed", _remote_output_text(output))
+
+
+def _remote_remove_mcp_config(workspace, worker_host):
+    script = "\n".join([
+        "set -eu",
+        "cd %s" % ssh.shell_escape(workspace),
+        "rm -f .pi/mcp.json",
+    ])
+    output, status = _run_remote_prepare(worker_host, script)
+    if status != 0:
+        raise WorkflowError(
+            "pi_mcp_config_failed", _remote_output_text(output))
+
+
+def _run_remote_prepare(worker_host, script):
+    try:
+        return ssh.run(worker_host, script, timeout_s=30)
+    except ssh.SSHError as error:
+        raise WorkflowError(
+            getattr(error, "reason", "ssh_command_failed"),
+            str(error)) from error
+
+
+def _remote_output_text(output):
+    text = output.decode("utf-8", "replace") \
+        if isinstance(output, bytes) else str(output or "")
+    return text[-2048:]
 
 
 def _is_link_or_reparse(path):
@@ -463,7 +601,11 @@ def run_turn(session, prompt, on_message, cancel_event=None):
     _send(session, {"id": request_id, "type": "prompt", "message": prompt})
 
     usage = {"input": 0, "output": 0}
-    deadline = time.monotonic() + max(session.config.turn_timeout_ms, 1) / 1000.0
+    # Parity with the Codex app-server: turn_timeout_ms is a *silence*
+    # timeout. Every protocol line proves Pi is still working, so a long but
+    # active turn must not be killed; only a quiet stdout does.
+    timeout_s = max(session.config.turn_timeout_ms, 1) / 1000.0
+    deadline = time.monotonic() + timeout_s
 
     while True:
         if cancel_event is not None and cancel_event.is_set():
@@ -485,6 +627,7 @@ def run_turn(session, prompt, on_message, cancel_event=None):
             code = session.process.poll()
             _emit_failed(on_message, session_id, ("pi_exited", code))
             raise TurnError(("pi_exited", code if code is not None else "eof"))
+        deadline = time.monotonic() + timeout_s
         record = _parse(item)
         if record is None:
             continue
@@ -508,6 +651,10 @@ def run_turn(session, prompt, on_message, cancel_event=None):
                 "payload": {"method": "turn/cancelled"},
             })
             raise TurnError("turn_aborted")
+        if outcome == "turn_input_required":
+            # Keep turn_input_required as the last recorded event so the
+            # orchestrator maps this run to blocked instead of retrying it.
+            raise TurnError("turn_input_required")
         _emit_failed(on_message, session_id, outcome)
         raise TurnError(outcome)
 
@@ -515,6 +662,30 @@ def run_turn(session, prompt, on_message, cancel_event=None):
 def _handle_record(record, request_id, session_id, usage, on_message):
     """Returns (outcome, usage). outcome ∈ continue|settled|handled|aborted|reason."""
     rtype = record.get("type")
+
+    if rtype == "extension_ui_request":
+        method = record.get("method")
+        if method in ("select", "confirm", "input", "editor"):
+            # RPC dialog methods block until the client answers. Symphony has
+            # no operator channel back into Pi, so surface the blocker and
+            # stop the worker instead of hanging until the turn timeout.
+            _emit(on_message, "turn_input_required", {
+                "session_id": session_id,
+                "payload": {
+                    "method": "extension_ui_request",
+                    "params": {
+                        "request_id": record.get("id"),
+                        "method": method,
+                        "title": record.get("title"),
+                        "message": record.get("message"),
+                        "placeholder": record.get("placeholder"),
+                    },
+                },
+            })
+            return "turn_input_required", usage
+        # notify/setStatus/setWidget/setTitle/set_editor_text are
+        # fire-and-forget and must not block the run.
+        return "continue", usage
 
     if rtype == "response" and record.get("id") == request_id:
         if record.get("success") is False:
@@ -579,6 +750,10 @@ def _abort_turn(session, request_id):
 
 def stop_session(session):
     """Terminate Pi and return only after its process tree is gone."""
+    if session is None:
+        return True
+    _revoke_mcp_token(getattr(session, "mcp_token", None))
+    session.mcp_token = None
     process = session.process
     if process is None:
         return True
@@ -617,6 +792,8 @@ def force_terminate_session(session):
     """Force-kill a Pi process tree and return whether it is confirmed dead."""
     if session is None or session.process is None:
         return True
+    _revoke_mcp_token(getattr(session, "mcp_token", None))
+    session.mcp_token = None
     process = session.process
     known_tree = set()
     force_confirmed = _force_kill_process_tree(process)

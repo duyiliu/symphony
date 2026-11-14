@@ -43,6 +43,20 @@ def settings(project_slug="project-a", repo="acme/repo-a"):
 
 
 class McpBridgeScopeTests(unittest.TestCase):
+    def test_scope_stats_report_usage_without_exposing_tokens(self):
+        state = mcp_bridge._State(None, 1234)
+        cfg = settings()
+        state.register_scope(
+            cfg.tracker, cfg.delivery, IssueScope(id="issue-a", identifier="ABC-1"))
+
+        stats = state.stats()
+
+        self.assertTrue(stats["running"])
+        self.assertEqual(stats["active"], 1)
+        self.assertEqual(stats["limit"], mcp_bridge.MAX_SCOPES)
+        self.assertGreater(stats["utilization"], 0)
+        self.assertNotIn("scopes", stats)
+
     def test_pi_directory_link_cannot_redirect_sanitise_or_mcp_config(self):
         cfg = settings()
         issue = SimpleNamespace(id="issue-a", identifier="ABC-1")
@@ -295,7 +309,7 @@ class McpBridgeScopeTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason, "pi_mcp_config_failed")
         self.assertEqual(state._scopes, {})
 
-    def test_scope_is_revoked_only_after_process_tree_confirmation(self):
+    def test_scope_is_revoked_on_stop_request(self):
         cfg = settings()
         issue = SimpleNamespace(id="issue-a", identifier="ABC-1")
         state = mcp_bridge._State(None, 1234)
@@ -318,7 +332,7 @@ class McpBridgeScopeTests(unittest.TestCase):
                 patch.object(pi_runtime, "_session_scan_confirmed_gone",
                              return_value=False):
             self.assertFalse(pi_runtime.stop_session(session))
-        self.assertIsNotNone(state.scope_for_token(token))
+        self.assertIsNone(state.scope_for_token(token))
 
         with patch.object(mcp_bridge, "_bridge", state), \
                 patch.object(pi_runtime, "_force_kill_process_tree",
@@ -330,7 +344,7 @@ class McpBridgeScopeTests(unittest.TestCase):
             self.assertTrue(pi_runtime.stop_session(session))
         self.assertIsNone(state.scope_for_token(token))
 
-    def test_startup_failure_keeps_scope_until_orphan_is_confirmed_dead(self):
+    def test_startup_failure_revokes_scope_even_when_orphan_unconfirmed(self):
         cfg = settings()
         cfg.runtime.command = "pi --mode rpc"
         issue = SimpleNamespace(id="issue-a", identifier="ABC-1")
@@ -357,10 +371,9 @@ class McpBridgeScopeTests(unittest.TestCase):
                     mcp_token=token)
 
         self.assertIsNotNone(raised.exception.session)
-        self.assertIsNotNone(state.scope_for_token(token))
+        self.assertIsNone(state.scope_for_token(token))
         process.stdin.close.assert_not_called()
         process.stdout.close.assert_not_called()
-        state.revoke_scope(token)
 
 
 if __name__ == "__main__":

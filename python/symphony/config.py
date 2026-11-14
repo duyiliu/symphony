@@ -13,16 +13,24 @@ from .util import normalize_issue_state, present_string
 from .workflow import WorkflowError
 
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SUPPORTED_TRACKER_KINDS = {"linear", "github", "board"}
+SUPPORTED_TRACKER_KINDS = {
+    "linear", "github", "board", "jira", "asana", "gitlab"}
+LINEAR_ACTIVE_STATES = ("Todo", "In Progress")
+LINEAR_TERMINAL_STATES = (
+    "Closed", "Cancelled", "Canceled", "Duplicate", "Done")
 
-DEFAULT_PROMPT_TEMPLATE = """\\
-You are working on Linear issue {{ issue.identifier }}.
+DEFAULT_PROMPT_TEMPLATE = """\
+You are working on an issue from the configured tracker.
+
+Identifier: {{ issue.identifier }}
 Title: {{ issue.title }}
-Status: {{ issue.state }}
-URL: {{ issue.url }}
 
-Use the host-provided linear_graphql tool for issue state, comments and links.
-Follow the repository's workflow policy and keep the workpad current.
+Body:
+{% if issue.description %}
+{{ issue.description }}
+{% else %}
+No description provided.
+{% endif %}
 """
 
 @dataclass
@@ -67,7 +75,7 @@ class AgentSettings:
 
 @dataclass
 class RuntimeSettings:
-    kind: str = "codex"
+    kind: str = "pi"
     command: str = None
     model: str = None
     thinking: str = None
@@ -118,6 +126,9 @@ class ServerSettings:
     port: int = None
     host: str = "127.0.0.1"
     api_token: str = None
+    state_backup_dir: str = None
+    state_backup_interval_ms: int = 3_600_000
+    state_backup_keep: int = 24
 
 
 DEFAULT_DELIVERY_RISK_PATHS = [
@@ -362,7 +373,7 @@ def parse_settings(config):
     runtime = _section(config, "runtime", errors)
     kind = _opt_str(runtime.get("kind"), "runtime.kind", errors)
     if kind is None:
-        kind = "codex"
+        kind = "pi"
     kind = kind.strip().lower()
     if kind not in ("codex", "pi"):
         errors.append("runtime.kind must be one of: codex, pi")
@@ -429,10 +440,22 @@ def parse_settings(config):
     host = _opt_str(server.get("host"), "server.host", errors)
     if host is not None and host.strip() == "":
         errors.append("server.host can't be blank")
+    backup_interval = _opt_int(
+        server.get("state_backup_interval_ms"),
+        "server.state_backup_interval_ms", 0, errors)
+    backup_keep = _opt_int(
+        server.get("state_backup_keep"),
+        "server.state_backup_keep", 1, errors)
     settings.server = ServerSettings(
         port=port,
         host=host if host is not None else "127.0.0.1",
         api_token=_opt_str(server.get("api_token"), "server.api_token", errors),
+        state_backup_dir=_opt_str(
+            server.get("state_backup_dir"),
+            "server.state_backup_dir", errors),
+        state_backup_interval_ms=(
+            3_600_000 if backup_interval is None else backup_interval),
+        state_backup_keep=24 if backup_keep is None else backup_keep,
     )
 
     delivery = _section(config, "delivery", errors)
@@ -505,15 +528,30 @@ def _finalize(settings):
     tracker = settings.tracker
     provider = _normalize_keys(tracker.provider) or {}
     tracker.provider = provider
-    tracker.endpoint = provider.get("endpoint", tracker.endpoint)
-    if tracker.kind == "linear" and tracker.endpoint is None:
-        tracker.endpoint = "https://api.linear.app/graphql"
-    tracker.project_slug = provider.get("project_slug", tracker.project_slug)
     if tracker.kind == "linear":
+        provider.setdefault(
+            "endpoint", tracker.endpoint or "https://api.linear.app/graphql")
+        provider.setdefault("api_key", tracker.api_key)
+        provider.setdefault("project_slug", tracker.project_slug)
+        provider.setdefault("assignee", tracker.assignee)
+        tracker.endpoint = provider.get("endpoint")
+        # ``provider`` keeps the literal ``$VAR`` reference while the
+        # compatibility alias resolves it, matching the upstream adapter.
+        tracker.api_key = resolve_env_setting(
+            provider.get("api_key"), "LINEAR_API_KEY")
         tracker.project_slug = resolve_env_setting(
-            tracker.project_slug, "LINEAR_PROJECT_SLUG")
-    tracker.api_key = provider.get("api_key", tracker.api_key)
-    tracker.assignee = provider.get("assignee", tracker.assignee)
+            provider.get("project_slug"), "LINEAR_PROJECT_SLUG")
+        tracker.assignee = resolve_env_setting(
+            provider.get("assignee"), "LINEAR_ASSIGNEE")
+        if tracker.active_states is None:
+            tracker.active_states = list(LINEAR_ACTIVE_STATES)
+        if tracker.terminal_states is None:
+            tracker.terminal_states = list(LINEAR_TERMINAL_STATES)
+    else:
+        tracker.endpoint = provider.get("endpoint", tracker.endpoint)
+        tracker.project_slug = provider.get("project_slug", tracker.project_slug)
+        tracker.api_key = provider.get("api_key", tracker.api_key)
+        tracker.assignee = provider.get("assignee", tracker.assignee)
 
     delivery = settings.delivery
     if delivery.enabled:
@@ -574,7 +612,7 @@ def _finalize(settings):
     secret_names = []
     if tracker.kind == "linear":
         secret_names = ["LINEAR_API_KEY"] + env_reference_names(
-            [tracker.api_key])
+            [provider.get("api_key")])
         session_conf = provider.get("agent_sessions") or {}
         if not isinstance(session_conf, dict):
             raise _invalid("tracker.provider.agent_sessions must be a map")
@@ -620,7 +658,21 @@ def _finalize(settings):
             "GH_TOKEN",
             "GITHUB_ENTERPRISE_TOKEN",
             "GH_ENTERPRISE_TOKEN",
+            "SYMPHONY_GITHUB_TOKEN",
         ] + env_reference_names([provider.get("token")])
+    elif tracker.kind == "jira":
+        secret_names = ["JIRA_API_TOKEN"] + env_reference_names(
+            [provider.get("api_token")])
+    elif tracker.kind == "asana":
+        secret_names = ["ASANA_PAT"] + env_reference_names(
+            [provider.get("api_key")])
+    elif tracker.kind == "gitlab":
+        secret_names = [
+            "GITLAB_PAT",
+            "GITLAB_ACCESS_TOKEN",
+            "GITLAB_TOKEN",
+            "OAUTH_TOKEN",
+        ] + env_reference_names([provider.get("api_key")])
     tracker.secret_environment_names = list(dict.fromkeys(secret_names))
 
     if settings.runtime.command in (None, ""):

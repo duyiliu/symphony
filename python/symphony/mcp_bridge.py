@@ -66,6 +66,16 @@ class _State:
         with self._lock:
             self._scopes.clear()
 
+    def stats(self):
+        with self._lock:
+            active = len(self._scopes)
+        return {
+            "running": True,
+            "active": active,
+            "limit": MAX_SCOPES,
+            "utilization": round(active / MAX_SCOPES, 4) if MAX_SCOPES else 0.0,
+        }
+
 
 def _tools():
     from . import tracker as tracker_adapter
@@ -152,8 +162,45 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         log.debug("mcp %s", format % args)
 
+    def _discard_body(self):
+        """Drain an unread request body before closing the connection.
+
+        Closing a socket with unread bytes makes Windows answer with RST
+        instead of FIN, which can destroy the response before the peer reads
+        it.  The drain is best-effort: a client that announced a body it never
+        sent must not block the error response.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return
+        remaining = min(max(length, 0), MAX_REQUEST_BYTES)
+        if remaining <= 0:
+            return
+        try:
+            previous_timeout = self.connection.gettimeout()
+            self.connection.settimeout(0.1)
+        except OSError:
+            return
+        try:
+            while remaining > 0:
+                try:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+        finally:
+            try:
+                self.connection.settimeout(previous_timeout)
+            except OSError:
+                pass
+
     def _respond(self, status, body, close=False):
         data = body.encode("utf-8") if isinstance(body, str) else body or b""
+        if close:
+            self._discard_body()
         self.send_response(status)
         if data:
             self.send_header("Content-Type", "application/json")
@@ -164,6 +211,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if data:
             self.wfile.write(data)
+        if close:
+            self.wfile.flush()
 
     def do_POST(self):
         if self.path.split("?", 1)[0] != MCP_PATH:
@@ -307,6 +356,25 @@ def revoke_scope(token):
     """Revoke one worker scope from the active bridge."""
     bridge = _bridge
     return bool(bridge and bridge.revoke_scope(token))
+
+
+def endpoint_port():
+    """Return the loopback bridge port, or ``None`` when it is not running."""
+    bridge = _bridge
+    return bridge.port if bridge is not None else None
+
+
+def stats():
+    """Return MCP scope usage for the observability API."""
+    bridge = _bridge
+    if bridge is None:
+        return {
+            "running": False,
+            "active": 0,
+            "limit": MAX_SCOPES,
+            "utilization": 0.0,
+        }
+    return bridge.stats()
 
 
 def endpoint():

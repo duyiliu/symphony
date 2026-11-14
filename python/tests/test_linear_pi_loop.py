@@ -185,7 +185,8 @@ print(json.dumps({"type": "agent_settled", "aborted": False}), flush=True)
 
 class LinearPiLoopTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="symphony-loop-")
+        self.temp = tempfile.TemporaryDirectory(
+            prefix="symphony-loop-", ignore_cleanup_errors=True)
         self.root = self.temp.name
         self.fake = _FakePiServer(self.root)
         self.workflow_path = os.path.join(self.root, "WORKFLOW.md")

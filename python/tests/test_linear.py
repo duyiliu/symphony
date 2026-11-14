@@ -75,6 +75,74 @@ class LinearTrackerTests(unittest.TestCase):
         self.assertIn("SYMPHONY_GITHUB_TOKEN", cfg.tracker.secret_environment_names)
         linear.validate_config(cfg.tracker)
 
+    def test_linear_defaults_and_env_fallbacks(self):
+        with patch.dict(os.environ, {"LINEAR_ASSIGNEE": "dev@example.com"}):
+            cfg = config.parse_settings({
+                "tracker": {"kind": "linear", "provider": {
+                    "project_slug": "example-project", "api_key": "test-key"}},
+            })
+        self.assertEqual(cfg.tracker.active_states, ["Todo", "In Progress"])
+        self.assertEqual(cfg.tracker.terminal_states, [
+            "Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
+        self.assertEqual(cfg.tracker.assignee, "dev@example.com")
+        self.assertEqual(cfg.tracker.provider["endpoint"],
+                         "https://api.linear.app/graphql")
+        self.assertEqual(cfg.tracker.provider["project_slug"],
+                         "example-project")
+        # The provider keeps the raw config value; the alias resolves env.
+        self.assertIsNone(cfg.tracker.provider["assignee"])
+
+    def test_linear_validate_prefers_endpoint_then_token_then_slug(self):
+        cfg = settings().tracker
+        cfg.endpoint = "http://insecure.example/graphql"
+        cfg.api_key = None
+        cfg.provider.pop("api_key", None)
+        with patch.dict(os.environ, {"LINEAR_API_KEY": ""}):
+            with self.assertRaises(WorkflowError) as ctx:
+                linear.validate_config(cfg)
+        self.assertEqual(ctx.exception.reason, "invalid_linear_endpoint")
+
+        cfg.endpoint = "https://api.linear.app/graphql"
+        cfg.provider["api_key"] = 123
+        with patch.dict(os.environ, {"LINEAR_API_KEY": ""}):
+            with self.assertRaises(WorkflowError) as ctx:
+                linear.validate_config(cfg)
+        self.assertEqual(ctx.exception.reason, "missing_linear_api_token")
+
+        cfg.provider["api_key"] = "test-key"
+        cfg.project_slug = None
+        cfg.provider.pop("project_slug", None)
+        with self.assertRaises(WorkflowError) as ctx:
+            linear.validate_config(cfg)
+        self.assertEqual(ctx.exception.reason, "missing_linear_project_slug")
+
+    def test_empty_states_skip_request(self):
+        cfg = settings().tracker
+        with patch.object(linear, "graphql") as api:
+            self.assertEqual(linear.fetch_issues_by_states(cfg, []), [])
+            self.assertEqual(linear.fetch_issues_by_states(cfg, [None]), [])
+        api.assert_not_called()
+
+    def test_state_names_are_stringified_and_deduplicated(self):
+        cfg = settings().tracker
+        page = {"data": {"issues": {
+            "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
+        with patch.object(linear, "graphql", return_value=page) as api:
+            linear.fetch_issues_by_states(cfg, ["Todo", "Todo", 7])
+        self.assertEqual(api.call_args.args[2]["stateNames"], ["Todo", "7"])
+
+    def test_malformed_poll_rows_are_dropped_with_warning(self):
+        cfg = settings().tracker
+        page = {"data": {"issues": {
+            "nodes": [row("ABC-1"), {"id": "broken", "title": " "}],
+            "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
+        with patch.object(linear, "graphql", return_value=page), \
+                self.assertLogs("symphony.linear", level="WARNING") as logs:
+            got = linear.fetch_candidate_issues(cfg)
+        self.assertEqual([issue.identifier for issue in got], ["ABC-1"])
+        self.assertIn("Dropping malformed Linear issue records count=1",
+                      "\n".join(logs.output))
+
     def test_poll_pagination_and_mapping(self):
         cfg = settings().tracker
         pages = [
@@ -560,6 +628,36 @@ class LinearTrackerTests(unittest.TestCase):
         result = tracker.execute_agent_tool(
             "linear_graphql", {"query": "query {viewer {id}}"}, cfg)
         self.assertEqual(result["error"]["code"], "linear_tool_forbidden")
+
+    def test_tool_trims_query_and_validates_variables(self):
+        cfg = settings().tracker
+        scope = issue_scope()
+        calls = []
+
+        def response(_settings, query, variables):
+            calls.append((query, variables))
+            if "SymphonyLinearWorkerIssueScope" in query:
+                return {"data": {"issue": live_issue(scope)}}
+            return {"data": {"viewer": {"id": "me"}}}
+
+        with patch.object(linear, "graphql", side_effect=response):
+            result = tracker.execute_agent_tool(
+                "linear_graphql", "  query {viewer {id}}  ", cfg,
+                issue_scope=scope)
+        self.assertEqual(result["data"]["viewer"]["id"], "me")
+        self.assertEqual(calls[-1][0], "query {viewer {id}}")
+
+        self.assertEqual(
+            tracker.execute_agent_tool(
+                "linear_graphql", {"query": "   "}, cfg,
+                issue_scope=scope)["error"]["code"],
+            "missing_query")
+        self.assertEqual(
+            tracker.execute_agent_tool(
+                "linear_graphql",
+                {"query": "query {viewer {id}}", "variables": ["bad"]},
+                cfg, issue_scope=scope)["error"]["code"],
+            "invalid_variables")
 
     def test_requires_auth(self):
         cfg = settings().tracker

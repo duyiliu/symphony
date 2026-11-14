@@ -8,6 +8,9 @@ Orchestrator/runner only ever talk to this facade; every function takes
 
 from .github import adapter as github_adapter
 from . import linear as linear_adapter
+from .jira import adapter as jira_adapter
+from .asana import adapter as asana_adapter
+from .gitlab import adapter as gitlab_adapter
 
 
 def _is_linear(settings):
@@ -23,11 +26,29 @@ def _is_board(tracker_settings):
     return getattr(tracker_settings, "kind", None) == "board"
 
 
+def _is_jira(tracker_settings):
+    return getattr(tracker_settings, "kind", None) == "jira"
+
+
+def _is_asana(tracker_settings):
+    return getattr(tracker_settings, "kind", None) == "asana"
+
+
+def _is_gitlab(tracker_settings):
+    return getattr(tracker_settings, "kind", None) == "gitlab"
+
+
 def validate_config(settings):
     """Full-settings entry used by WorkflowStore."""
     tracker = settings.tracker
     if _is_linear(tracker):
         linear_adapter.validate_config(tracker)
+    elif _is_jira(tracker):
+        jira_adapter.validate_config(tracker)
+    elif _is_asana(tracker):
+        asana_adapter.validate_config(tracker)
+    elif _is_gitlab(tracker):
+        gitlab_adapter.validate_config(tracker)
     elif _is_board(tracker):
         _board().validate_config(tracker)
     else:
@@ -37,6 +58,12 @@ def validate_config(settings):
 def fetch_candidate_issues(tracker_settings):
     if _is_linear(tracker_settings):
         return linear_adapter.fetch_candidate_issues(tracker_settings)
+    if _is_jira(tracker_settings):
+        return jira_adapter.fetch_candidate_issues(tracker_settings)
+    if _is_asana(tracker_settings):
+        return asana_adapter.fetch_candidate_issues(tracker_settings)
+    if _is_gitlab(tracker_settings):
+        return gitlab_adapter.fetch_candidate_issues(tracker_settings)
     if _is_board(tracker_settings):
         return _board().fetch_candidate_issues(tracker_settings)
     return github_adapter.fetch_candidate_issues(tracker_settings)
@@ -45,6 +72,15 @@ def fetch_candidate_issues(tracker_settings):
 def fetch_issues_by_states(tracker_settings, state_names):
     if _is_linear(tracker_settings):
         return linear_adapter.fetch_issues_by_states(tracker_settings, state_names)
+    if _is_jira(tracker_settings):
+        return jira_adapter.fetch_issues_by_states(
+            tracker_settings, state_names)
+    if _is_asana(tracker_settings):
+        return asana_adapter.fetch_issues_by_states(
+            tracker_settings, state_names)
+    if _is_gitlab(tracker_settings):
+        return gitlab_adapter.fetch_issues_by_states(
+            tracker_settings, state_names)
     if _is_board(tracker_settings):
         return _board().fetch_issues_by_states(
             tracker_settings, state_names)
@@ -55,6 +91,15 @@ def fetch_issues_by_states(tracker_settings, state_names):
 def fetch_issues_by_ids(tracker_settings, issue_ids):
     if _is_linear(tracker_settings):
         return linear_adapter.fetch_issues_by_ids(tracker_settings, issue_ids)
+    if _is_jira(tracker_settings):
+        return jira_adapter.fetch_issues_by_ids(
+            tracker_settings, issue_ids)
+    if _is_asana(tracker_settings):
+        return asana_adapter.fetch_issues_by_ids(
+            tracker_settings, issue_ids)
+    if _is_gitlab(tracker_settings):
+        return gitlab_adapter.fetch_issues_by_ids(
+            tracker_settings, issue_ids)
     if _is_board(tracker_settings):
         return _board().fetch_issues_by_ids(tracker_settings, issue_ids)
     return github_adapter.fetch_issues_by_ids(tracker_settings, issue_ids)
@@ -83,6 +128,12 @@ def begin_run_issue(issue, tracker_settings):
 def routable(issue, tracker_settings):
     if _is_linear(tracker_settings):
         return linear_adapter.routable(issue, tracker_settings)
+    if _is_jira(tracker_settings):
+        return jira_adapter.routable(issue, tracker_settings)
+    if _is_asana(tracker_settings):
+        return asana_adapter.routable(issue, tracker_settings)
+    if _is_gitlab(tracker_settings):
+        return gitlab_adapter.routable(issue, tracker_settings)
     if _is_board(tracker_settings):
         return _board().routable(issue, tracker_settings)
     return github_adapter.routable(issue, tracker_settings)
@@ -107,6 +158,12 @@ def tool_specs(tracker_settings=None, delivery_settings=None):
         if delivery is not None and delivery.enabled:
             specs = specs + agent_tool.delivery_tool_specs()
         return specs
+    if tracker_settings and _is_jira(tracker_settings):
+        return jira_adapter.tool_specs()
+    if tracker_settings and _is_asana(tracker_settings):
+        return asana_adapter.tool_specs()
+    if tracker_settings and _is_gitlab(tracker_settings):
+        return gitlab_adapter.tool_specs()
     return agent_tool.tool_specs(tracker_settings)
 
 
@@ -130,6 +187,15 @@ def execute_agent_tool(
         return linear_adapter.execute_agent_tool(
             tracker_settings, tool_name, arguments,
             issue_scope=issue_scope, delivery=delivery_settings)
+    if tracker_settings and _is_jira(tracker_settings):
+        return jira_adapter.execute_agent_tool(
+            tool_name, arguments, tracker_settings=tracker_settings)
+    if tracker_settings and _is_asana(tracker_settings):
+        return asana_adapter.execute_agent_tool(
+            tool_name, arguments, tracker_settings=tracker_settings)
+    if tracker_settings and _is_gitlab(tracker_settings):
+        return gitlab_adapter.execute_agent_tool(
+            tool_name, arguments, tracker_settings=tracker_settings)
     return agent_tool.execute_agent_tool(tool_name, arguments,
                                          tracker_settings)
 

@@ -4,10 +4,12 @@ Tracker-side parity coverage moved to test_tasks.py with the v2 record model.
 """
 import json
 import os
+import posixpath
 import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -93,10 +95,51 @@ class RemoveIssueWorkspacesTest(unittest.TestCase):
             target = os.path.join(tmp, "GH-1")
             os.makedirs(target)
             settings = self._settings(tmp, ssh_hosts=["a", "b"])
-            removed = workspace_mod.remove_issue_workspaces(settings, ["GH-1"])
-            # Remote cleanup is unsupported; the local dir must be untouched.
-            self.assertEqual(removed, [])
+            with mock.patch(
+                    "symphony.ssh.run", return_value=(b"", 0)) as run:
+                removed = workspace_mod.remove_issue_workspaces(
+                    settings, ["GH-1"])
+            remote_path = posixpath.join(tmp, "GH-1")
+            self.assertEqual(removed, [remote_path, remote_path])
+            self.assertEqual(run.call_count, 2)
+            # Remote cleanup must not delete the local directory.
             self.assertTrue(os.path.isdir(target))
+
+    def test_missing_root_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(os.path.join(tmp, "missing"))
+            removed = workspace_mod.remove_issue_workspaces(
+                settings, ["GH-1"])
+        self.assertEqual(removed, [])
+
+    def test_non_string_identifier_uses_issue_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "issue")
+            os.makedirs(target)
+            settings = self._settings(tmp)
+            removed = workspace_mod.remove_issue_workspaces(settings, [None])
+            self.assertEqual(len(removed), 1)
+            self.assertEqual(os.path.basename(removed[0]), "issue")
+            self.assertFalse(os.path.lexists(target))
+
+    def test_multiple_identifiers_remove_every_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("GH-1", "GH-2"):
+                os.makedirs(os.path.join(tmp, name))
+            settings = self._settings(tmp)
+            removed = workspace_mod.remove_issue_workspaces(
+                settings, ["GH-1", "GH-2"])
+            self.assertEqual(len(removed), 2)
+            self.assertEqual(
+                sorted(os.listdir(tmp)), [])
+
+    def test_empty_identifier_list_removes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "GH-1"))
+            settings = self._settings(tmp)
+            self.assertEqual(
+                workspace_mod.remove_issue_workspaces(settings, []), [])
+            self.assertTrue(os.path.isdir(os.path.join(tmp, "GH-1")))
 
 
 class TickStagingTest(unittest.TestCase):

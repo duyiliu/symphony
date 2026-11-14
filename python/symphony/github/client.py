@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .. import http_client
 from ..issue import Issue
 from ..util import normalize_label, parse_datetime, present_string
 
@@ -149,7 +150,7 @@ def perform_request(method, path, params, body, gh_settings):
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with http_client.urlopen(request, timeout=30) as response:
             payload = response.read()
             return {
                 "status": response.status,

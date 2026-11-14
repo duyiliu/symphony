@@ -1,8 +1,9 @@
 """Per-issue workspace creation, hook execution and safe removal.
 
-Safety invariant: every path that hooks or the agent can reach must resolve
-inside the configured workspace root. Remote workers (``worker.ssh_hosts``)
-are not supported by this implementation; ``pi`` runs locally only.
+Local safety invariant: every path that hooks or the agent can reach must
+resolve inside the configured workspace root. Remote workers
+(``worker.ssh_hosts``) use the same deterministic ``<root>/<key>`` layout on
+the remote host and never fall back to local execution.
 """
 
 import base64
@@ -10,15 +11,17 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
 
-from . import util
+from . import ssh, util
 from .paths import PathSafetyError, canonicalize, expand_workspace_root, safe_join
 from .workflow import WorkflowError
 
@@ -134,9 +137,20 @@ def acquire_run_lease(settings, issue, workflow_path=None, worker_host=None):
     with a recorded live Pi is treated as crash debris only when its command
     line still contains the unique Pi session ID; unverifiable ownership is
     kept busy so another host can never execute concurrently.
+
+    Remote workers keep the lease on the Symphony host, keyed by both the
+    worker host and the remote workspace path.  This prevents two local
+    Symphony processes from dispatching the same issue to the same remote
+    workspace; the Elixir reference has no cross-host lease either.
     """
     if worker_host is not None:
-        raise WorkflowError("remote_workspace_not_supported")
+        path = workspace_path(
+            settings, issue, workflow_path, worker_host=worker_host)
+        return acquire_path_run_lease(
+            settings, path, issue_id=getattr(issue, "id", None),
+            identifier=getattr(issue, "identifier", None),
+            workflow_path=workflow_path, canonical=False,
+            lease_key="remote\0%s\0%s" % (worker_host, path))
     path = _resolve_workspace_path(settings, issue, workflow_path)
     return acquire_path_run_lease(
         settings, path, issue_id=getattr(issue, "id", None),
@@ -145,15 +159,20 @@ def acquire_run_lease(settings, issue, workflow_path=None, worker_host=None):
 
 
 def acquire_path_run_lease(settings, workspace, issue_id=None, identifier=None,
-                           workflow_path=None):
+                           workflow_path=None, canonical=True,
+                           lease_key=None, lock_root=None):
     """Acquire a run lease for an already resolved workspace path."""
-    canonical_workspace = canonicalize(workspace)
-    lock_dir = os.path.join(
-        expand_workspace_root(settings.workspace.root, workflow_path),
-        RUN_LOCK_DIRECTORY)
+    canonical_workspace = canonicalize(workspace) if canonical else workspace
+    if lock_root is None:
+        lock_root = (_remote_lease_root() if not canonical
+                     else expand_workspace_root(
+                         settings.workspace.root, workflow_path))
+    lock_dir = os.path.join(lock_root, RUN_LOCK_DIRECTORY)
     os.makedirs(lock_dir, exist_ok=True)
     digest = hashlib.sha256(
-        os.path.normcase(canonical_workspace).encode("utf-8")).hexdigest()[:32]
+        os.path.normcase(
+            canonical_workspace if lease_key is None else lease_key
+        ).encode("utf-8")).hexdigest()[:32]
     path = os.path.join(lock_dir, digest + ".lock")
     owner_path = path + ".owner.json"
 
@@ -206,6 +225,18 @@ def acquire_path_run_lease(settings, workspace, issue_id=None, identifier=None,
         _reset_lock_file_metadata(handle)
         _local_run_leases[path] = lease
         return lease
+
+
+def _remote_lease_root():
+    """Host-local state directory for remote workspace leases.
+
+    Remote workspace roots are POSIX paths and may not exist on the Symphony
+    host, so remote leases must never create directories under them.
+    """
+    configured = os.environ.get("SYMPHONY_LEASE_ROOT")
+    if configured:
+        return configured
+    return tempfile.gettempdir()
 
 
 def _lock_run_file(handle):
@@ -628,8 +659,19 @@ def _kill_verified_process_tree(pid):
             pass
 
 
-def workspace_path(settings, issue, workflow_path=None):
-    """Deterministic ``<root>/<identifier>`` workspace for an issue."""
+def workspace_path(settings, issue, workflow_path=None, worker_host=None):
+    """Deterministic ``<root>/<identifier>`` workspace for an issue.
+
+    Remote paths are kept verbatim (no local canonicalisation); the remote
+    shell expands ``~`` and reports the real path after ``cd``/``pwd -P``.
+    """
+    if worker_host is not None:
+        root = _remote_workspace_root(settings)
+        base = workspace_key(
+            issue.identifier if hasattr(issue, "identifier") else issue)
+        path = posixpath.join(root, base)
+        _validate_remote_workspace_path(path)
+        return path
     root = expand_workspace_root(settings.workspace.root, workflow_path)
     base = workspace_key(issue.identifier)
     try:
@@ -646,6 +688,21 @@ def workspace_path(settings, issue, workflow_path=None):
     return path
 
 
+def _remote_workspace_root(settings):
+    root = getattr(settings.workspace, "root", None)
+    if not isinstance(root, str) or root.strip() == "":
+        raise WorkflowError("workspace_root_missing", root)
+    return root
+
+
+def _validate_remote_workspace_path(path):
+    if not isinstance(path, str) or path.strip() == "":
+        raise WorkflowError("workspace_path_unreadable", "empty")
+    if "\n" in path or "\r" in path or "\0" in path:
+        raise WorkflowError(
+            "workspace_path_unreadable", "invalid_characters")
+
+
 def _resolve_workspace_path(settings, issue, workflow_path):
     return canonicalize(
         workspace_path(settings, issue, workflow_path))
@@ -654,7 +711,7 @@ def _resolve_workspace_path(settings, issue, workflow_path):
 def create_for_issue(settings, issue, workflow_path=None, worker_host=None):
     """Create the workspace and run ``after_create`` hooks (first creation only)."""
     if worker_host is not None:
-        raise WorkflowError("remote_workspace_not_supported")
+        return _create_remote(settings, issue, workflow_path, worker_host)
     path = _resolve_workspace_path(settings, issue, workflow_path)
     if os.path.lexists(path) and not os.path.isdir(path):
         os.remove(path)
@@ -668,6 +725,96 @@ def create_for_issue(settings, issue, workflow_path=None, worker_host=None):
             _cleanup_failed_new_workspace(path)
             raise
     return path
+
+
+REMOTE_WORKSPACE_MARKER = "__SYMPHONY_WORKSPACE__"
+
+
+def _remote_shell_assign(variable, raw_path):
+    """Assign a remote path, expanding a leading ``~`` in the remote shell."""
+    return "\n".join([
+        "%s=%s" % (variable, ssh.shell_escape(raw_path)),
+        'case "$%s" in' % variable,
+        "  '~') %s=\"$HOME\" ;;" % variable,
+        "  '~/'*) %s=\"$HOME/${%s#\\~/}\" ;;" % (variable, variable),
+        "esac",
+    ])
+
+
+def _parse_remote_workspace_output(output):
+    text = output.decode("utf-8", "replace") \
+        if isinstance(output, bytes) else str(output or "")
+    for line in text.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3 and parts[0] == REMOTE_WORKSPACE_MARKER \
+                and parts[1] in ("0", "1") and parts[2]:
+            return parts[1] == "1", parts[2]
+    return None
+
+
+def _create_remote(settings, issue, workflow_path, worker_host):
+    path = workspace_path(
+        settings, issue, workflow_path, worker_host=worker_host)
+    script = "\n".join([
+        "set -eu",
+        _remote_shell_assign("workspace", path),
+        'if [ -d "$workspace" ]; then',
+        "  created=0",
+        'elif [ -e "$workspace" ]; then',
+        '  rm -rf "$workspace"',
+        '  mkdir -p "$workspace"',
+        "  created=1",
+        "else",
+        '  mkdir -p "$workspace"',
+        "  created=1",
+        "fi",
+        'cd "$workspace"',
+        "printf '%%s\\t%%s\\t%%s\\n' '%s' \"$created\" \"$(pwd -P)\""
+        % REMOTE_WORKSPACE_MARKER,
+    ])
+    timeout_s = max(settings.hooks.timeout_ms, 1) / 1000.0
+    try:
+        output, status = ssh.run(
+            worker_host, script, timeout_s=timeout_s)
+    except ssh.SSHError as error:
+        if error.reason == "ssh_command_timeout":
+            raise HookError(
+                "remote_command", timed_out=settings.hooks.timeout_ms)
+        raise WorkflowError("workspace_prepare_failed", str(error)) from error
+    if status != 0:
+        raise WorkflowError(
+            "workspace_prepare_failed",
+            _truncate(_decode(output)))
+    parsed = _parse_remote_workspace_output(output)
+    if parsed is None:
+        raise WorkflowError(
+            "workspace_prepare_failed", "invalid_output")
+    created, remote_path = parsed
+    if created:
+        try:
+            _run_hook(
+                settings.hooks.after_create, "after_create", remote_path,
+                settings.hooks.timeout_ms, worker_host=worker_host)
+        except HookError:
+            _cleanup_failed_remote_workspace(
+                settings, remote_path, worker_host)
+            raise
+    return remote_path
+
+
+def _cleanup_failed_remote_workspace(settings, workspace, worker_host):
+    script = "\n".join([
+        _remote_shell_assign("workspace", workspace),
+        'rm -rf "$workspace"',
+    ])
+    try:
+        ssh.run(
+            worker_host, script,
+            timeout_s=max(settings.hooks.timeout_ms, 1) / 1000.0)
+    except ssh.SSHError as error:
+        log.warning(
+            "Failed to remove partial remote workspace host=%s path=%s "
+            "error=%s", worker_host, workspace, error)
 
 
 def _rmtree_compat(path):
@@ -704,7 +851,12 @@ def _cleanup_failed_new_workspace(path):
 
 def run_before_run(settings, issue, workflow_path=None, worker_host=None):
     if worker_host is not None:
-        raise WorkflowError("remote_workspace_not_supported")
+        path = workspace_path(
+            settings, issue, workflow_path, worker_host=worker_host)
+        _run_hook(
+            settings.hooks.before_run, "before_run", path,
+            settings.hooks.timeout_ms, worker_host=worker_host)
+        return path
     path = _resolve_workspace_path(settings, issue, workflow_path)
     _run_hook(settings.hooks.before_run, "before_run", path, settings.hooks.timeout_ms)
     return path
@@ -712,7 +864,20 @@ def run_before_run(settings, issue, workflow_path=None, worker_host=None):
 
 def run_after_run(settings, issue, workflow_path=None, worker_host=None):
     if worker_host is not None:
-        raise WorkflowError("remote_workspace_not_supported")
+        try:
+            path = workspace_path(
+                settings, issue, workflow_path, worker_host=worker_host)
+        except WorkflowError:
+            return
+        try:
+            _run_hook(
+                settings.hooks.after_run, "after_run", path,
+                settings.hooks.timeout_ms, worker_host=worker_host)
+        except HookError as error:
+            log.warning(
+                "after_run hook failed workspace=%s worker_host=%s error=%s",
+                path, worker_host, error)
+        return
     try:
         path = _resolve_workspace_path(settings, issue, workflow_path)
     except (PathSafetyError, WorkflowError):
@@ -734,7 +899,32 @@ def remove(settings, issue_or_path, workflow_path=None, worker_host=None):
     failures are logged but never block deletion.
     """
     if worker_host is not None:
-        raise WorkflowError("remote_workspace_not_supported")
+        path = issue_or_path if isinstance(issue_or_path, str) \
+            else workspace_path(
+                settings, issue_or_path, workflow_path,
+                worker_host=worker_host)
+        _validate_remote_workspace_path(path)
+        _run_remote_before_remove(settings, path, worker_host)
+        script = "\n".join([
+            _remote_shell_assign("workspace", path),
+            'rm -rf "$workspace"',
+        ])
+        try:
+            output, status = ssh.run(
+                worker_host, script,
+                timeout_s=max(settings.hooks.timeout_ms, 1) / 1000.0)
+        except ssh.SSHError as error:
+            log.warning(
+                "remote workspace remove failed host=%s path=%s error=%s",
+                worker_host, path, error)
+            return False
+        if status == 0:
+            return True
+        log.warning(
+            "remote workspace remove failed host=%s path=%s status=%s "
+            "output=%r", worker_host, path, status,
+            _truncate(_decode(output)))
+        return False
     root = expand_workspace_root(settings.workspace.root, workflow_path)
     if isinstance(issue_or_path, str):
         path = issue_or_path
@@ -768,7 +958,9 @@ def remove_recorded(settings, workspace_path, workflow_path=None,
     under the currently configured workspace root.
     """
     if worker_host is not None:
-        raise WorkflowError("remote_workspace_not_supported")
+        return remove(
+            settings, workspace_path, workflow_path,
+            worker_host=worker_host)
     if not isinstance(workspace_path, str) or not os.path.isabs(workspace_path):
         return False
     if not _validate_recorded_path(workspace_path):
@@ -822,7 +1014,7 @@ def remove_issue_workspaces(settings, issue_identifiers, workflow_path=None,
 
     ``worker_host`` nil + configured ``ssh_hosts`` iterates every configured
     host (matching the Elixir semantics of "we don't know which host it ran
-    on"); remote removal is reported unsupported by :func:`remove`.
+    on").
     """
     if isinstance(issue_identifiers, (str, bytes)) \
             or hasattr(issue_identifiers, "identifier"):
@@ -834,19 +1026,25 @@ def remove_issue_workspaces(settings, issue_identifiers, workflow_path=None,
     else:
         hosts = [host for host in (settings.worker.ssh_hosts or []) if host]
         targets = hosts if hosts else [None]
-    root = expand_workspace_root(settings.workspace.root, workflow_path)
+    remote_root = _remote_workspace_root(settings) \
+        if targets != [None] else None
+    root = None if remote_root is not None \
+        else expand_workspace_root(settings.workspace.root, workflow_path)
     removed = []
     for identifier in identifiers:
         base = workspace_key(identifier)
         for host in targets:
             if host is not None:
                 try:
-                    path = safe_join(root, base)
-                    remove(settings, path, workflow_path, worker_host=host)
-                except (PathSafetyError, WorkflowError) as error:
+                    path = posixpath.join(remote_root, base)
+                    if remove(
+                            settings, path, workflow_path,
+                            worker_host=host):
+                        removed.append(path)
+                except WorkflowError as error:
                     log.warning(
-                        "remote workspace cleanup unsupported host=%s "
-                        "path=%s error=%s", host, base, error)
+                        "remote workspace cleanup failed host=%s path=%s "
+                        "error=%s", host, base, error)
                 continue
             try:
                 path = safe_join(root, base)
@@ -857,8 +1055,11 @@ def remove_issue_workspaces(settings, issue_identifiers, workflow_path=None,
     return removed
 
 
-def _run_hook(command, name, cwd, timeout_ms):
+def _run_hook(command, name, cwd, timeout_ms, worker_host=None):
     if not command:
+        return
+    if worker_host is not None:
+        _run_remote_hook(command, name, cwd, timeout_ms, worker_host)
         return
     log.info(
         "Running workspace hook hook=%s workspace=%s worker_host=local",
@@ -898,6 +1099,60 @@ def _run_hook(command, name, cwd, timeout_ms):
             "status=%s output=%r",
             name, cwd, process.returncode, _truncate(text))
         raise HookError(name, status=process.returncode, output=text)
+
+
+def _run_remote_hook(command, name, cwd, timeout_ms, worker_host):
+    log.info(
+        "Running workspace hook hook=%s workspace=%s worker_host=%s",
+        name, cwd, worker_host)
+    script = "cd %s && %s" % (ssh.shell_escape(cwd), command)
+    try:
+        output, status = ssh.run(
+            worker_host, script,
+            timeout_s=max(timeout_ms, 1) / 1000.0)
+    except ssh.SSHError as error:
+        if error.reason == "ssh_command_timeout":
+            log.warning(
+                "Workspace hook timed out hook=%s workspace=%s "
+                "worker_host=%s timeout_ms=%s",
+                name, cwd, worker_host, timeout_ms)
+            raise HookError(name, timed_out=timeout_ms) from error
+        raise HookError(name, status=-1, output=str(error)) from error
+    if status == 0:
+        return
+    text = _decode(output)
+    log.warning(
+        "Workspace hook failed hook=%s workspace=%s worker_host=%s "
+        "status=%s output=%r",
+        name, cwd, worker_host, status, _truncate(text))
+    raise HookError(name, status=status, output=text)
+
+
+def _run_remote_before_remove(settings, path, worker_host):
+    command = settings.hooks.before_remove
+    if not command:
+        return
+    script = "\n".join([
+        _remote_shell_assign("workspace", path),
+        'if [ -d "$workspace" ]; then',
+        '  cd "$workspace"',
+        "  %s" % command,
+        "fi",
+    ])
+    try:
+        output, status = ssh.run(
+            worker_host, script,
+            timeout_s=max(settings.hooks.timeout_ms, 1) / 1000.0)
+    except ssh.SSHError as error:
+        log.warning(
+            "before_remove hook failed workspace=%s worker_host=%s "
+            "error=%s", path, worker_host, error)
+        return
+    if status != 0:
+        log.warning(
+            "before_remove hook failed workspace=%s worker_host=%s "
+            "status=%s output=%r", path, worker_host, status,
+            _truncate(_decode(output)))
 
 
 def _drain(process):

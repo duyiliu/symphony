@@ -19,9 +19,14 @@ import hmac
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import mcp_bridge
+
 log = logging.getLogger("symphony.http_api")
 
 SNAPSHOT_TIMEOUT_S = 15
+ALERT_SCOPE_UTILIZATION = 0.9
+ALERT_OUTBOX_QUEUE = 200
+ALERT_OUTBOX_PENDING = 100
 
 
 def _iso(value):
@@ -660,6 +665,7 @@ def state_payload(orchestrator):
         "healthy" if polling.get("last_success_at") else "starting")
     result = {
         "generated_at": generated_at,
+        "paused": bool(snapshot.get("paused")),
         "counts": {
             "running": len(running),
             "retrying": len(retrying),
@@ -678,12 +684,111 @@ def state_payload(orchestrator):
         },
     }
     reporter = getattr(orchestrator, "session_reporter", None)
+    reporter_snapshot = None
     if reporter is not None:
-        result["agent_sessions"] = reporter.snapshot()
+        reporter_snapshot = reporter.snapshot()
+        result["agent_sessions"] = reporter_snapshot
     delivery_controller = getattr(orchestrator, "delivery_controller", None)
+    delivery_snapshot = None
     if delivery_controller is not None:
-        result["delivery"] = delivery_controller.snapshot()
+        delivery_snapshot = delivery_controller.snapshot()
+        result["delivery"] = delivery_snapshot
+    backup_controller = getattr(orchestrator, "state_backup", None)
+    if backup_controller is not None:
+        result["state_backup"] = backup_controller.snapshot()
+    metrics = dict(snapshot.get("metrics") or {})
+    metrics["mcp_scopes"] = mcp_bridge.stats()
+    metrics["outbox"] = {
+        "queue_length": (reporter_snapshot or {}).get("queue_length", 0),
+        "pending_events": (reporter_snapshot or {}).get("pending_events", 0),
+    }
+    result["metrics"] = metrics
+    alerts = _alerts(result)
+    result["health"]["alerts"] = alerts
+    result["health"]["alert_count"] = len(alerts)
     return result
+
+
+def _alerts(result):
+    alerts = []
+    health = result.get("health") or {}
+    if health.get("status") in ("stopped", "stale", "degraded"):
+        alerts.append({
+            "code": "scheduler_" + str(health.get("status")),
+            "severity": "critical" if health.get("status") == "stopped" else "warning",
+            "message": "Scheduler health is %s" % health.get("status"),
+        })
+    polling = result.get("polling") or {}
+    if polling.get("last_error"):
+        alerts.append({
+            "code": "polling_error",
+            "severity": "warning",
+            "message": "Tracker polling failed: %s" % polling.get("last_error"),
+        })
+    metrics = result.get("metrics") or {}
+    unconfirmed = metrics.get("termination_unconfirmed") or 0
+    if unconfirmed:
+        alerts.append({
+            "code": "termination_unconfirmed",
+            "severity": "warning",
+            "message": "%d worker termination(s) unconfirmed" % unconfirmed,
+        })
+    scopes = metrics.get("mcp_scopes") or {}
+    utilization = scopes.get("utilization") or 0
+    if utilization >= ALERT_SCOPE_UTILIZATION:
+        alerts.append({
+            "code": "mcp_scope_pressure",
+            "severity": "warning",
+            "message": "MCP scope usage at %.1f%% (%s/%s)" % (
+                utilization * 100, scopes.get("active"), scopes.get("limit")),
+        })
+    outbox = metrics.get("outbox") or {}
+    if (outbox.get("queue_length") or 0) >= ALERT_OUTBOX_QUEUE:
+        alerts.append({
+            "code": "agent_session_queue_backlog",
+            "severity": "warning",
+            "message": "Agent Session queue backlog: %s" % outbox.get("queue_length"),
+        })
+    if (outbox.get("pending_events") or 0) >= ALERT_OUTBOX_PENDING:
+        alerts.append({
+            "code": "agent_session_outbox_backlog",
+            "severity": "warning",
+            "message": "Agent Session outbox pending: %s" % outbox.get("pending_events"),
+        })
+    sessions = result.get("agent_sessions") or {}
+    if sessions.get("enabled") and sessions.get("thread_alive") is False:
+        alerts.append({
+            "code": "agent_session_reporter_down",
+            "severity": "critical",
+            "message": "Agent Session reporter thread is not running",
+        })
+    delivery = result.get("delivery") or {}
+    if delivery.get("enabled") and delivery.get("thread_alive") is False:
+        alerts.append({
+            "code": "delivery_thread_down",
+            "severity": "critical",
+            "message": "Delivery controller thread is not running",
+        })
+    if delivery.get("deferred_count"):
+        alerts.append({
+            "code": "delivery_deferred",
+            "severity": "info",
+            "message": "Delivery deferred for %s item(s)" % delivery.get("deferred_count"),
+        })
+    backup = result.get("state_backup") or {}
+    if backup.get("enabled") and backup.get("thread_alive") is False:
+        alerts.append({
+            "code": "state_backup_thread_down",
+            "severity": "warning",
+            "message": "State backup thread is not running",
+        })
+    if backup.get("enabled") and backup.get("last_error"):
+        alerts.append({
+            "code": "state_backup_failed",
+            "severity": "warning",
+            "message": "State backup failed: %s" % backup.get("last_error"),
+        })
+    return alerts
 
 
 def issue_payload(identifier, orchestrator, settings=None, workflow_path=None):
@@ -743,6 +848,13 @@ def refresh_payload(orchestrator):
     result = dict(result)
     result["requested_at"] = _iso_full(result.get("requested_at"))
     return result
+
+
+def control_payload(orchestrator):
+    state = orchestrator.control_state()
+    if state in ("timeout", "unavailable", None):
+        return None
+    return state
 
 
 def _workspace_path(identifier, running, retry, blocked, settings, workflow_path):
@@ -871,12 +983,60 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         log.debug("http %s", format % args)
 
+    def handle_one_request(self):
+        self._body_consumed = False
+        super().handle_one_request()
+
+    def _discard_body(self):
+        """Consume a request body the handler did not read.
+
+        A leftover body would be parsed as the next request on a keep-alive
+        connection, and closing over unread bytes makes Windows answer with
+        RST instead of FIN.  Both break the client that is still reading the
+        response, so drain best-effort and only then decide about keep-alive.
+        """
+        if getattr(self, "_body_consumed", False):
+            return True
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return False
+        if length <= 0:
+            return True
+        if length > 1024 * 1024:
+            return False
+        try:
+            previous_timeout = self.connection.gettimeout()
+            self.connection.settimeout(0.1)
+        except OSError:
+            return False
+        remaining = length
+        try:
+            while remaining > 0:
+                try:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                except OSError:
+                    return False
+                if not chunk:
+                    return False
+                remaining -= len(chunk)
+        finally:
+            try:
+                self.connection.settimeout(previous_timeout)
+            except OSError:
+                pass
+        return remaining == 0
+
     def _json(self, status, payload):
         data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        keep_alive = self._discard_body()
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            if not keep_alive:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             self.wfile.write(data)
             # Flush now: handlers may do best-effort work (e.g. nudging a
@@ -897,7 +1057,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _route_exists(path):
         """Paths that match a served route pattern (405 vs 404 on bad verbs)."""
         if path in ("/", "/api/v1/state", "/api/v1/refresh",
-                    "/api/v1/tasks", "/api/v1/tasks/import"):
+                    "/api/v1/tasks", "/api/v1/tasks/import",
+                    "/api/v1/control", "/api/v1/control/pause",
+                    "/api/v1/control/resume"):
+            return True
+        if path.startswith("/api/v1/control/release/") \
+                or path.startswith("/api/v1/control/cleanup/"):
             return True
         if path.startswith("/api/v1/tasks/"):
             tail = path[len("/api/v1/tasks/"):]
@@ -940,7 +1105,12 @@ class _Handler(BaseHTTPRequestHandler):
         if not 0 < length <= limit:
             return None
         try:
-            return json.loads(self.rfile.read(length))
+            body = self.rfile.read(length)
+        except (ValueError, UnicodeDecodeError):
+            return None
+        self._body_consumed = True
+        try:
+            return json.loads(body)
         except (ValueError, UnicodeDecodeError):
             return None
 
@@ -1129,6 +1299,26 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/state":
             self._json(200, state_payload(self.api.orchestrator))
             return
+        if path == "/api/v1/control":
+            payload = control_payload(self.api.orchestrator)
+            if payload is None:
+                self._error(
+                    503, "orchestrator_unavailable",
+                    "Orchestrator is unavailable")
+            else:
+                self._json(200, payload)
+            return
+        if path in ("/api/v1/control/pause", "/api/v1/control/resume") \
+                or path.startswith("/api/v1/control/release/") \
+                or path.startswith("/api/v1/control/cleanup/"):
+            self._error(405, "method_not_allowed", "Method not allowed")
+            return
+        if path == "/api/v1/refresh":
+            # Phoenix matches the explicit refresh route before the
+            # :issue_identifier route, so GET must be 405, not an issue lookup.
+            self._error(
+                405, "method_not_allowed", "Method not allowed")
+            return
         if path == "/":
             # Phoenix serves the LiveView dashboard here; the Python port ships
             # no dashboard, so a minimal service document is returned instead.
@@ -1153,6 +1343,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self._path()
+        if path == "/api/v1/control/pause":
+            return self._handle_control("pause")
+        if path == "/api/v1/control/resume":
+            return self._handle_control("resume")
+        if path.startswith("/api/v1/control/release/"):
+            return self._handle_control(
+                "release", path[len("/api/v1/control/release/"):])
+        if path.startswith("/api/v1/control/cleanup/"):
+            return self._handle_control(
+                "cleanup", path[len("/api/v1/control/cleanup/"):])
         if path == "/api/v1/tasks/import":
             return self._handle_task_import()
         if path.startswith("/api/v1/tasks/") \
@@ -1167,6 +1367,36 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(202, payload)
             return
         self._method_not_allowed_or_404()
+
+    def _handle_control(self, action, identifier=None):
+        if not self._mutation_allowed():
+            return self._error(403, "forbidden", "Authentication required")
+        orchestrator = self.api.orchestrator
+        if action in ("release", "cleanup"):
+            if not identifier or "/" in identifier:
+                return self._error(
+                    400, "invalid_fields", "issue identifier required")
+        try:
+            if action == "pause":
+                result = orchestrator.pause()
+            elif action == "resume":
+                result = orchestrator.resume()
+            elif action == "release":
+                result = orchestrator.release_unconfirmed(identifier)
+            else:
+                result = orchestrator.cleanup_workspace(identifier)
+        except Exception as error:  # noqa: BLE001
+            return self._error(502, "control_failed", str(error))
+        if result in ("timeout", "unavailable", None):
+            return self._error(
+                503, "orchestrator_unavailable",
+                "Orchestrator is unavailable")
+        if action in ("release", "cleanup"):
+            success = bool(result.get("released") or result.get("cleaned"))
+            return self._json(
+                200 if success else 409,
+                result)
+        return self._json(200, result)
 
     def _handle_task_import(self):
         if not self._mutation_allowed():

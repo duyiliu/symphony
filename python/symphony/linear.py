@@ -732,19 +732,22 @@ def _endpoint(settings):
 
 
 def _token(settings):
-    return resolve_env_setting(
+    token = resolve_env_setting(
         _provider(settings).get("api_key", settings.api_key), "LINEAR_API_KEY"
     )
+    if not isinstance(token, str) or token.strip() == "":
+        return None
+    return token
 
 
 def validate_config(settings):
-    if not present_string(settings.project_slug):
-        raise WorkflowError("missing_linear_project_slug")
-    if not _token(settings):
-        raise WorkflowError("missing_linear_api_token")
     endpoint = _endpoint(settings)
     if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
         raise WorkflowError("invalid_linear_endpoint")
+    if not _token(settings):
+        raise WorkflowError("missing_linear_api_token")
+    if not present_string(settings.project_slug):
+        raise WorkflowError("missing_linear_project_slug")
     if settings.assignee is not None and not present_string(settings.assignee):
         raise WorkflowError("invalid_linear_assignee")
     if not settings.active_states or not settings.terminal_states:
@@ -798,7 +801,11 @@ def _assignee(settings):
     wanted = settings.assignee
     if wanted is None:
         return None
+    if not isinstance(wanted, str):
+        return None
     wanted = wanted.strip()
+    if wanted == "":
+        return None
     if wanted != "me":
         return wanted
     payload = graphql(settings, VIEWER_QUERY)
@@ -886,18 +893,28 @@ def _rows(payload):
 def fetch_issues_by_states(settings, state_names):
     if not state_names:
         return []
+    wanted_states = list(dict.fromkeys(
+        str(name) for name in state_names if name is not None))
+    if not wanted_states:
+        return []
     wanted = _assignee(settings)
     result, after, visited = [], None, set()
     while True:
         payload = graphql(settings, POLL_QUERY, {
-            "projectSlug": settings.project_slug, "stateNames": list(state_names),
+            "projectSlug": settings.project_slug, "stateNames": wanted_states,
             "first": PAGE_SIZE, "after": after,
         })
         issues, nodes = _rows(payload)
+        malformed = 0
         for row in nodes:
             item = _normalize(row, settings, wanted)
             if item is not None:
                 result.append(item)
+            else:
+                malformed += 1
+        if malformed:
+            log.warning(
+                "Dropping malformed Linear issue records count=%d", malformed)
         page = issues.get("pageInfo")
         if not isinstance(page, dict):
             raise WorkflowError("linear_unknown_payload")
@@ -1008,14 +1025,18 @@ def execute_agent_tool(
     if tool_name != "linear_graphql":
         return {"error": {"code": "unknown_tool", "detail": tool_name}}
     if isinstance(arguments, str):
-        query, variables = arguments, {}
+        query, variables = arguments.strip(), {}
     elif isinstance(arguments, dict):
         query = arguments.get("query")
+        if isinstance(query, str):
+            query = query.strip()
         variables = arguments.get("variables") or {}
     else:
         return {"error": {"code": "invalid_arguments"}}
-    if not isinstance(query, str) or not query.strip() or not isinstance(variables, dict):
-        return {"error": {"code": "invalid_arguments"}}
+    if not isinstance(query, str) or query == "":
+        return {"error": {"code": "missing_query"}}
+    if not isinstance(variables, dict):
+        return {"error": {"code": "invalid_variables"}}
     try:
         scope = _coerce_issue_scope(issue_scope)
         if scope is None:

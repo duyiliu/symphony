@@ -7,9 +7,6 @@ on:
       nightly:
         type: boolean
         default: false
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read

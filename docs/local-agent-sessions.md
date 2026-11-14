@@ -97,6 +97,12 @@ Session 创建请求响应丢失时，
 Linear Agent 面板的消息、停止信号不会自动进入 Pi。当前 OAuth app 的占位 webhook
 仍须在以后提供可达入口时替换，不能把该占位地址称为已接入。
 
+Pi 侧的边界：宿主取消运行时会终止 Pi 进程树，这是当前唯一的“停止”通道；
+Linear 中的人工回复不会作为新 prompt 注入同一个 Pi session。Pi 扩展发出
+`select`/`confirm`/`input`/`editor` 对话框时，宿主会记录
+`turn_input_required` 并将 Issue 置为 `blocked`，等待人工处理后重新领取，
+而不是在无人值守时自动回答。
+
 官方契约参考：Linear Developers 的 OAuth 2.0 authentication、Developing the
 Agent Interaction，以及 `linear/linear` SDK 的 `schema.graphql`（2026-11-13 核对）。
 
@@ -144,3 +150,13 @@ Magpie `devin/swe-2`、thinking `max`；19:11:14 创建 Session
 `5d69d6d238778e62362e5bca0b7e1cc2aa640a50`。Linear 为 Done，Session 为
 complete，最终 response 恰好 1 条，本地 pending 为 0。证据见
 `work/任务/本机执行与AgentSession完善/e2e-r02-evidence.json`。
+
+Phase 1.7 日志/HTTP/CLI 对齐完成后，2026-11-14 用当前工作树冷启动再验一条
+YIL-182：19:22:56 自动领取，19:23:02 启动 Pi，19:25:05 进入 `Human Review`。
+PR `duyiliu/symphony-e2e#21`（HEAD
+`f650de9151fa962a265a21c65b5899bdbe50c27d`）三个 `test` 检查全部成功，
+宿主门禁 11:25:25Z 合并，merge commit
+`e18b992b3ca38a222e7efa2c0c72cd1797bcd64a`。Linear 为 Done，delivery
+`phase=merged`、`merge_attempts=1`；Agent Session
+`5f6be763-42a8-4de6-a497-f59c343aaccb` 上报 `phase=merged`，pending 为空。
+这次验收覆盖“当前未提交工作树”的完整闭环，不代表公网 webhook 或人工消息回传。

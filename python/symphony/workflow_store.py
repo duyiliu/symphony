@@ -12,7 +12,7 @@ import os
 import threading
 
 from . import workflow as workflow_mod
-from .config import parse_settings
+from .config import SUPPORTED_TRACKER_KINDS, parse_settings
 from .github import workflow_policy
 from .workflow import WorkflowError
 
@@ -24,7 +24,7 @@ POLL_INTERVAL_S = 1.0
 def _validate_settings(settings):
     if settings.tracker.kind is None:
         raise WorkflowError("missing_tracker_kind")
-    if settings.tracker.kind not in ("linear", "github", "board"):
+    if settings.tracker.kind not in SUPPORTED_TRACKER_KINDS:
         raise WorkflowError("unsupported_tracker_kind", settings.tracker.kind)
     from . import tracker as tracker_adapter
 
@@ -32,6 +32,8 @@ def _validate_settings(settings):
     workflow_policy.validate_runtime(settings)
     if settings.runtime.kind != "pi":
         raise WorkflowError("unsupported_runtime_kind", settings.runtime.kind)
+    if not settings.runtime.command or not settings.runtime.command.strip():
+        raise WorkflowError("missing_pi_command")
 
 
 class WorkflowStore:

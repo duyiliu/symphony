@@ -1,8 +1,27 @@
 """Normalised tracker work item used by the orchestrator."""
 
+import datetime
 from dataclasses import dataclass, field
 
-from .util import normalize_label
+from .util import iso8601, normalize_label
+
+
+def _solid_value(value):
+    """Mirror ``PromptBuilder.to_solid_value/1`` for nested template data."""
+    if isinstance(value, datetime.datetime):
+        return iso8601(value)
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _solid_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_solid_value(item) for item in value]
+    if hasattr(value, "__dataclass_fields__"):
+        return {
+            str(name): _solid_value(getattr(value, name))
+            for name in value.__dataclass_fields__
+        }
+    return value
 
 
 @dataclass
@@ -38,9 +57,7 @@ class Issue:
 
     def to_template_map(self):
         """Context for the Liquid prompt template (string keys, plain values)."""
-        from .util import iso8601
-
-        return {
+        return _solid_value({
             "id": self.id,
             "native_ref": self.native_ref,
             "identifier": self.identifier,
@@ -58,4 +75,4 @@ class Issue:
             "dispatchable": self.dispatchable,
             "created_at": iso8601(self.created_at) if self.created_at else None,
             "updated_at": iso8601(self.updated_at) if self.updated_at else None,
-        }
+        })

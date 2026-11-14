@@ -11,7 +11,11 @@ import os
 import signal
 import sys
 
-from . import http_api, logging_setup, mcp_bridge, workflow_store
+from . import (
+    http_api, logging_setup, mcp_bridge, preflight, state_backup,
+    status_dashboard,
+    workflow_store,
+)
 from .delivery import DeliveryController
 from .agent_sessions import Reporter
 from .orchestrator import Orchestrator
@@ -26,6 +30,24 @@ DEFAULT_WORKFLOW_PATHS = (
     "/root/symphony/WORKFLOW.md",
 )
 
+GUARDRAIL_FLAG = (
+    "--i-understand-that-this-will-be-running-without-the-usual-guardrails")
+
+
+def _acknowledgement_banner():
+    lines = [
+        "This Symphony implementation is a low key engineering preview.",
+        "Pi will run without any guardrails.",
+        "Symphony is not a supported product and is presented as-is.",
+        "To proceed, start with `%s` CLI argument" % GUARDRAIL_FLAG,
+    ]
+    width = max(len(line) for line in lines)
+    border = "─" * (width + 2)
+    content = ["╭%s╮" % border, "│ %s │" % (" " * width)]
+    content.extend("│ %s │" % line.ljust(width) for line in lines)
+    content.extend(["│ %s │" % (" " * width), "╰%s╯" % border])
+    return "\x1b[31m\x1b[1m%s\x1b[0m" % "\n".join(content)
+
 
 def _resolve_workflow_path(arg):
     if arg:
@@ -39,13 +61,16 @@ def _resolve_workflow_path(arg):
     return None
 
 
-def main(argv=None):
+def _build_parser():
     parser = argparse.ArgumentParser(
         prog="symphony",
         description="Symphony scheduler (Python implementation).")
     parser.add_argument(
         "--workflow", "-w",
         help="Path to WORKFLOW.md (default: SYMPHONY_WORKFLOW or ./WORKFLOW.md)")
+    parser.add_argument(
+        "workflow_path", nargs="?", default=None,
+        help="Positional WORKFLOW.md path (Elixir CLI compatible)")
     parser.add_argument(
         "--port", type=int, default=None,
         help="Override server.port from WORKFLOW.md")
@@ -61,13 +86,37 @@ def main(argv=None):
     parser.add_argument(
         "--log-file", default=None,
         help="Write UTF-8 rotating logs directly (or SYMPHONY_LOG_FILE)")
+    parser.add_argument(
+        "--logs-root", default=None,
+        help="Log root; writes <root>/log/symphony.log (default: cwd)")
+    parser.add_argument(
+        "--restore-state", default=None, metavar="ARCHIVE",
+        help="Restore delivery and Agent Session state from a backup zip, "
+             "then exit")
+    parser.add_argument(
+        GUARDRAIL_FLAG, dest="acknowledge_guardrails", action="store_true",
+        help="Required to start the scheduler; confirms unsupervised execution")
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
     args = parser.parse_args(argv)
 
-    logging_setup.setup(args.log_level, args.log_file)
+    if not args.check and not args.restore_state \
+            and not args.acknowledge_guardrails:
+        sys.stderr.write(_acknowledgement_banner() + "\n")
+        return 1
 
-    path = _resolve_workflow_path(args.workflow)
+    logging_setup.setup(
+        args.log_level, args.log_file, logs_root=args.logs_root)
+
+    path = _resolve_workflow_path(args.workflow or args.workflow_path)
     if path is None:
         log.error("No WORKFLOW.md found; pass --workflow or set SYMPHONY_WORKFLOW")
+        return 2
+    if not os.path.isfile(path):
+        log.error("Workflow file not found: %s", path)
         return 2
 
     try:
@@ -77,6 +126,31 @@ def main(argv=None):
         return 2
 
     settings = store.settings()
+    report = preflight.collect(settings, os.path.dirname(path))
+    for warning in report["warnings"]:
+        log.warning("Preflight %s: %s",
+                    warning["code"], warning["message"])
+    if not report["ok"]:
+        for error in report["errors"]:
+            log.error("Preflight %s: %s",
+                      error["code"], error["message"])
+        workflow_store.stop_store()
+        return 2
+    if args.restore_state:
+        try:
+            restored = state_backup.restore_backup(
+                args.restore_state, settings)
+        except state_backup.StateBackupError as error:
+            log.error("Failed to restore state: %s", error)
+            workflow_store.stop_store()
+            return 2
+        log.info(
+            "State restored delivery=%d agent_sessions=%d",
+            restored[state_backup.DELIVERY_PREFIX],
+            restored[state_backup.SESSION_PREFIX])
+        if not args.check:
+            workflow_store.stop_store()
+            return 0
     if args.check:
         log.info("WORKFLOW.md OK path=%s", path)
         workflow_store.stop_store()
@@ -95,7 +169,14 @@ def main(argv=None):
     orchestrator.start()
     delivery = DeliveryController(store, session_reporter=reporter).start()
     orchestrator.delivery_controller = delivery
+    backup = state_backup.StateBackup(store.settings()).start()
+    orchestrator.state_backup = backup
     server = http_api.start(orchestrator, store, path, host, port)
+    dashboard = status_dashboard.StatusDashboard(
+        orchestrator, store.settings(),
+        dashboard_url_override=status_dashboard.dashboard_url(
+            store.settings(), server.server_address[1]),
+    ).start()
 
     stop = {"flag": False}
 
@@ -117,6 +198,9 @@ def main(argv=None):
             time.sleep(0.5)
     finally:
         log.info("Shutting down")
+        if dashboard.enabled:
+            dashboard.render_offline()
+        dashboard.stop()
         try:
             server.shutdown()
         except Exception:  # noqa: BLE001
@@ -125,6 +209,7 @@ def main(argv=None):
             delivery.stop()
         orchestrator.stop()
         reporter.stop()
+        backup.stop()
         mcp_bridge.stop()
         workflow_store.stop_store()
     return 0

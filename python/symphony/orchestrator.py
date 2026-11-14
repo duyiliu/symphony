@@ -34,6 +34,7 @@ CONTROL_DEFERRAL_LIMIT = 30
 FAILURE_RETRY_BASE_MS = 10_000
 STOP_GRACE_S = 2.0
 STOP_FORCE_WAIT_S = 3.0
+TERMINATION_PROBE_INTERVAL_MS = 30_000
 
 _EMPTY_TOTALS = {
     "input_tokens": 0,
@@ -107,6 +108,21 @@ class Orchestrator:
         self.last_poll_success_at = None
         self.last_poll_error = None
         self.poll_count = 0
+        self.metrics = {
+            "dispatch_count": 0,
+            "retry_count": 0,
+            "control_retry_count": 0,
+            "blocked_count": 0,
+            "completed_count": 0,
+            "failed_count": 0,
+            "dispatch_latency_ms_total": 0,
+            "dispatch_latency_ms_last": None,
+            "dispatch_latency_samples": 0,
+            "run_seconds_total": 0,
+            "run_samples": 0,
+        }
+        self._first_seen_at = {}
+        self.paused = False
 
     # -- lifecycle ------------------------------------------------------
 
@@ -173,6 +189,88 @@ class Orchestrator:
 
     def request_refresh(self):
         return self._call(self._request_refresh, 15)
+
+    def pause(self):
+        def handler(_state):
+            self.paused = True
+            log.info("Scheduler paused by operator")
+            return {"paused": True, "running": len(self.running)}
+        return self._call(handler, 15)
+
+    def resume(self):
+        def handler(_state):
+            self.paused = False
+            self._schedule_tick(0)
+            log.info("Scheduler resumed by operator")
+            return {"paused": False, "running": len(self.running)}
+        return self._call(handler, 15)
+
+    def control_state(self):
+        def handler(_state):
+            return {
+                "paused": self.paused,
+                "counts": {
+                    "running": len(self.running),
+                    "retrying": len(self.retry_attempts),
+                    "blocked": len(self.blocked),
+                },
+                "termination_unconfirmed": sum(
+                    1 for entry in self.running.values()
+                    if entry.get("termination_unconfirmed") is True),
+            }
+        return self._call(handler, 15)
+
+    def release_unconfirmed(self, identifier):
+        def handler(_state):
+            for issue_id, entry in list(self.running.items()):
+                if entry.get("identifier") != identifier:
+                    continue
+                if entry.get("termination_unconfirmed") is not True:
+                    return {
+                        "released": False,
+                        "identifier": identifier,
+                        "reason": "not_unconfirmed",
+                    }
+                confirmed = self._request_running_issue_stop(
+                    issue_id, entry,
+                    entry.get("stop_requested")
+                    or {"kind": "release", "cleanup_workspace": False},
+                    self._store.settings())
+                return {
+                    "released": bool(confirmed),
+                    "identifier": identifier,
+                    "reason": None if confirmed else "termination_unconfirmed",
+                }
+            return {
+                "released": False,
+                "identifier": identifier,
+                "reason": "not_running",
+            }
+        return self._call(handler, 60)
+
+    def cleanup_workspace(self, identifier):
+        def handler(_state):
+            if self._identifier_active(identifier):
+                return {
+                    "cleaned": False,
+                    "identifier": identifier,
+                    "reason": "issue_busy",
+                }
+            cleaned = self._cleanup_issue_workspace(
+                identifier, {}, self._store.settings())
+            return {
+                "cleaned": bool(cleaned),
+                "identifier": identifier,
+                "reason": None if cleaned else "cleanup_failed",
+            }
+        return self._call(handler, 30)
+
+    def _identifier_active(self, identifier):
+        for collection in (self.running, self.retry_attempts, self.blocked):
+            for entry in collection.values():
+                if entry.get("identifier") == identifier:
+                    return True
+        return False
 
     def _call(self, fn, timeout_s):
         if not self._started:
@@ -307,6 +405,10 @@ class Orchestrator:
     def _maybe_dispatch(self):
         self._reconcile_running_issues()
         self._reconcile_blocked_issues()
+        if self.paused:
+            self.last_poll_success_at = _now()
+            self.last_poll_error = None
+            return
 
         try:
             self._store.force_reload()
@@ -331,8 +433,22 @@ class Orchestrator:
             log.info("Issue tracker polling recovered")
         self.last_poll_success_at = _now()
         self.last_poll_error = None
+        self._record_seen_issues(issues)
         if self._available_slots() > 0:
             self._choose_issues(issues, settings)
+
+    def _record_seen_issues(self, issues):
+        now = _now()
+        seen = set()
+        for issue in issues:
+            issue_id = getattr(issue, "id", None)
+            if not isinstance(issue_id, str) or not issue_id:
+                continue
+            seen.add(issue_id)
+            self._first_seen_at.setdefault(issue_id, now)
+        for issue_id in list(self._first_seen_at):
+            if issue_id not in seen:
+                self._first_seen_at.pop(issue_id, None)
 
     def _log_config_error(self, error):
         reason = error.reason
@@ -571,10 +687,21 @@ class Orchestrator:
         log.info(
             "Agent runner spawned for issue: %s attempt=%r worker_host=%s",
             _issue_context(issue), attempt, worker_host or "local")
+        self.metrics["dispatch_count"] += 1
+        self._record_dispatch_latency(issue.id)
         self.retry_attempts.pop(issue.id, None)
         if self.session_reporter:
             self.session_reporter.started(
                 issue, attempt=attempt, model=settings.runtime.model)
+
+    def _record_dispatch_latency(self, issue_id):
+        started = self._first_seen_at.pop(issue_id, None)
+        if not isinstance(started, datetime.datetime):
+            return
+        latency_ms = max(0, int((_now() - started).total_seconds() * 1000))
+        self.metrics["dispatch_latency_ms_total"] += latency_ms
+        self.metrics["dispatch_latency_ms_last"] = latency_ms
+        self.metrics["dispatch_latency_samples"] += 1
 
     # -- worker lifecycle -------------------------------------------------
 
@@ -660,6 +787,7 @@ class Orchestrator:
             if self._input_required_blocker(entry):
                 self._block_input_required(issue_id, entry, session_id, "normal")
             else:
+                self.metrics["completed_count"] += 1
                 log.info(
                     "Agent task completed for issue_id=%s session_id=%s; "
                     "scheduling active-state continuation check",
@@ -676,6 +804,7 @@ class Orchestrator:
             if self._input_required_blocker(entry):
                 self._block_input_required(issue_id, entry, session_id, reason)
             else:
+                self.metrics["failed_count"] += 1
                 self._retry_agent_down(issue_id, entry, session_id, reason)
         log.info(
             "Agent task finished for issue_id=%s session_id=%s reason=%r",
@@ -783,6 +912,7 @@ class Orchestrator:
     # -- retry machinery ------------------------------------------------------
 
     def _schedule_issue_retry(self, issue_id, attempt, metadata, settings=None):
+        self.metrics["retry_count"] += 1
         previous = self.retry_attempts.get(issue_id, {"attempt": 0})
         next_attempt = attempt if isinstance(attempt, int) else previous.get("attempt", 0) + 1
         settings = settings or self._store.settings()
@@ -840,6 +970,7 @@ class Orchestrator:
         if not isinstance(control_attempt, int) or control_attempt < 0:
             control_attempt = 0
         control_attempt += 1
+        self.metrics["control_retry_count"] += 1
         metadata["control_attempt"] = control_attempt
         metadata["control_policy"] = policy
         count_key = "bounded_attempt" if policy == "bounded" else "wait_attempt"
@@ -1039,6 +1170,7 @@ class Orchestrator:
             retry["timer"].cancel()
 
     def _block_issue_from_entry(self, issue_id, entry, error, **extra):
+        self.metrics["blocked_count"] += 1
         blocked_entry = {
             "issue_id": issue_id,
             "identifier": entry.get("identifier", issue_id),
@@ -1065,6 +1197,7 @@ class Orchestrator:
     # -- reconciliation -------------------------------------------------------
 
     def _reconcile_running_issues(self):
+        self._recheck_unconfirmed_terminations()
         settings = self._store.settings()
         self._reconcile_stalled_running_issues(settings)
         running_ids = list(self.running.keys())
@@ -1088,6 +1221,32 @@ class Orchestrator:
             if issue_id not in visible and issue_id in self.running:
                 self._log_missing_running_issue(issue_id)
                 self._terminate_running_issue(issue_id, False, settings)
+
+    def _recheck_unconfirmed_terminations(self):
+        now_ms = _monotonic_ms()
+        for issue_id, entry in list(self.running.items()):
+            if entry.get("termination_unconfirmed") is not True:
+                continue
+            last_probe = entry.get("termination_probe_at_ms")
+            if isinstance(last_probe, int) \
+                    and now_ms - last_probe < TERMINATION_PROBE_INTERVAL_MS:
+                continue
+            entry["termination_probe_at_ms"] = now_ms
+            handle = entry.get("handle")
+            confirmed = handle.force_terminate() \
+                if handle is not None and hasattr(handle, "force_terminate") \
+                else False
+            if not confirmed:
+                log.warning(
+                    "Termination still unconfirmed issue_id=%s identifier=%s",
+                    issue_id, entry.get("identifier"))
+                continue
+            entry["termination_unconfirmed"] = False
+            log.info(
+                "Termination confirmed on recheck; releasing claim and slot "
+                "issue_id=%s identifier=%s",
+                issue_id, entry.get("identifier"))
+            self._finalize_stopped_issue(issue_id, entry)
 
     def _reconcile_issue_state(self, issue, active, terminal, settings):
         state_name = normalize_issue_state(issue.state or "")
@@ -1393,8 +1552,6 @@ class Orchestrator:
             if isinstance(metadata, dict) else None
         worker_host = (metadata or {}).get("worker_host") \
             if isinstance(metadata, dict) else None
-        if worker_host is not None:
-            return False
         identifier = getattr(issue_or_identifier, "identifier", None)
         if identifier is None and isinstance(issue_or_identifier, str):
             identifier = issue_or_identifier
@@ -1403,14 +1560,19 @@ class Orchestrator:
                 lease_path = workspace_path
             elif hasattr(issue_or_identifier, "identifier"):
                 lease_path = workspace_mod.workspace_path(
-                    settings, issue_or_identifier, self._store.path)
+                    settings, issue_or_identifier, self._store.path,
+                    worker_host=worker_host)
             else:
                 lease_path = workspace_mod.workspace_path(
-                    settings, _WorkspaceIssue(identifier), self._store.path)
+                    settings, _WorkspaceIssue(identifier), self._store.path,
+                    worker_host=worker_host)
             lease = workspace_mod.acquire_path_run_lease(
                 settings, lease_path,
                 issue_id=getattr(issue_or_identifier, "id", None),
-                identifier=identifier, workflow_path=self._store.path)
+                identifier=identifier, workflow_path=self._store.path,
+                canonical=worker_host is None,
+                lease_key=("remote\0%s\0%s" % (worker_host, lease_path))
+                if worker_host is not None else None)
         except Exception as error:  # noqa: BLE001 - cleanup is best effort
             log.warning(
                 "Unable to acquire workspace cleanup lease identifier=%s "
@@ -1504,6 +1666,8 @@ class Orchestrator:
             seconds = max(0, int((_now() - started).total_seconds()))
             self.codex_totals["seconds_running"] = max(
                 0, self.codex_totals.get("seconds_running", 0) + seconds)
+            self.metrics["run_seconds_total"] += seconds
+            self.metrics["run_samples"] += 1
 
     # -- token accounting -------------------------------------------------------
 
@@ -1605,6 +1769,7 @@ class Orchestrator:
         return {
             "published_at": now,
             "scheduler_alive": bool(self._thread and self._thread.is_alive()),
+            "paused": self.paused,
             "running": running,
             "retrying": retrying,
             "blocked": blocked,
@@ -1622,6 +1787,49 @@ class Orchestrator:
                     if isinstance(self.next_poll_due_at_ms, int) else None),
                 "poll_interval_ms": self.poll_interval_ms,
             },
+            "metrics": self._metrics_snapshot(),
+        }
+
+    def _metrics_snapshot(self):
+        metrics = self.metrics
+        latency_samples = metrics["dispatch_latency_samples"]
+        run_samples = metrics["run_samples"]
+        dispatches = metrics["dispatch_count"]
+        return {
+            "dispatch": {
+                "count": dispatches,
+                "latency_ms_avg": (
+                    round(metrics["dispatch_latency_ms_total"] / latency_samples, 1)
+                    if latency_samples else None),
+                "latency_ms_last": metrics["dispatch_latency_ms_last"],
+            },
+            "runs": {
+                "completed": metrics["completed_count"],
+                "failed": metrics["failed_count"],
+                "active": len(self.running),
+                "avg_seconds": (
+                    round(metrics["run_seconds_total"] / run_samples, 1)
+                    if run_samples else None),
+            },
+            "retries": {
+                "execution": metrics["retry_count"],
+                "control": metrics["control_retry_count"],
+            },
+            "blocked": {
+                "count": metrics["blocked_count"],
+                "current": len(self.blocked),
+            },
+            "rates": {
+                "retry_per_dispatch": (
+                    round(metrics["retry_count"] / dispatches, 3)
+                    if dispatches else 0.0),
+                "blocked_per_dispatch": (
+                    round(metrics["blocked_count"] / dispatches, 3)
+                    if dispatches else 0.0),
+            },
+            "termination_unconfirmed": sum(
+                1 for entry in self.running.values()
+                if entry.get("termination_unconfirmed") is True),
         }
 
 
