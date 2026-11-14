@@ -1011,6 +1011,177 @@ class ConfigTest(unittest.TestCase):
             })
 
 
+class GitHubLabelTransitionTest(unittest.TestCase):
+    """GitHub mode: _transition_state/_create_comment use REST labels/comments."""
+
+    def _settings(self):
+        return config.parse_settings({
+            "tracker": {
+                "kind": "github",
+                "provider": {
+                    "repo": "o/r",
+                    "token": "tok",
+                    "use_label_states": True,
+                },
+                "active_states": ["todo", "in-progress"],
+                "terminal_states": ["done", "closed"],
+            },
+            "delivery": {
+                "enabled": True,
+                "repo": "o/r",
+                "token": "tok",
+                "review_state": "review",
+                "merge_state": "merging",
+                "rework_state": "todo",
+                "done_state": "done",
+            },
+        })
+
+    def _issue(self, state="in-progress"):
+        return Issue(
+            id="42", identifier="GH-42", title="Fix it",
+            state=state, labels=["agent:in-progress"],
+            team_id=None,
+            updated_at=datetime.datetime(
+                2026, 11, 15, tzinfo=datetime.timezone.utc))
+
+    def test_transition_to_review_removes_old_and_adds_new_label(self):
+        calls = []
+
+        def fake_request(method, path, params, body, settings):
+            calls.append((method, path, body))
+            return {"status": 200, "body": {}}
+
+        cfg = self._settings()
+        issue = self._issue()
+        github = delivery.GitHub(cfg.delivery)
+        with patch.object(
+                delivery.gh_client, "perform_request",
+                side_effect=fake_request):
+            delivery._transition_state(cfg, issue, "review", github)
+
+        self.assertEqual(issue.state, "review")
+        delete_calls = [c for c in calls if c[0] == "DELETE"]
+        post_calls = [c for c in calls if c[0] == "POST"]
+        self.assertTrue(any(
+            "/issues/42/labels/agent:review" in c[1]
+            for c in delete_calls))
+        self.assertTrue(any(
+            "/issues/42/labels" in c[1]
+            and c[2] == {"labels": ["agent:review"]}
+            for c in post_calls))
+
+    def test_transition_to_done_uses_done_label(self):
+        calls = []
+
+        def fake_request(method, path, params, body, settings):
+            calls.append((method, path, body))
+            return {"status": 200, "body": {}}
+
+        cfg = self._settings()
+        issue = self._issue()
+        github = delivery.GitHub(cfg.delivery)
+        with patch.object(
+                delivery.gh_client, "perform_request",
+                side_effect=fake_request):
+            delivery._transition_state(cfg, issue, "done", github)
+
+        post_calls = [c for c in calls if c[0] == "POST"]
+        self.assertTrue(any(
+            c[2] == {"labels": ["agent:done"]} for c in post_calls))
+
+    def test_transition_to_todo_uses_todo_label(self):
+        calls = []
+
+        def fake_request(method, path, params, body, settings):
+            calls.append((method, path, body))
+            return {"status": 200, "body": {}}
+
+        cfg = self._settings()
+        issue = self._issue()
+        github = delivery.GitHub(cfg.delivery)
+        with patch.object(
+                delivery.gh_client, "perform_request",
+                side_effect=fake_request):
+            delivery._transition_state(cfg, issue, "todo", github)
+
+        post_calls = [c for c in calls if c[0] == "POST"]
+        self.assertTrue(any(
+            c[2] == {"labels": ["agent:todo"]} for c in post_calls))
+
+    def test_create_comment_posts_to_issue_comments(self):
+        calls = []
+
+        def fake_request(method, path, params, body, settings):
+            calls.append((method, path, body))
+            return {"status": 201, "body": {"id": 1}}
+
+        cfg = self._settings()
+        issue = self._issue()
+        github = delivery.GitHub(cfg.delivery)
+        with patch.object(
+                delivery.gh_client, "perform_request",
+                side_effect=fake_request):
+            delivery._create_comment(cfg, issue, "hello", github)
+
+        self.assertEqual(len(calls), 1)
+        method, path, body = calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/repos/o/r/issues/42/comments")
+        self.assertEqual(body, {"body": "hello"})
+
+    def test_comment_exists_finds_marker(self):
+        def fake_request(method, path, params, body, settings):
+            return {
+                "status": 200,
+                "body": [
+                    {"body": "unrelated"},
+                    {"body": "[symphony-delivery:abc123]\npaused"},
+                ],
+            }
+
+        cfg = self._settings()
+        github = delivery.GitHub(cfg.delivery)
+        with patch.object(
+                delivery.gh_client, "perform_request",
+                side_effect=fake_request):
+            found = delivery._comment_exists(
+                cfg, "42", "abc123", github)
+        self.assertTrue(found)
+
+    def test_comment_exists_paginates(self):
+        pages = {
+            1: [{"body": "a"}] * 100,
+            2: [{"body": "[symphony-delivery:x]"}],
+        }
+
+        def fake_request(method, path, params, body, settings):
+            page = (params or {}).get("page", 1)
+            return {"status": 200, "body": pages.get(page, [])}
+
+        cfg = self._settings()
+        github = delivery.GitHub(cfg.delivery)
+        with patch.object(
+                delivery.gh_client, "perform_request",
+                side_effect=fake_request):
+            found = delivery._comment_exists(
+                cfg, "42", "x", github)
+        self.assertTrue(found)
+
+    def test_comment_exists_caps_at_25_pages(self):
+        def fake_request(method, path, params, body, settings):
+            return {"status": 200, "body": [{"body": "a"}] * 100}
+
+        cfg = self._settings()
+        github = delivery.GitHub(cfg.delivery)
+        with patch.object(
+                delivery.gh_client, "perform_request",
+                side_effect=fake_request):
+            found = delivery._comment_exists(
+                cfg, "42", "x", github)
+        self.assertFalse(found)
+
+
 class AgentToolBoundaryTest(unittest.TestCase):
     @staticmethod
     def _scope(identifier="ABC-1"):

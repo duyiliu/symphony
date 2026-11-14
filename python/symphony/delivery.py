@@ -75,37 +75,6 @@ def _digest(*values):
     ).hexdigest()[:20]
 
 
-def _comment_exists(settings, issue_id, notice_key):
-    """Return whether a deterministic delivery comment is already visible."""
-    marker = "[symphony-delivery:%s]" % notice_key
-    after = None
-    for _ in range(10):
-        payload = linear.graphql(
-            settings.tracker,
-            "query SymphonyDeliveryCommentExists("
-            "$id: String!, $after: String) {"
-            " issue(id: $id) { comments(first: 100, after: $after) {"
-            " nodes { id body }"
-            " pageInfo { hasNextPage endCursor } } } }",
-            {"id": issue_id, "after": after},
-        )
-        issue = (payload.get("data") or {}).get("issue") or {}
-        comments = issue.get("comments") or {}
-        if any(
-                isinstance(item, dict)
-                and marker in str(item.get("body") or "")
-                for item in comments.get("nodes") or []):
-            return True
-        page = comments.get("pageInfo") or {}
-        if not page.get("hasNextPage"):
-            return False
-        cursor = page.get("endCursor")
-        if not cursor or cursor == after:
-            raise DeliveryError("invalid_linear_comment_pagination")
-        after = cursor
-    raise DeliveryError("linear_comment_pagination_limit")
-
-
 class GitHub:
     """Small REST facade using the host-only delivery credential."""
 
@@ -145,6 +114,128 @@ class GitHub:
                 "status": status, "method": method, "path": path,
                 "retry_after": gh_client.retry_after_seconds(headers),
             })
+
+
+def _tracker_kind(settings):
+    return (settings.tracker.kind or "").strip().lower()
+
+
+def _tracker_state_names(settings, state_name):
+    """Map workflow state names to provider-native values.
+
+    Linear uses workflow state names directly; GitHub label-states
+    translate the same names into ``agent:*`` labels.
+    """
+    if _tracker_kind(settings) == "github":
+        label_map = {
+            settings.delivery.review_state: "agent:review",
+            settings.delivery.merge_state: "agent:review",
+            settings.delivery.rework_state: "agent:todo",
+            settings.delivery.done_state: "agent:done",
+        }
+        return label_map.get(state_name, "agent:%s" % state_name)
+    return state_name
+
+
+def _transition_state(settings, issue, state_name, github=None):
+    """Transition issue state via the appropriate tracker API."""
+    if _tracker_kind(settings) == "github":
+        if github is None:
+            github = GitHub(settings.delivery)
+        gh_label = _tracker_state_names(settings, state_name)
+        try:
+            github.request(
+                "DELETE",
+                _repo_path(
+                    settings.delivery.repo,
+                    "/issues/%s/labels/agent:review" % issue.id))
+        except DeliveryError:
+            pass  # label may not exist
+        github.request(
+            "POST",
+            _repo_path(
+                settings.delivery.repo,
+                "/issues/%s/labels" % issue.id),
+            body={"labels": [gh_label]})
+        issue.state = state_name
+        log.info(
+            "delivery moved issue identifier=%s state=%s (github label=%s)",
+            issue.identifier, state_name, gh_label)
+        return
+    linear.update_issue_state(
+        settings.tracker, issue.id, issue.team_id, state_name)
+    issue.state = state_name
+    log.info(
+        "delivery moved issue identifier=%s state=%s -> %s",
+        issue.identifier, state_name, state_name)
+
+
+def _create_comment(settings, issue, body, github=None):
+    """Post a delivery comment via the appropriate tracker API."""
+    if _tracker_kind(settings) == "github":
+        if github is None:
+            github = GitHub(settings.delivery)
+        github.request(
+            "POST",
+            _repo_path(
+                settings.delivery.repo,
+                "/issues/%s/comments" % issue.id),
+            body={"body": body})
+        return
+    linear.create_comment(settings.tracker, issue.id, body)
+
+
+def _comment_exists(settings, issue_id, notice_key, github=None):
+    """Return whether a deterministic delivery comment is already visible."""
+    marker = "[symphony-delivery:%s]" % notice_key
+    if _tracker_kind(settings) == "github":
+        if github is None:
+            github = GitHub(settings.delivery)
+        page = 1
+        while True:
+            comments = github.request(
+                "GET",
+                _repo_path(
+                    settings.delivery.repo,
+                    "/issues/%s/comments" % issue_id),
+                params={"per_page": 100, "page": page})
+            if not isinstance(comments, list):
+                return False
+            if any(marker in str(c.get("body") or "")
+                    for c in comments if isinstance(c, dict)):
+                return True
+            if len(comments) < 100:
+                return False
+            page += 1
+            if page > 25:
+                return False
+        return False
+    after = None
+    for _ in range(10):
+        payload = linear.graphql(
+            settings.tracker,
+            "query SymphonyDeliveryCommentExists("
+            "$id: String!, $after: String) {"
+            " issue(id: $id) { comments(first: 100, after: $after) {"
+            " nodes { id body }"
+            " pageInfo { hasNextPage endCursor } } } }",
+            {"id": issue_id, "after": after},
+        )
+        issue = (payload.get("data") or {}).get("issue") or {}
+        comments = issue.get("comments") or {}
+        if any(
+                isinstance(item, dict)
+                and marker in str(item.get("body") or "")
+                for item in comments.get("nodes") or []):
+            return True
+        page = comments.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            return False
+        cursor = page.get("endCursor")
+        if not cursor or cursor == after:
+            raise DeliveryError("invalid_linear_comment_pagination")
+        after = cursor
+    raise DeliveryError("linear_comment_pagination_limit")
 
     def pages(self, path, field=None):
         rows = []
@@ -1221,8 +1312,8 @@ class DeliveryController:
             changes["lifecycle_marker"] = lifecycle_marker
         record = self._save(records, issue, record, changes)
         try:
-            linear.create_comment(
-                settings.tracker, issue.id,
+            _create_comment(
+                settings, issue,
                 "[symphony-delivery:%s]\n%s" % (notice_key, body))
         except Exception as error:  # noqa: BLE001 - keep a retry marker
             log.warning("Linear comment failed identifier=%s error=%s",
@@ -1241,12 +1332,7 @@ class DeliveryController:
         if normalize_issue_state(issue.state) == normalize_issue_state(state_name):
             return
         previous = issue.state
-        linear.update_issue_state(
-            settings.tracker, issue.id, issue.team_id, state_name)
-        issue.state = state_name
-        log.info(
-            "delivery moved issue identifier=%s state=%s -> %s",
-            issue.identifier, previous, state_name)
+        _transition_state(settings, issue, state_name)
 
     def _refresh_issue(self, settings, issue):
         """Re-read Linear immediately before a host mutation.

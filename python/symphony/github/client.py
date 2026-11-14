@@ -20,6 +20,13 @@ PAGE_SIZE = 100
 USER_AGENT = "symphony"
 VALID_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE"}
 
+LABEL_PREFIX = "agent:"
+LABEL_STATE_PRIORITY = {
+    "agent:done": 3,
+    "agent:in-progress": 2,
+    "agent:todo": 1,
+}
+
 
 class GitHubError(Exception):
     def __init__(self, reason, detail=None):
@@ -38,6 +45,58 @@ class GitHubSettings:
 def provider_settings(tracker_settings):
     provider = getattr(tracker_settings, "provider", None)
     return provider if isinstance(provider, dict) else {}
+
+
+def _use_label_states(tracker_settings):
+    provider = provider_settings(tracker_settings)
+    return provider.get("use_label_states") is True
+
+
+def _derive_state(issue, labels, use_label_states):
+    """Return tracker state; label-derived when ``use_label_states`` is on."""
+    if not use_label_states:
+        return issue.get("state")
+    if issue.get("state") == "closed":
+        return "done"
+    priority = -1
+    state = None
+    for label in labels:
+        if label.startswith(LABEL_PREFIX):
+            p = LABEL_STATE_PRIORITY.get(label, 0)
+            if p > priority:
+                priority = p
+                state = label[len(LABEL_PREFIX):]
+    return state
+
+
+def _state_names_to_query(state_names, use_label_states):
+    """Map normalized state names to a GitHub ``state=`` API query.
+
+    When ``use_label_states`` is on, "done" and "closed" both map to
+    closed issues; every other label-state maps to open issues.
+    """
+    normalized = {
+        name.strip().lower() for name in state_names if isinstance(name, str)
+    }
+    if not use_label_states:
+        has_open = "open" in normalized
+        has_closed = "closed" in normalized
+        if has_open and has_closed:
+            return "all"
+        if has_open:
+            return "open"
+        if has_closed:
+            return "closed"
+        return None
+    wants_closed = normalized & {"done", "closed"}
+    wants_open = normalized - {"done", "closed"}
+    if wants_open and wants_closed:
+        return "all"
+    if wants_closed:
+        return "closed"
+    if wants_open:
+        return "open"
+    return None
 
 
 def resolve_setting(value, fallback_env):
@@ -229,7 +288,8 @@ def fetch_issues_by_states(state_names, tracker_settings):
     normalized_states = {
         name.strip().lower() for name in state_names if isinstance(name, str)
     }
-    state_query = _github_state_query(normalized_states)
+    use_label_states = _use_label_states(tracker_settings)
+    state_query = _state_names_to_query(state_names, use_label_states)
     if state_query is None:
         return []
     gh_settings = settings(tracker_settings)
@@ -254,7 +314,7 @@ def fetch_issues_by_states(state_names, tracker_settings):
         page_issues = []
         malformed = 0
         for raw in payload:
-            issue = normalize_issue(raw, gh_settings.repo)
+            issue = normalize_issue(raw, gh_settings.repo, use_label_states)
             if issue is None:
                 malformed += 1
             else:
@@ -283,6 +343,7 @@ def fetch_issues_by_ids(issue_ids, tracker_settings):
     ids = list(dict.fromkeys(issue_ids))
     if not ids:
         return []
+    use_label_states = _use_label_states(tracker_settings)
     gh_settings = settings(tracker_settings)
     issues = []
     for raw_id in ids:
@@ -299,21 +360,34 @@ def fetch_issues_by_ids(issue_ids, tracker_settings):
             continue
         if not isinstance(payload, dict):
             raise GitHubError("github_unknown_payload")
-        issue = normalize_issue(payload, gh_settings.repo)
+        issue = normalize_issue(payload, gh_settings.repo, use_label_states)
         if issue is None:
+            # A valid record that is merely outside the label-state domain
+            # is skipped like a 404 rather than treated as malformed.
+            if use_label_states:
+                continue
             raise GitHubError("github_unknown_payload")
         issues.append(issue)
     return issues
 
 
-def normalize_issue(issue, repo):
+def normalize_issue(issue, repo, use_label_states=False):
+    """Return normalized Issue, ``None`` when the record is undispatchable.
+
+    Raises ``GitHubError("github_unknown_payload")`` only when required
+    fields are missing or malformed — a valid issue that simply has no
+    ``agent:*`` label is skipped (not malformed).
+    """
     if not isinstance(issue, dict):
         return None
     number = issue.get("number")
-    state = issue.get("state")
     if not (isinstance(number, int) and not isinstance(number, bool) and number > 0):
         return None
-    if not (present_string(issue.get("title")) and present_string(state)):
+    if not present_string(issue.get("title")):
+        return None
+    labels = _extract_labels(issue)
+    state = _derive_state(issue, labels, use_label_states)
+    if state is None:
         return None
     assignee = issue.get("assignee")
     return Issue(
@@ -325,7 +399,7 @@ def normalize_issue(issue, repo):
         state=state,
         url=issue.get("html_url"),
         assignee_id=assignee.get("login") if isinstance(assignee, dict) else None,
-        labels=_extract_labels(issue),
+        labels=labels,
         blocked_by=[],
         dispatchable="pull_request" not in issue,
         created_at=parse_datetime(issue.get("created_at")),

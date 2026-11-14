@@ -12,13 +12,22 @@ from . import client as gh_client
 ACTIVE_STATES = ("open",)
 TERMINAL_STATES = ("closed",)
 ALLOWED_STATES = frozenset(ACTIVE_STATES + TERMINAL_STATES)
+LABEL_STATES = frozenset(
+    label[len(gh_client.LABEL_PREFIX):]
+    for label in gh_client.LABEL_STATE_PRIORITY
+    if label.startswith(gh_client.LABEL_PREFIX)
+) | frozenset({"closed"})
 
 
-def _validate_states(states, missing_error):
+def _validate_states(states, missing_error, tracker_settings):
     if not isinstance(states, list):
         raise WorkflowError(missing_error)
+    if gh_client._use_label_states(tracker_settings):
+        allowed = LABEL_STATES
+    else:
+        allowed = ALLOWED_STATES
     if not all(
-            normalize_issue_state(state) in ALLOWED_STATES
+            normalize_issue_state(state) in allowed
             for state in states):
         raise WorkflowError("invalid_github_states")
 
@@ -30,10 +39,12 @@ def _translate(error):
 def validate_config(tracker_settings):
     _validate_states(
         getattr(tracker_settings, "active_states", None),
-        "missing_github_active_states")
+        "missing_github_active_states",
+        tracker_settings)
     _validate_states(
         getattr(tracker_settings, "terminal_states", None),
-        "missing_github_terminal_states")
+        "missing_github_terminal_states",
+        tracker_settings)
     try:
         gh_client.settings(tracker_settings)
     except gh_client.GitHubError as error:
