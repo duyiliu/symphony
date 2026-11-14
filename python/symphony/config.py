@@ -578,8 +578,16 @@ def _finalize(settings):
         ]
         if any(not present_string(state) for state in states):
             raise _invalid("delivery states can't be blank")
-        if len({normalize_issue_state(state) for state in states}) != len(states):
-            raise _invalid("delivery states must be distinct")
+        # GitHub label-states collapse several delivery states to the same
+        # label (review/merge -> agent:review, rework -> agent:todo).  The
+        # distinct rule only applies when the provider actually uses the
+        # state name (Linear); with label-states the label is what matters.
+        use_label_states = (
+            tracker.kind == "github"
+            and tracker.provider.get("use_label_states") is True)
+        if not use_label_states:
+            if len({normalize_issue_state(state) for state in states}) != len(states):
+                raise _invalid("delivery states must be distinct")
         active = {
             normalize_issue_state(state)
             for state in (tracker.active_states or [])
@@ -592,7 +600,7 @@ def _finalize(settings):
             ("review_state", delivery.review_state),
             ("merge_state", delivery.merge_state),
         ):
-            if normalize_issue_state(state) in active:
+            if normalize_issue_state(state) in active and not use_label_states:
                 raise _invalid(
                     "delivery.%s must not be an active tracker state; "
                     "the host owns delivery and merge" % name)
