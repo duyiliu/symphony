@@ -10,3 +10,4 @@ deploy/e2e-container/.env
 /deploy/local.env
 !/deploy/WORKFLOW.local.md
 .env
+/symphony-e2esessions/
