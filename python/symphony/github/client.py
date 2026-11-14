@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -93,8 +94,49 @@ def _headers(token):
     }
 
 
+def _response_metadata(headers):
+    """Keep only rate-limit fields needed by the caller."""
+    if headers is None:
+        return {}
+    metadata = {}
+    for name in (
+        "Retry-After",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+        "X-RateLimit-Used",
+    ):
+        value = headers.get(name)
+        if value is not None:
+            metadata[name] = str(value)
+    return metadata
+
+
+def retry_after_seconds(headers, now=None):
+    """Return a bounded delay supplied by GitHub, if one is available."""
+    headers = headers or {}
+    raw_retry_after = headers.get("Retry-After")
+    if raw_retry_after is not None:
+        try:
+            return max(1.0, min(float(raw_retry_after), 3600.0))
+        except (TypeError, ValueError):
+            pass
+    if str(headers.get("X-RateLimit-Remaining", "")) != "0":
+        return None
+    try:
+        reset_at = float(headers.get("X-RateLimit-Reset"))
+    except (TypeError, ValueError):
+        return None
+    current = time.time() if now is None else float(now)
+    return max(1.0, min(reset_at - current, 3600.0))
+
+
 def perform_request(method, path, params, body, gh_settings):
-    """Execute one HTTP request. Returns ``{"status": int, "body": object}``."""
+    """Execute one HTTP request.
+
+    The result contains the response status/body plus a small, non-secret
+    subset of headers used for rate-limit backoff.
+    """
     if method not in VALID_METHODS:
         raise GitHubError("invalid_github_method", method)
     url = gh_settings.api_url + path
@@ -112,10 +154,15 @@ def perform_request(method, path, params, body, gh_settings):
             return {
                 "status": response.status,
                 "body": _decode_payload(payload, response.headers),
+                "headers": _response_metadata(response.headers),
             }
     except urllib.error.HTTPError as error:
         payload = error.read()
-        return {"status": error.code, "body": _decode_payload(payload, error.headers)}
+        return {
+            "status": error.code,
+            "body": _decode_payload(payload, error.headers),
+            "headers": _response_metadata(error.headers),
+        }
     except (urllib.error.URLError, OSError) as error:
         raise GitHubError("github_api_request", getattr(error, "reason", error))
 

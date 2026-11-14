@@ -101,6 +101,24 @@ class AgentSessionTest(unittest.TestCase):
                 self.assertIsNone(
                     agent_sessions.ensure_session(cfg, make_issue()))
 
+    def test_record_save_failure_cleans_unique_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_settings(tmp)
+            issue_value = make_issue()
+            path = agent_sessions._state_path(cfg, issue_value.id)
+            with patch.object(
+                    agent_sessions.os, "replace",
+                    side_effect=OSError("atomic replace failed")):
+                with self.assertRaises(OSError):
+                    agent_sessions._save_record(cfg, {
+                        "issue_id": issue_value.id,
+                        "identifier": issue_value.identifier,
+                    })
+            self.assertFalse(os.path.exists(path))
+            self.assertFalse(any(
+                name.startswith(os.path.basename(path) + ".tmp.")
+                for name in os.listdir(os.path.dirname(path))))
+
 
 class FakeAPI:
     def __init__(self):

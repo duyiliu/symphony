@@ -74,11 +74,15 @@ Description:
   acceptance criteria, validation results, current commit, and blockers.
 - Inspect the repository and reproduce the problem before editing. Implement only
   the requested scope, run the required tests, commit and push the branch.
+- Use a branch name containing `{{ issue.identifier }}` (for example
+  `feature/{{ issue.identifier }}-short-description`). The host binds PR writes
+  and automatic delivery to branches containing the current issue identifier.
 - Reuse the current branch/PR for rework. Use a fresh branch if the old PR was
   already closed or merged. Do not create duplicate PRs.
 - Git uses the workspace's Contents-only SSH deploy key. Never obtain another
   credential or use `gh`; create/update PRs and inspect checks/reviews through the
-  host `github_api` tool. Address actionable feedback and rerun validation.
+  host `github_api` tool. Its writes are limited to the current issue's branch,
+  open PR and PR comments. Address actionable feedback and rerun validation.
 - Attach the PR to the issue with `attachmentCreate`, add the `symphony` PR label,
   and move the issue to Human Review only after the required validation is green.
 - Human Review and Merging belong to the host delivery controller. Stop working

@@ -369,7 +369,7 @@ class CrashBeforeFinalSaveTest(_ReporterCase):
 
     def test_poll_once_recovers_done_issue_and_reports_once(self):
         from symphony import linear
-        from tests.test_delivery import _FakeGitHub
+        from tests.test_delivery import _FakeGitHub, pr_payload
 
         self.start()
         self.assertEqual(self.types(), ["thought"])
@@ -397,7 +397,14 @@ class CrashBeforeFinalSaveTest(_ReporterCase):
 
         controller = delivery.DeliveryController(
             self.store, session_reporter=self.reporter)
-        fake = _FakeGitHub(self.cfg.delivery)
+        fake = _FakeGitHub(
+            self.cfg.delivery,
+            pr=pr_payload(head={
+                "sha": "a" * 40,
+                "ref": "yil-1-fix",
+                "repo": {"full_name": "o/r"},
+            }),
+        )
         with patch.object(
                 delivery.tracker_adapter, "fetch_issues_by_states",
                 return_value=[issue]), \
@@ -547,6 +554,138 @@ class PendingSyncSupersededTest(_ReporterCase):
         self.pump()
         self.assertEqual(self.responses(), [])
         self.assertNotIn("elicitation", self.types())
+
+
+class NewDeliveryLifecycleResetsOldScopeTest(_ReporterCase):
+    """A fresh Agent Session run must not inherit old delivery decisions."""
+
+    def test_new_lifecycle_resets_paused_record_for_same_pr(self):
+        from symphony import linear
+        from tests.test_delivery import _FakeGitHub
+
+        self.start()
+        old_marker = self.reporter.records[self.issue.id]["marker"]
+        self.issue.state = "Human Review"
+        self.issue.attachments = [{
+            "url": "https://github.com/o/r/pull/7",
+            "metadata": {"status": "open"},
+        }]
+
+        records = delivery.DeliveryRecordStore(
+            self.cfg.delivery.state_dir)
+        records.save(self.issue, {
+            "phase": "merged",
+            "pr": 7,
+            "head_sha": "a" * 40,
+            "lifecycle_marker": old_marker,
+        })
+
+        self.reporter.started(self.issue, model="provider/model")
+        self.pump()
+        self.pump()
+        new_marker = self.reporter.records[self.issue.id]["marker"]
+        self.assertNotEqual(new_marker, old_marker)
+
+        # A stale paused record from the prior lifecycle must not suppress the
+        # pause notice or leak its rework/gate state into the new lifecycle.
+        records.save(self.issue, {
+            "phase": "paused",
+            "pr": 7,
+            "head_sha": "a" * 40,
+            "gated_sha": "c" * 40,
+            "rework_attempts": 2,
+            "last_rework": {
+                "head_sha": "a" * 40,
+                "reason": "previous lifecycle",
+            },
+            "last_notice_key": "old-notice",
+            "lifecycle_marker": old_marker,
+        })
+        comments = []
+        fake = _FakeGitHub(
+            self.cfg.delivery,
+            files=[{"filename": "auth/login.js"}],
+        )
+        controller = delivery.DeliveryController(
+            self.store, session_reporter=self.reporter)
+        with patch.object(
+                delivery.tracker_adapter, "fetch_issues_by_states",
+                return_value=[self.issue]), \
+                patch.object(
+                    delivery.tracker_adapter, "fetch_issues_by_ids",
+                    return_value=[self.issue]), \
+                patch.object(linear, "create_comment",
+                             side_effect=lambda _s, _i, body:
+                                 comments.append(body)), \
+                patch.object(delivery, "GitHub", return_value=fake):
+            controller.poll_once()
+
+        record = records.load(self.issue)
+        self.assertEqual(record.get("phase"), "paused")
+        self.assertEqual(record.get("lifecycle_marker"), new_marker)
+        self.assertNotIn("gated_sha", record)
+        self.assertNotIn("rework_attempts", record)
+        self.assertNotIn("last_rework", record)
+        self.assertNotEqual(record.get("last_notice_key"), "old-notice")
+        self.assertEqual(len(comments), 1)
+        self.assertIn("自动交付已暂停", comments[0])
+
+    def test_new_lifecycle_supersedes_pending_sync(self):
+        import datetime
+
+        from symphony import linear
+        from tests.test_delivery import _FakeGitHub
+
+        self.start()
+        old_marker = self.reporter.records[self.issue.id]["marker"]
+        self.issue.state = "Human Review"
+        self.issue.updated_at = datetime.datetime(
+            2026, 11, 13, 10, 0, tzinfo=datetime.timezone.utc)
+        self.issue.attachments = [{
+            "url": "https://github.com/o/r/pull/7",
+            "metadata": {"status": "closed"},
+        }]
+        records = delivery.DeliveryRecordStore(
+            self.cfg.delivery.state_dir)
+        records.save(self.issue, {
+            "phase": "merged_pending_sync",
+            "session_phase": "merged_pending_sync",
+            "pr": 7,
+            "head_sha": "a" * 40,
+            "gated_sha": "a" * 40,
+            "pre_sync_state": "Human Review",
+            "pre_sync_updated_at": "2026-11-13T10:00:00Z",
+            "lifecycle_marker": old_marker,
+        })
+
+        self.reporter.started(self.issue, model="provider/model")
+        self.pump()
+        self.pump()
+        self.assertNotEqual(
+            self.reporter.records[self.issue.id]["marker"], old_marker)
+
+        transitions = []
+        fake = _FakeGitHub(self.cfg.delivery)
+        controller = delivery.DeliveryController(
+            self.store, session_reporter=self.reporter)
+        with patch.object(
+                delivery.tracker_adapter, "fetch_issues_by_states",
+                return_value=[]), \
+                patch.object(
+                    delivery.tracker_adapter, "fetch_issues_by_ids",
+                    return_value=[self.issue]), \
+                patch.object(
+                    linear, "update_issue_state",
+                    side_effect=lambda _s, _i, _t, state:
+                        transitions.append(state)), \
+                patch.object(linear, "create_comment"), \
+                patch.object(delivery, "GitHub", return_value=fake):
+            controller.poll_once()
+
+        record = records.load(self.issue)
+        self.assertEqual(record.get("phase"), "superseded_pending_sync")
+        self.assertNotIn("Done", transitions)
+        self.assertEqual(fake.calls, [])
 
 
 class NewLifecycleDropsOldPendingControlTest(_ReporterCase):

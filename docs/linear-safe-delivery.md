@@ -33,8 +33,11 @@ Linear 仍是唯一任务源。宿主负责在 PR 完成后核验真实 HEAD SHA
 
 - `SYMPHONY_GITHUB_TOKEN` 只存在于宿主进程环境；Pi 启动脚本会 unset GitHub
   token 变量，并使用独立的 `GH_CONFIG_DIR` / `GIT_CONFIG_GLOBAL`。
-- Pi 的 `github_api` MCP 工具只允许配置仓库内的读、PR 创建/更新和评论；
-  `PUT /pulls/{n}/merge` 被 allowlist 明确拒绝。
+- Pi 的 `github_api` MCP 工具可在配置仓库内读取评审与检查信息；写操作还必须
+  绑定当前 Linear Issue：新建 PR 的 head 分支、已有 PR 的 head 分支以及评论目标
+  都必须包含该 Issue identifier，且只能操作同一仓库内的 open PR。
+- `PUT /pulls/{n}/merge` 被 allowlist 明确拒绝；worker 只能把 `symphony`
+  label 加到自己的 PR，不能创建通用 Issue，也不能修改其他 PR。
 - 分支推送使用只能写 Contents 的部署密钥或细粒度 Token；base 分支保护必须
   阻止直接推送和 force push。
 - 合并动作只能由 `symphony.delivery` 使用宿主凭据执行。

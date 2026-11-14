@@ -13,7 +13,6 @@ import tempfile
 import threading
 import time
 import unittest
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -77,6 +76,20 @@ class _LinearHandler(BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(length).decode("utf-8"))
         query = request.get("query", "")
         variables = request.get("variables") or {}
+        if "SymphonyLinearWorkerIssueScope" in query:
+            self._reply(200, {"data": {"issue": {
+                "id": self.issue_id,
+                "identifier": self.identifier,
+                "project": {"slugId": "local-project"},
+                "team": {"states": {"nodes": [
+                    {"id": "progress", "name": "In Progress"},
+                    {"id": "review", "name": "Human Review"},
+                    {"id": "rework", "name": "Rework"},
+                    {"id": "merging", "name": "Merging"},
+                    {"id": "done", "name": "Done"},
+                ]}},
+            }}})
+            return
         if "SymphonyLinearViewer" in query:
             self._reply(200, {"data": {"viewer": {"id": "viewer-1"}}})
             return

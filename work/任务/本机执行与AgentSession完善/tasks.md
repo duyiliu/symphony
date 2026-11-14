@@ -9,7 +9,7 @@
 > 实现审查模式：independent
 > 实现审查轮次：3/3 + 2 次针对性收敛确认
 > Reviewer：Meitner（01a1d469-1226-7883-b2cc-005164f864f6）
-> 环境验收：YIL-181 最新代码真实闭环通过；本机最新进程健康
+> 环境验收：YIL-181 最新代码真实闭环通过；R03 终态冷启动健康
 
 ## 范围与验收
 
@@ -82,7 +82,7 @@
 
 ### R01 异常恢复与隔离返工
 
-- 状态：in_progress
+- 状态：done
 - 目标：利用原子保存的宿主交付结果补偿最终上报；仅允许丢弃拥塞的进度，保留生命周期事件；补齐终态保护、按认证配置隔离恢复、热开启恢复。
 - 验证：SWE-2 测试子代理新增对抗回归；完整离线回归；原 Reviewer 增量复审。
 - 测试责任：Laplace（SWE-2，01a1d475-b097-7cc3-b126-779f02edde13），仅新增异常恢复测试。
@@ -101,6 +101,25 @@
 - 验证：Laplace 新增故障注入与两次轮询回归；相关 56 项通过；最终审查明确 PASS，Critical/High=0。
 - 最终离线验证：unittest 151 项（150 通过、1 跳过），pytest 238 通过、1 跳过，`compileall`、Workflow `-Check`、`git diff --check` 通过。
 - 最新真实闭环：YIL-181 自动领取；PR #20 merge commit `5d69d6d238778e62362e5bca0b7e1cc2aa640a50`；Session `7aecc331-7c38-477d-bad4-78cc63bc7af9` complete；Linear Done、恰好 1 条最终 response、pending 0。证据：`e2e-r02-evidence.json`。
+
+### R03 Worker 安全边界与终态幂等
+
+- 状态：done
+- 目标：收敛 MCP/Linear/GitHub 的跨 Issue 与跨仓库写入边界，补齐进程终止、租约恢复和持久化状态文件的幂等性。
+- `.pi` 防逃逸：拒绝 symlink/junction/reparse point 写穿；私有目录与 `mcp.json` 分别收紧为 `0700/0600`，配置使用 UUID 临时文件和原子替换。
+- Worker scope：每次 spawn 使用独立可撤销 bearer；Linear issue/project scope 与 GraphQL AST allowlist fail closed；确认进程树死亡后才撤销 token。
+- PR 归属：attachment 只接受配置仓库 PR；delivery gate、PR 创建与后续评论都要求 head 分支按 token 边界包含当前 Issue identifier。GitHub 写操作不得落到其他分支、PR、Issue 或仓库；merge 仍仅属宿主。
+- 终止与调度：一次强杀未确认后，后续成功 stop 会恢复 termination confirmed；已退出 runner 的保留项仍可重探测。`thread.start()` 失败使用有界控制面退避，不再无限静默重试。
+- 统计幂等：同一 session completion 只累计一次 `seconds_running`，停止保留后 finalize 不重复累计。
+- 租约与持久化：运行租约位于 worktree 外，结合 OS 锁、PID 身份和 Pi session token 判定；released marker 写失败仍尝试删除 sidecar，避免同进程重入自锁。Agent Session 与 delivery 记录使用 UUID 临时文件并在失败路径清理。
+- HTTP 与评论：MCP 拒绝畸形、重复、负数及超过 1 MiB 的请求长度；交付评论在确认查询失败时保留 pending，避免 response 丢失后重复发送。
+- 定向验证：workspace lease / Agent Session / delivery / MCP 共 90 项通过；SWE-2 安全复审最新结论为 Critical=0、High=0，列出的 6 个 Medium 均已对应修复。
+- 租约偶发失败修复：完整 `unittest` 首轮暴露 2 个 Windows 进程观测用例失败，根因为 CIM 查询偶尔超过短时确认窗口；将进程观测超时与租约确认窗口分离为 10 秒和 3 秒，并使用唯一 session ID 隔离真实进程测试。修复后完整 `unittest` 连续 3 次通过。
+- 完整回归：`unittest` 连续 3 次均为 238 项通过、1 跳过；`pytest` 325 通过、1 跳过、4 个 subtests 通过；`compileall`、`git diff --check` 通过。
+- 独立终态回归：DeepSeek 对快照 `925eaad11a383ccf99744dac6c46206a6d95f701d8f68c114e47922ad5cb638a` 给出 Critical=0、High=0；17 项临时逆向测试通过。其发现的恢复夹具 PR 分支不匹配已按真实门禁修正，未放宽生产检查；MCP 401/404 响应已改为 `Connection: close`，避免 Windows 上 keep-alive 残留请求体污染下一请求。
+- 部署与冷启动：`deploy\run-local.ps1 -AppRoot D:\symphony-e2e -Check` 通过；09:49:54 冷启动成功，API PID 20784 监听 `127.0.0.1:18331`，轮询与 delivery 轮次持续推进，`health=healthy`，agent session 线程存活，running/retrying/blocked 均为 0，delivery deferred 为 0。日志中 08:35 前的 YIL-167/YIL-169 GitHub 403 是历史记录；本次冷启动后的轮询与 delivery 均为成功。
+- 残余风险：`mcp_bridge._State` 的 scope 上限为 1024，达到上限会抛 `RuntimeError("mcp_scope_limit_reached")`；终止未确认的 worker 不撤销 bearer，因此持续异常时可能耗尽 scope。本轮选择保留 fail-closed 和既有回收边界，记录为后续容量/恢复设计项，不扩大 R03 改动。
+- 残余风险：终止未确认的 retained entry 在 stall 超时或 Issue 离开活跃态前不会高频重探，恢复窗口较长；当前行为保持 fail-closed，避免租约和进程树未确认时重复执行。
 
 ## 阻塞项
 

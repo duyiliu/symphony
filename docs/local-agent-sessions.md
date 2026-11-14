@@ -33,6 +33,24 @@ Contents-only deploy key。不要把真实配置、密钥或 token 放进 Git。
 - 关键工具完成事件默认至少间隔 30 秒，每次生命周期最多 20 条；
   不回传 shell 参数、工具原始结果或模型内部推理。
 
+## Worker 安全边界
+
+- 每次 Pi spawn 获得独立、可撤销的 loopback MCP bearer token。`.pi` 目录为
+  `0700`，`mcp.json` 为 `0600`。`.pi` 是 symlink/junction 时只移除链接并重建
+  私有目录；`.git` 的 symlink/junction/reparse point 被视为不安全工作区并拒绝
+  写穿。更新 `mcp.json` 使用随机临时文件、`fsync` 和原子替换。
+- Linear 查询与 mutation 使用独立 token scope。mutation 只能作用于 spawn 时
+  冻结的 Issue，并经过 GraphQL tokenizer/AST allowlist；资源 attachment 的
+  GitHub PR URL 还必须属于配置仓库。
+- `github_api` 的 GET 可读取配置仓库；写操作只能创建 head 分支包含当前
+  Issue identifier 的 PR，或修改/评论同一仓库中该 identifier 对应的 open PR。
+  `symphony` label 是唯一允许的仓库级 label 创建。worker 没有 merge 能力。
+- 工作区运行锁位于可删除 worktree 之外，同时使用进程内 map、跨进程 OS 字节锁、
+  host/agent PID 身份和 Pi session token 扫描。无法验证的存活状态一律保持 busy。
+- Agent Session 和 delivery 状态使用 UUID 临时文件、`fsync` 与原子替换；
+  失败路径清理临时文件。MCP HTTP 单请求上限为 1 MiB，畸形、重复、负数或超限
+  `Content-Length` 在读取 body 前拒绝。
+
 | 事件 | Activity / 语义 |
 |---|---|
 | 自动领取 | thought；建立或恢复 Session |

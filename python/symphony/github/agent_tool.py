@@ -4,6 +4,8 @@ the worker environment carries no GitHub token."""
 
 import base64
 import logging
+import re
+from urllib.parse import urlsplit
 
 from .. import workflow_store
 from . import client as gh_client
@@ -61,12 +63,12 @@ def delivery_tool_specs():
     return [_GITHUB_API_SPEC]
 
 
-def execute_delivery_tool(arguments, delivery):
+def execute_delivery_tool(arguments, delivery, issue_scope=None):
     """Execute github_api for a Linear delivery project.
 
     ``delivery`` is a :class:`symphony.config.DeliverySettings`; it carries a
-    host-only token. The policy allowlist is read/PR/comment only and never
-    includes merge.
+    host-only token. Reads may inspect the configured repository; writes are
+    additionally bound to the current issue's open PR and branch.
     """
     if not isinstance(arguments, dict):
         return {"error": {"code": "invalid_arguments"}}
@@ -91,11 +93,13 @@ def execute_delivery_tool(arguments, delivery):
         return {"error": {"code": "forbidden"}}
     if not allowed:
         return {"error": {"code": "forbidden"}}
-    from urllib.parse import urlsplit
     api_path = urlsplit(url).path
     gh_settings = gh_client.GitHubSettings(
         api_root, delivery.repo, delivery.token)
     try:
+        if not _delivery_write_is_scoped(
+                delivery, gh_settings, method, api_path, body, issue_scope):
+            return {"error": {"code": "forbidden"}}
         result = gh_client.perform_request(
             method, api_path, params or {}, body, gh_settings)
     except Exception as error:  # noqa: BLE001
@@ -112,6 +116,161 @@ def execute_delivery_tool(arguments, delivery):
             "status": result["status"],
         }
     return response
+
+
+def _delivery_write_is_scoped(
+        delivery, gh_settings, method, path, body, issue_scope):
+    """Fail closed unless a write targets this worker's issue.
+
+    GET requests remain repository-wide for review and check inspection.
+    Mutations must either create a branch whose name contains the issue
+    identifier or target an open PR whose head branch is bound to it.
+    """
+    method = method.upper()
+    if method == "GET":
+        return True
+    identifier = getattr(issue_scope, "identifier", None)
+    if not isinstance(identifier, str) or not identifier.strip():
+        return False
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 3 or parts[0] != "repos" \
+            or "/".join(parts[1:3]) != delivery.repo:
+        return False
+    tail = parts[3:]
+    body = body if body is not None else {}
+
+    if method == "POST" and tail == ["pulls"]:
+        return isinstance(body, dict) \
+            and body.get("base") == delivery.base_branch \
+            and _branch_binds_identifier(body.get("head"), identifier)
+    if method == "POST" and tail == ["labels"]:
+        return isinstance(body, dict) and body.get("name") == "symphony"
+
+    if len(tail) == 3 and tail[0] == "pulls" and tail[2] == "comments" \
+            and method == "POST":
+        return _pull_is_scoped(
+            delivery, gh_settings, tail[1], identifier)
+    if len(tail) == 2 and tail[0] == "pulls" \
+            and method == "PATCH":
+        if not isinstance(body, dict) \
+                or not set(body).issubset({"title", "body", "base"}):
+            return False
+        if "base" in body and body["base"] != delivery.base_branch:
+            return False
+        return _pull_is_scoped(
+            delivery, gh_settings, tail[1], identifier)
+
+    if len(tail) == 3 and tail[0] == "issues" \
+            and tail[2] == "comments" and method == "POST":
+        return _issue_is_scoped_pull(
+            delivery, gh_settings, tail[1], identifier)
+    if len(tail) == 2 and tail[0] == "issues" and method == "PATCH":
+        if not _pull_identifier_body(body):
+            return False
+        return _issue_is_scoped_pull(
+            delivery, gh_settings, tail[1], identifier)
+    if len(tail) == 3 and tail[0] == "issues" \
+            and tail[2] == "labels" and method == "POST":
+        if not _symphony_label_body(body):
+            return False
+        return _issue_is_scoped_pull(
+            delivery, gh_settings, tail[1], identifier)
+
+    if len(tail) == 3 and tail[0] == "issues" \
+            and tail[1] == "comments" \
+            and method in {"PATCH", "DELETE"}:
+        number = _comment_issue_number(
+            delivery, gh_settings, "issues", tail[2])
+        return number is not None and _issue_is_scoped_pull(
+            delivery, gh_settings, number, identifier)
+    if len(tail) == 3 and tail[0] == "pulls" \
+            and tail[1] == "comments" and method == "PATCH":
+        number = _comment_issue_number(
+            delivery, gh_settings, "pulls", tail[2])
+        return number is not None and _pull_is_scoped(
+            delivery, gh_settings, number, identifier)
+    return False
+
+
+def _pull_identifier_body(body):
+    if not isinstance(body, dict) or set(body) != {"labels"}:
+        return False
+    return _symphony_label_body(body)
+
+
+def _symphony_label_body(body):
+    labels = body.get("labels") if isinstance(body, dict) else None
+    return isinstance(labels, list) and labels == ["symphony"]
+
+
+def _branch_binds_identifier(branch, identifier):
+    if not isinstance(branch, str) or not branch:
+        return False
+    # PR creation accepts either a branch or ``owner:branch``.
+    branch = branch.rsplit(":", 1)[-1]
+    pattern = r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(
+        identifier.strip())
+    return re.search(pattern, branch, flags=re.IGNORECASE) is not None
+
+
+def _pull_is_scoped(delivery, gh_settings, number, identifier):
+    payload = _get_github_json(
+        gh_settings, _repo_path(delivery.repo, "/pulls/%s" % number))
+    if not isinstance(payload, dict) or payload.get("state") != "open":
+        return False
+    base = payload.get("base") or {}
+    head = payload.get("head") or {}
+    base_repo = (base.get("repo") or {}).get("full_name")
+    head_repo = (head.get("repo") or {}).get("full_name")
+    return base_repo == delivery.repo \
+        and head_repo == delivery.repo \
+        and base.get("ref") == delivery.base_branch \
+        and _branch_binds_identifier(head.get("ref"), identifier)
+
+
+def _issue_is_scoped_pull(delivery, gh_settings, number, identifier):
+    payload = _get_github_json(
+        gh_settings, _repo_path(delivery.repo, "/issues/%s" % number))
+    return isinstance(payload, dict) \
+        and bool(payload.get("pull_request")) \
+        and _pull_is_scoped(delivery, gh_settings, number, identifier)
+
+
+def _comment_issue_number(delivery, gh_settings, kind, comment_id):
+    suffix = "/issues/comments/%s" % comment_id if kind == "issues" \
+        else "/pulls/comments/%s" % comment_id
+    payload = _get_github_json(
+        gh_settings, _repo_path(delivery.repo, suffix))
+    if not isinstance(payload, dict):
+        return None
+    url = payload.get("pull_request_url") or payload.get("issue_url")
+    if not isinstance(url, str):
+        return None
+    parsed = urlsplit(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    expected = [
+        "repos", delivery.repo.split("/", 1)[0],
+        delivery.repo.split("/", 1)[1],
+    ]
+    if parts[:3] != expected or len(parts) != 5 \
+            or parts[3] not in {"issues", "pulls"}:
+        return None
+    return parts[4]
+
+
+def _get_github_json(gh_settings, path):
+    try:
+        result = gh_client.perform_request("GET", path, {}, None, gh_settings)
+    except Exception:  # noqa: BLE001 - verification failures fail closed
+        return None
+    if not 200 <= result.get("status", 0) <= 299:
+        return None
+    body = result.get("body")
+    return body if isinstance(body, dict) else None
+
+
+def _repo_path(repo, suffix):
+    return "/repos/%s%s" % (gh_client.encoded_repo(repo), suffix)
 
 
 def execute_agent_tool(tool_name, arguments, tracker_settings=None):

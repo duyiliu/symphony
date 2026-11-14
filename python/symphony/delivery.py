@@ -20,7 +20,9 @@ import logging
 import os
 import re
 import threading
+import time
 import urllib.parse
+import uuid
 from types import SimpleNamespace
 
 from . import linear
@@ -73,6 +75,37 @@ def _digest(*values):
     ).hexdigest()[:20]
 
 
+def _comment_exists(settings, issue_id, notice_key):
+    """Return whether a deterministic delivery comment is already visible."""
+    marker = "[symphony-delivery:%s]" % notice_key
+    after = None
+    for _ in range(10):
+        payload = linear.graphql(
+            settings.tracker,
+            "query SymphonyDeliveryCommentExists("
+            "$id: String!, $after: String) {"
+            " issue(id: $id) { comments(first: 100, after: $after) {"
+            " nodes { id body }"
+            " pageInfo { hasNextPage endCursor } } } }",
+            {"id": issue_id, "after": after},
+        )
+        issue = (payload.get("data") or {}).get("issue") or {}
+        comments = issue.get("comments") or {}
+        if any(
+                isinstance(item, dict)
+                and marker in str(item.get("body") or "")
+                for item in comments.get("nodes") or []):
+            return True
+        page = comments.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            return False
+        cursor = page.get("endCursor")
+        if not cursor or cursor == after:
+            raise DeliveryError("invalid_linear_comment_pagination")
+        after = cursor
+    raise DeliveryError("linear_comment_pagination_limit")
+
+
 class GitHub:
     """Small REST facade using the host-only delivery credential."""
 
@@ -90,14 +123,28 @@ class GitHub:
             return result["body"]
         if allow_missing and status == 404:
             return _NOT_FOUND
+        payload = result.get("body")
+        message = payload.get("message") if isinstance(payload, dict) else ""
+        headers = result.get("headers") or {}
+        rate_limited = (
+            status == 429
+            or "rate limit" in str(message).lower()
+            or str(headers.get("X-RateLimit-Remaining", "")) == "0"
+        )
+        if rate_limited:
+            raise DeliveryError("github_rate_limited", {
+                "status": status,
+                "method": method,
+                "path": path,
+                "retry_after": gh_client.retry_after_seconds(headers),
+            })
         if allow_missing and status == 403:
-            payload = result.get("body")
-            message = payload.get("message") if isinstance(payload, dict) else ""
-            if "rate limit" in str(message).lower():
-                raise DeliveryError("github_rate_limited", message)
             return _NOT_FOUND
         raise DeliveryError(
-            "github_status", (status, method, path))
+            "github_status", {
+                "status": status, "method": method, "path": path,
+                "retry_after": gh_client.retry_after_seconds(headers),
+            })
 
     def pages(self, path, field=None):
         rows = []
@@ -332,6 +379,17 @@ def _pr_repo_matches(pr, repo):
     return base_repo == repo and head_repo == repo
 
 
+def _pr_branch_matches_issue(pr, issue):
+    identifier = getattr(issue, "identifier", None)
+    head_ref = (pr.get("head") or {}).get("ref")
+    if not isinstance(identifier, str) or not identifier.strip() \
+            or not isinstance(head_ref, str) or not head_ref.strip():
+        return False
+    pattern = r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(
+        identifier.strip())
+    return re.search(pattern, head_ref, flags=re.IGNORECASE) is not None
+
+
 def _valid_sha(value):
     return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{40,64}", value)
 
@@ -350,6 +408,10 @@ def evaluate(settings, issue, pr, checks, files, reviews, protection,
     if base.get("ref") != delivery.base_branch:
         return "pause", "pull request targets %r, expected %r" % (
             base.get("ref"), delivery.base_branch), {}
+    if not _pr_branch_matches_issue(pr, issue):
+        return "pause", (
+            "pull request head branch is not bound to %s"
+            % getattr(issue, "identifier", "the current issue")), {}
     if pr.get("merged") is True:
         return "confirm", "pull request is already merged", {
             "sha": sha, "pr": pr.get("number")}
@@ -442,22 +504,32 @@ class DeliveryRecordStore:
         except OSError:
             pass
         path = self._path(issue)
-        temp = path + ".tmp"
+        temp = "%s.tmp.%d.%s" % (path, os.getpid(), uuid.uuid4().hex)
         payload = dict(record)
         payload["updated_at"] = _utc_now()
-        with open(temp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
         try:
-            os.chmod(temp, 0o600)
-        except OSError:
-            pass
-        os.replace(temp, path)
+            with open(temp, "x", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.chmod(temp, 0o600)
+            except OSError:
+                pass
+            os.replace(temp, path)
+        finally:
+            try:
+                os.remove(temp)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                log.warning(
+                    "Unable to remove temporary delivery record path=%s "
+                    "error=%s", temp, error)
         return payload
 
     def load_pending_sync(self):
-        """Return confirmed merges whose Linear state still needs syncing.
+        """Return merges or delivery comments whose sync is still pending.
 
         These records must stay discoverable after an issue reaches a terminal
         state because the active-state poll will no longer return it.
@@ -472,7 +544,8 @@ class DeliveryRecordStore:
                 continue
             issue_id = name[:-5]
             record = self.load(SimpleNamespace(id=issue_id))
-            if record.get("phase") != "merged_pending_sync":
+            if record.get("phase") != "merged_pending_sync" \
+                    and not record.get("pending_notice_key"):
                 continue
             stored_id = record.get("issue_id")
             if isinstance(stored_id, str) and stored_id:
@@ -486,14 +559,24 @@ class DeliveryRecordStore:
 class DeliveryController:
     """Background host checker. It never starts an Agent."""
 
-    def __init__(self, store, session_reporter=None):
+    def __init__(self, store, session_reporter=None, clock=None):
         self.store = store
         self.session_reporter = session_reporter
+        self._clock = clock or time.monotonic
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread = None
         self._locks = {}
         self._locks_guard = threading.Lock()
+        self._backoff_lock = threading.RLock()
+        self._deferred = {}
+        self._global_backoff_until = 0
+        self._global_backoff_reason = None
+        self._last_poll_started_at = None
+        self._last_poll_completed_at = None
+        self._last_success_at = None
+        self._last_error = None
+        self._poll_count = 0
 
     def start(self):
         self._thread = threading.Thread(
@@ -510,6 +593,111 @@ class DeliveryController:
 
     def refresh(self):
         self._wake.set()
+
+    def snapshot(self):
+        now = self._clock()
+        try:
+            enabled = self.store.settings().delivery.enabled
+        except Exception:  # noqa: BLE001 - observability is best effort
+            enabled = None
+        with self._backoff_lock:
+            deferred = []
+            for issue_id, item in self._deferred.items():
+                remaining_ms = max(0, int((item["until"] - now) * 1000))
+                if remaining_ms <= 0:
+                    continue
+                deferred.append({
+                    "issue_id": issue_id,
+                    "identifier": item.get("identifier"),
+                    "reason": item.get("reason"),
+                    "attempts": item.get("attempts", 1),
+                    "retry_in_ms": remaining_ms,
+                })
+            deferred.sort(key=lambda item: (
+                item.get("identifier") or "", item.get("issue_id") or ""))
+            global_remaining_ms = max(
+                0, int((self._global_backoff_until - now) * 1000))
+            return {
+                "enabled": enabled,
+                "thread_alive": bool(
+                    self._thread and self._thread.is_alive()),
+                "poll_count": self._poll_count,
+                "last_poll_started_at": self._last_poll_started_at,
+                "last_poll_completed_at": self._last_poll_completed_at,
+                "last_success_at": self._last_success_at,
+                "last_error": self._last_error,
+                "deferred_count": len(deferred),
+                "deferred": deferred,
+                "global_backoff_reason": self._global_backoff_reason,
+                "global_backoff_remaining_ms": global_remaining_ms,
+            }
+
+    def _remaining_backoff(self):
+        with self._backoff_lock:
+            remaining = self._global_backoff_until - self._clock()
+            if remaining <= 0:
+                self._global_backoff_until = 0
+                self._global_backoff_reason = None
+                return 0
+            return remaining
+
+    def _issue_is_deferred(self, issue_id):
+        with self._backoff_lock:
+            item = self._deferred.get(issue_id)
+            if item is None:
+                return False
+            if item["until"] > self._clock():
+                return True
+            self._deferred.pop(issue_id, None)
+            return False
+
+    def _clear_issue_backoff(self, issue_id):
+        with self._backoff_lock:
+            self._deferred.pop(issue_id, None)
+
+    @staticmethod
+    def _backoff_delay(error, previous_attempts, poll_interval_ms):
+        detail = getattr(error, "detail", None)
+        detail = detail if isinstance(detail, dict) else {}
+        reason = getattr(error, "reason", type(error).__name__)
+        status = detail.get("status")
+        if reason == "github_rate_limited" or status == 429:
+            try:
+                return max(1.0, min(float(detail.get("retry_after")), 3600.0))
+            except (TypeError, ValueError):
+                return 60.0
+        base = max(30.0, float(poll_interval_ms or 30_000) / 1000.0)
+        if status in (401, 403):
+            base = max(base, 300.0)
+        return min(base * (2 ** min(previous_attempts, 6)), 1800.0)
+
+    def _defer_issue(self, issue, error):
+        settings = self.store.settings()
+        reason = getattr(error, "reason", type(error).__name__)
+        detail = getattr(error, "detail", None)
+        detail = detail if isinstance(detail, dict) else {}
+        with self._backoff_lock:
+            previous = self._deferred.get(issue.id, {})
+            attempts = int(previous.get("attempts") or 0) + 1
+            delay = self._backoff_delay(
+                error, max(0, attempts - 1),
+                settings.delivery.poll_interval_ms)
+            until = self._clock() + delay
+            self._deferred[issue.id] = {
+                "identifier": issue.identifier,
+                "reason": reason,
+                "attempts": attempts,
+                "until": until,
+            }
+            if reason == "github_rate_limited" or detail.get("status") == 429:
+                self._global_backoff_until = max(
+                    self._global_backoff_until, until)
+                self._global_backoff_reason = reason
+            self._last_error = reason
+        log.warning(
+            "delivery check deferred identifier=%s reason=%s retry_after_s=%s",
+            issue.identifier, reason, round(delay, 1))
+        return delay
 
     def _lock_for(self, issue_id):
         with self._locks_guard:
@@ -533,40 +721,65 @@ class DeliveryController:
         delivery = settings.delivery
         if not delivery.enabled:
             return
-        issues = tracker_adapter.fetch_issues_by_states(
-            settings.tracker,
-            [delivery.review_state, delivery.merge_state],
-        )
-        records = DeliveryRecordStore(delivery.state_dir)
-        pending_by_id = {
-            record["issue_id"]: record
-            for record in records.load_pending_sync()
-            if isinstance(record.get("issue_id"), str) and record["issue_id"]
-        }
-        found_ids = {issue.id for issue in issues}
-        missing_ids = [
-            issue_id for issue_id in pending_by_id
-            if issue_id not in found_ids
-        ]
-        if missing_ids:
-            try:
-                issues.extend(tracker_adapter.fetch_issues_by_ids(
-                    settings.tracker, missing_ids))
-            except Exception as error:  # noqa: BLE001
-                log.warning(
-                    "delivery pending-sync issue refresh failed ids=%s error=%s",
-                    missing_ids, error)
+        if self._remaining_backoff() > 0:
+            return
+        with self._backoff_lock:
+            self._poll_count += 1
+            self._last_poll_started_at = _utc_now()
+        try:
+            issues = tracker_adapter.fetch_issues_by_states(
+                settings.tracker,
+                [delivery.review_state, delivery.merge_state],
+            )
+            records = DeliveryRecordStore(delivery.state_dir)
+            pending_by_id = {
+                record["issue_id"]: record
+                for record in records.load_pending_sync()
+                if isinstance(record.get("issue_id"), str) and record["issue_id"]
+            }
+            found_ids = {issue.id for issue in issues}
+            missing_ids = [
+                issue_id for issue_id in pending_by_id
+                if issue_id not in found_ids
+            ]
+            if missing_ids:
+                try:
+                    issues.extend(tracker_adapter.fetch_issues_by_ids(
+                        settings.tracker, missing_ids))
+                except Exception as error:  # noqa: BLE001
+                    log.warning(
+                        "delivery pending-sync issue refresh failed ids=%s error=%s",
+                        missing_ids, error)
 
-        seen = set()
-        for issue in issues:
-            if issue.id in seen:
-                continue
-            seen.add(issue.id)
-            pending = pending_by_id.get(issue.id)
-            if pending is not None:
-                self._resume_pending_sync(settings, issue, pending)
-            else:
-                self.check(settings, issue)
+            seen = set()
+            for issue in issues:
+                if issue.id in seen:
+                    continue
+                seen.add(issue.id)
+                if self._remaining_backoff() > 0:
+                    break
+                if self._issue_is_deferred(issue.id):
+                    continue
+                pending = pending_by_id.get(issue.id)
+                if pending is not None:
+                    if pending.get("phase") == "merged_pending_sync":
+                        self._resume_pending_sync(settings, issue, pending)
+                    else:
+                        self._retry_pending_notice(settings, issue)
+                else:
+                    self.check(settings, issue)
+        except Exception as error:
+            with self._backoff_lock:
+                self._last_error = getattr(
+                    error, "reason", type(error).__name__)
+                self._last_poll_completed_at = _utc_now()
+            raise
+        else:
+            with self._backoff_lock:
+                self._last_poll_completed_at = _utc_now()
+                self._last_success_at = self._last_poll_completed_at
+                if not self._deferred and not self._global_backoff_until:
+                    self._last_error = None
 
     def _resume_pending_sync(self, settings, issue, record):
         """Finish a merge whose GitHub result was already durably confirmed."""
@@ -601,13 +814,13 @@ class DeliveryController:
                     (pr_number, expected_sha, actual_sha))
             self._confirm_merge(
                 settings, issue, records, current, pr, github)
-        except DeliveryError as error:
-            log.warning(
-                "delivery pending-sync deferred identifier=%s reason=%s detail=%s",
-                issue.identifier, error.reason, error.detail)
+            self._clear_issue_backoff(issue.id)
+        except (DeliveryError, gh_client.GitHubError) as error:
+            self._defer_issue(issue, error)
         except Exception:  # noqa: BLE001 - one issue must not stop recovery
             log.exception(
                 "delivery pending-sync failed identifier=%s", issue.identifier)
+            self._defer_issue(issue, DeliveryError("delivery_internal_error"))
         finally:
             lock.release()
 
@@ -624,6 +837,13 @@ class DeliveryController:
         from .util import normalize_issue_state
 
         delivery = settings.delivery
+        previous_lifecycle = self._record_lifecycle_marker(record)
+        current_lifecycle = self._current_lifecycle_marker(
+            issue, strict=bool(previous_lifecycle))
+        if isinstance(previous_lifecycle, str) and previous_lifecycle \
+                and isinstance(current_lifecycle, str) and current_lifecycle \
+                and previous_lifecycle != current_lifecycle:
+            return False
         state = normalize_issue_state(issue.state or "")
         done = normalize_issue_state(delivery.done_state)
         terminal = {
@@ -647,6 +867,80 @@ class DeliveryController:
             and expected_updated == _iso(issue.updated_at)
         )
 
+    @staticmethod
+    def _record_lifecycle_marker(record):
+        marker = record.get("lifecycle_marker")
+        if isinstance(marker, str) and marker:
+            return marker
+        envelope = record.get("agent_session_report")
+        if isinstance(envelope, dict):
+            marker = envelope.get("lifecycle")
+            if isinstance(marker, str) and marker:
+                return marker
+        return None
+
+    def _current_lifecycle_marker(self, issue, strict=False):
+        if self.session_reporter is None:
+            return None
+        records = getattr(self.session_reporter, "records", None)
+        if isinstance(records, dict):
+            current = records.get(issue.id)
+            if isinstance(current, dict):
+                marker = current.get("marker")
+                if isinstance(marker, str) and marker:
+                    return marker
+        try:
+            envelope = self.session_reporter.delivery_event(
+                issue, "waiting", "delivery lifecycle check", None, None)
+        except Exception as error:  # noqa: BLE001 - reporting stays optional
+            if strict:
+                raise DeliveryError(
+                    "delivery_lifecycle_unavailable") from error
+            return None
+        if not isinstance(envelope, dict):
+            if strict:
+                raise DeliveryError("delivery_lifecycle_unavailable")
+            return None
+        marker = envelope.get("lifecycle")
+        return marker if isinstance(marker, str) and marker else None
+
+    def _delivery_scope_changed(self, record, pr_number, lifecycle_marker):
+        previous_pr = record.get("pr")
+        if isinstance(previous_pr, int) and previous_pr != pr_number:
+            return True
+        previous_lifecycle = self._record_lifecycle_marker(record)
+        if not isinstance(previous_lifecycle, str) or not previous_lifecycle:
+            previous_lifecycle = None
+        return (
+            isinstance(previous_lifecycle, str)
+            and bool(previous_lifecycle)
+            and isinstance(lifecycle_marker, str)
+            and bool(lifecycle_marker)
+            and previous_lifecycle != lifecycle_marker
+        )
+
+    def _notice_belongs_to_current_scope(self, settings, issue, record):
+        if record.get("phase") == "superseded_pending_sync":
+            return False
+        try:
+            current_pr = discover_pr(issue, settings.delivery.repo)
+        except DeliveryError:
+            return False
+        previous_pr = record.get("pr")
+        if isinstance(previous_pr, int) and current_pr is not None \
+                and previous_pr != current_pr:
+            return False
+        previous_lifecycle = self._record_lifecycle_marker(record)
+        current_lifecycle = self._current_lifecycle_marker(
+            issue, strict=bool(previous_lifecycle))
+        return not (
+            isinstance(previous_lifecycle, str)
+            and bool(previous_lifecycle)
+            and isinstance(current_lifecycle, str)
+            and bool(current_lifecycle)
+            and previous_lifecycle != current_lifecycle
+        )
+
     def _superseded_delivery_matches(self, record, pr_number):
         superseded_pr = record.get("pr")
         return (
@@ -664,10 +958,56 @@ class DeliveryController:
                 "推进当前状态。"
             ),
             "superseded_at": _utc_now(),
+            "pending_notice_key": None,
+            "pending_notice_body": None,
+            "pending_notice_creation_attempted": None,
         })
         log.warning(
             "delivery pending-sync superseded identifier=%s state=%s",
             issue.identifier, issue.state)
+
+    def _retry_pending_notice(self, settings, issue):
+        lock = self._lock_for(issue.id)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            records = DeliveryRecordStore(settings.delivery.state_dir)
+            current = records.load(issue)
+            notice_key = current.get("pending_notice_key")
+            body = current.get("pending_notice_body")
+            if not isinstance(notice_key, str) or not notice_key:
+                return
+            if not isinstance(body, str) or not body:
+                log.warning(
+                    "delivery pending notice malformed identifier=%s",
+                    issue.identifier)
+                return
+            if not self._notice_belongs_to_current_scope(
+                    settings, issue, current):
+                self._save(records, issue, current, {
+                    "pending_notice_key": None,
+                    "pending_notice_body": None,
+                    "pending_notice_creation_attempted": None,
+                })
+                log.warning(
+                    "delivery pending notice discarded as stale "
+                    "identifier=%s pr=%s", issue.identifier,
+                    current.get("pr"))
+                return
+            delivered = self._notice(
+                settings, issue, records, current, notice_key, body,
+                scoped=True)
+            if delivered.get("last_notice_key") == notice_key:
+                self._clear_issue_backoff(issue.id)
+        except DeliveryError as error:
+            self._defer_issue(issue, error)
+        except Exception:  # noqa: BLE001 - one notice must not stop the poll
+            log.exception(
+                "delivery notice recovery failed identifier=%s",
+                issue.identifier)
+            self._defer_issue(issue, DeliveryError("delivery_internal_error"))
+        finally:
+            lock.release()
 
     def check(self, settings, issue):
         delivery = settings.delivery
@@ -676,10 +1016,9 @@ class DeliveryController:
             return
         try:
             self._check_locked(settings, issue, delivery)
-        except DeliveryError as error:
-            log.warning(
-                "delivery check deferred identifier=%s reason=%s detail=%s",
-                issue.identifier, error.reason, error.detail)
+            self._clear_issue_backoff(issue.id)
+        except (DeliveryError, gh_client.GitHubError) as error:
+            self._defer_issue(issue, error)
             if error.reason == "ambiguous_pr_association":
                 records = DeliveryRecordStore(delivery.state_dir)
                 record = records.load(issue)
@@ -693,6 +1032,7 @@ class DeliveryController:
                     })
         except Exception:  # noqa: BLE001 - one issue must not stop the poll
             log.exception("delivery check failed identifier=%s", issue.identifier)
+            self._defer_issue(issue, DeliveryError("delivery_internal_error"))
         finally:
             lock.release()
 
@@ -702,15 +1042,25 @@ class DeliveryController:
             return
         records = DeliveryRecordStore(delivery.state_dir)
         record = records.load(issue)
+        lifecycle_marker = self._current_lifecycle_marker(
+            issue, strict=bool(self._record_lifecycle_marker(record)))
         if record.get("phase") == "superseded_pending_sync" \
                 and self._superseded_delivery_matches(record, pr_number):
             log.info(
                 "delivery ignored superseded PR identifier=%s pr=%s",
                 issue.identifier, pr_number)
             return
-        if record.get("phase") == "superseded_pending_sync":
-            # A different PR is a new delivery object; do not carry rework
-            # counters or gate fingerprints from the superseded lifecycle.
+        if record.get("phase") == "superseded_pending_sync" \
+                or self._delivery_scope_changed(
+                    record, pr_number, lifecycle_marker):
+            # A different PR or Agent Session run is a new delivery object.
+            # Drop old counters, gates, and notice fingerprints before using
+            # any result from the new object.
+            log.info(
+                "delivery reset for new scope identifier=%s old_pr=%s "
+                "new_pr=%s old_lifecycle=%s new_lifecycle=%s",
+                issue.identifier, record.get("pr"), pr_number,
+                record.get("lifecycle_marker"), lifecycle_marker)
             record = {}
         github = GitHub(delivery)
 
@@ -798,6 +1148,9 @@ class DeliveryController:
         phase = changes.get("phase")
         if phase is not None:
             payload.pop("agent_session_report", None)
+            lifecycle_marker = self._current_lifecycle_marker(issue)
+            if isinstance(lifecycle_marker, str) and lifecycle_marker:
+                payload["lifecycle_marker"] = lifecycle_marker
             if self.session_reporter and phase in (
                     "merged", "merged_pending_sync", "paused"):
                 report_phase = (
@@ -813,26 +1166,74 @@ class DeliveryController:
                         issue, report_phase, reason, payload.get("pr"), sha)
                     if isinstance(envelope, dict):
                         payload["agent_session_report"] = envelope
+                        envelope_lifecycle = envelope.get("lifecycle")
+                        if isinstance(envelope_lifecycle, str) \
+                                and envelope_lifecycle:
+                            payload["lifecycle_marker"] = envelope_lifecycle
                 except Exception as error:  # noqa: BLE001 - reporting stays optional
                     log.warning("Agent delivery envelope unavailable reason=%s",
                                 getattr(error, "reason", type(error).__name__))
         return records.save(issue, payload)
 
     def _report_session(self, issue, phase, reason, pr_number, sha):
-        if self.session_reporter:
+        if not self.session_reporter:
+            return
+        try:
             self.session_reporter.delivery(issue, phase, reason, pr_number, sha)
+        except Exception as error:  # noqa: BLE001 - reporting is asynchronous
+            log.warning(
+                "Agent delivery report unavailable identifier=%s reason=%s",
+                issue.identifier, getattr(error, "reason", type(error).__name__))
 
-    def _notice(self, settings, issue, records, record, key, body):
-        if record.get("last_notice_key") == key:
+    def _notice(self, settings, issue, records, record, key, body,
+                scoped=False):
+        lifecycle_marker = self._current_lifecycle_marker(issue)
+        if not lifecycle_marker:
+            lifecycle_marker = record.get("lifecycle_marker")
+        notice_key = (
+            key if scoped or not lifecycle_marker
+            else _digest("notice", key, lifecycle_marker))
+        if record.get("last_notice_key") == notice_key:
             return record
+        if record.get("pending_notice_key") == notice_key \
+                and record.get("pending_notice_creation_attempted") is True:
+            try:
+                if _comment_exists(settings, issue.id, notice_key):
+                    return self._save(records, issue, record, {
+                        "last_notice_key": notice_key,
+                        "pending_notice_key": None,
+                        "pending_notice_body": None,
+                        "pending_notice_creation_attempted": None,
+                    })
+            except Exception as error:  # noqa: BLE001 - retry the send
+                log.warning(
+                    "Linear comment confirmation failed identifier=%s "
+                    "error=%s", issue.identifier, error)
+                raise DeliveryError(
+                    "linear_comment_confirmation_failed", repr(error)
+                ) from error
+        changes = {
+            "pending_notice_key": notice_key,
+            "pending_notice_body": body,
+            "pending_notice_creation_attempted": True,
+        }
+        if isinstance(lifecycle_marker, str) and lifecycle_marker:
+            changes["lifecycle_marker"] = lifecycle_marker
+        record = self._save(records, issue, record, changes)
         try:
             linear.create_comment(
                 settings.tracker, issue.id,
-                "[symphony-delivery] %s" % body)
-        except Exception as error:  # noqa: BLE001 - state still advances
+                "[symphony-delivery:%s]\n%s" % (notice_key, body))
+        except Exception as error:  # noqa: BLE001 - keep a retry marker
             log.warning("Linear comment failed identifier=%s error=%s",
                         issue.identifier, error)
-        return self._save(records, issue, record, {"last_notice_key": key})
+            return record
+        return self._save(records, issue, record, {
+            "last_notice_key": notice_key,
+            "pending_notice_key": None,
+            "pending_notice_body": None,
+            "pending_notice_creation_attempted": None,
+        })
 
     def _transition(self, settings, issue, state_name):
         from .util import normalize_issue_state

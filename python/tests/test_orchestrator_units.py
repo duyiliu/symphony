@@ -1,13 +1,16 @@
 import datetime
 import os
 import sys
+import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from symphony import config, orchestrator  # noqa: E402
 from symphony.issue import Issue  # noqa: E402
+from symphony.workflow import WorkflowError  # noqa: E402
 
 
 def _settings(**overrides):
@@ -105,6 +108,23 @@ class CandidateTest(unittest.TestCase):
         worker.assert_not_called()
         self.assertEqual(done, [(issue.id, runner.DONE_SKIPPED)])
 
+    def test_lease_failure_does_not_claim_or_start_worker(self):
+        from symphony.agent import runner
+        issue = _issue()
+        done = []
+        handle = runner.RunHandle()
+        with patch.object(runner.workspace_mod, "acquire_run_lease",
+                          return_value=None), \
+                patch.object(runner.tracker_adapter, "begin_run_issue") as begin, \
+                patch.object(runner, "_run_on_worker_host") as worker:
+            runner.run(
+                issue, _settings(), lambda *args: None,
+                lambda *args: done.append(args), handle)
+        begin.assert_not_called()
+        worker.assert_not_called()
+        self.assertEqual(done, [(issue.id, runner.DONE_DEFERRED)])
+        self.assertEqual(handle.deferred_policy, "wait")
+
     def test_retry_waits_for_capacity_then_respawns(self):
         orch = _orchestrator()
         settings = orch._store.settings()
@@ -167,6 +187,26 @@ class RetryDelayTest(unittest.TestCase):
         orch = _orchestrator(settings)
         self.assertEqual(
             orch._retry_delay(2, {"delay_type": "continuation"}, settings), 20000)
+
+    def test_control_backoff_is_bounded_only_for_temporary_failures(self):
+        settings = _settings()
+        orch = _orchestrator(settings)
+        bounded = {
+            "delay_type": "control",
+            "control_policy": "bounded",
+            "bounded_attempt": 1,
+        }
+        self.assertEqual(orch._retry_delay(2, bounded, settings), 10000)
+        bounded["bounded_attempt"] = 2
+        self.assertEqual(orch._retry_delay(2, bounded, settings), 20000)
+        bounded["bounded_attempt"] = 5
+        self.assertEqual(orch._retry_delay(2, bounded, settings), 30000)
+        waiting = {
+            "delay_type": "control",
+            "control_policy": "wait",
+            "wait_attempt": 100,
+        }
+        self.assertEqual(orch._retry_delay(2, waiting, settings), 10000)
 
 
 class RetryLimitTest(unittest.TestCase):
@@ -242,6 +282,255 @@ class RetryLimitTest(unittest.TestCase):
         self.assertIn("1", orch.blocked)
         self.assertIn("retry limit exceeded", orch.blocked["1"]["error"])
 
+    def test_capacity_deferral_does_not_advance_attempt_or_block(self):
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        orch.max_concurrent_agents = 1
+        orch.running["other"] = {"issue": _issue("other")}
+        with patch.object(orch, "_schedule_issue_retry") as schedule, \
+                patch.object(orch, "_spawn_issue") as spawn:
+            orch._handle_active_retry(
+                _issue("1"), 3,
+                {"identifier": "GH-1", "error": "agent exited"},
+                settings)
+        schedule.assert_called_once()
+        self.assertEqual(schedule.call_args.args[1], 3)
+        self.assertEqual(
+            schedule.call_args.args[2]["delay_type"], "control")
+        self.assertEqual(
+            schedule.call_args.args[2]["control_policy"], "wait")
+        spawn.assert_not_called()
+        self.assertNotIn("1", orch.blocked)
+
+    def test_worker_capacity_deferral_keeps_attempt(self):
+        settings = _settings(
+            agent={
+                "max_concurrent_agents": 2,
+                "max_retry_backoff_ms": 300000,
+                "max_retry_attempts": 2,
+            },
+            worker={
+                "ssh_hosts": ["worker-a"],
+                "max_concurrent_agents_per_host": 1,
+            })
+        orch = _orchestrator(settings)
+        orch.running["other"] = {
+            "issue": _issue("other"), "worker_host": "worker-a"}
+        with patch.object(orch, "_schedule_issue_retry") as schedule, \
+                patch.object(orch, "_spawn_issue") as spawn:
+            orch._handle_active_retry(
+                _issue("1"), 2,
+                {"identifier": "GH-1", "worker_host": "worker-a"},
+                settings)
+        self.assertEqual(schedule.call_args.args[1], 2)
+        self.assertEqual(schedule.call_args.args[2]["delay_type"], "control")
+        self.assertEqual(
+            schedule.call_args.args[2]["control_policy"], "wait")
+        spawn.assert_not_called()
+        self.assertNotIn("1", orch.blocked)
+
+    def test_refresh_and_poll_failures_do_not_advance_attempt(self):
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        orch.running.clear()
+        metadata = {"identifier": "GH-1", "error": "agent exited"}
+        with patch.object(orch, "_schedule_issue_retry") as schedule, \
+                patch.object(orch, "_refresh_issue_for_dispatch",
+                             return_value=("error", RuntimeError("temporary"))):
+            orch._handle_active_retry(_issue("1"), 2, metadata, settings)
+        self.assertEqual(schedule.call_args.args[1], 2)
+        self.assertEqual(schedule.call_args.args[2]["delay_type"], "control")
+
+        orch.retry_attempts["1"] = {
+            "attempt": 2,
+            "retry_token": "token",
+            "identifier": "GH-1",
+            "delay_type": "control",
+        }
+        with patch.object(orch, "_schedule_issue_retry") as schedule, \
+                patch.object(orchestrator.tracker_adapter,
+                             "fetch_issues_by_ids",
+                             side_effect=RuntimeError("tracker offline")):
+            orch._on_retry_issue("1", "token")
+        self.assertEqual(schedule.call_args.args[1], 2)
+        self.assertEqual(schedule.call_args.args[2]["delay_type"], "control")
+        self.assertNotIn("1", orch.blocked)
+
+    def test_thread_start_failure_is_control_deferral(self):
+        settings = self._limited_settings(1)
+        orch = _orchestrator(settings)
+        with patch.object(orch, "_schedule_issue_retry") as schedule, \
+                patch.object(orchestrator.threading.Thread, "start",
+                             side_effect=RuntimeError("thread unavailable")):
+            orch._spawn_issue(_issue("1"), settings, 1, None)
+        self.assertEqual(schedule.call_args.args[1], 1)
+        self.assertEqual(schedule.call_args.args[2]["delay_type"], "control")
+        self.assertNotIn("1", orch.blocked)
+        self.assertIn("1", orch.claimed)
+        self.assertNotIn("1", orch.running)
+        self.assertEqual(
+            schedule.call_args.args[2]["control_policy"], "bounded")
+
+    def test_session_completion_seconds_are_recorded_once(self):
+        orch = _orchestrator()
+        started = datetime.datetime(
+            2026, 11, 14, tzinfo=datetime.timezone.utc)
+        entry = {"started_at": started}
+        with patch.object(
+                orchestrator, "_now",
+                return_value=started + datetime.timedelta(seconds=17)):
+            orch._record_session_completion_totals(entry)
+            orch._record_session_completion_totals(entry)
+        self.assertEqual(orch.codex_totals["seconds_running"], 17)
+        self.assertTrue(entry["session_completion_totals_recorded"])
+
+    def test_fast_worker_done_is_not_lost(self):
+        from symphony.agent import runner
+        settings = self._limited_settings(1)
+        orch = _orchestrator(settings)
+        issue = _issue("1")
+
+        def run_immediately(_issue, _settings, _on_update, on_done, _handle,
+                            opts=None):
+            on_done(_issue.id, runner.DONE_SKIPPED)
+
+        def start_immediately(thread):
+            thread._target()
+
+        with patch.object(orchestrator.threading.Thread, "start",
+                          new=start_immediately), \
+                patch.object(orchestrator.agent_runner, "run",
+                             side_effect=run_immediately):
+            orch._spawn_issue(issue, settings, 1, None)
+
+        self.assertIn(issue.id, orch.running)
+        kind, issue_id, ref, reason = orch._mailbox.get_nowait()
+        self.assertEqual((kind, issue_id, reason),
+                         ("worker_done", issue.id, runner.DONE_SKIPPED))
+        orch._on_worker_done(issue_id, ref, reason)
+        self.assertNotIn(issue.id, orch.running)
+        self.assertNotIn(issue.id, orch.claimed)
+
+    def test_control_deferrals_have_a_separate_bounded_limit(self):
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        metadata = {
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "error": "temporary tracker outage",
+        }
+        with patch.object(orchestrator, "CONTROL_DEFERRAL_LIMIT", 2):
+            self.assertTrue(
+                orch._schedule_control_retry("1", 0, metadata, settings))
+            self.assertTrue(
+                orch._schedule_control_retry("1", 0, metadata, settings))
+            self.assertFalse(
+                orch._schedule_control_retry("1", 0, metadata, settings))
+        self.assertIn("1", orch.blocked)
+        self.assertIn("control-plane deferral limit exceeded",
+                      orch.blocked["1"]["error"])
+        self.assertNotIn("max_retry_attempts", orch.blocked["1"]["error"])
+        self.assertNotIn("1", orch.retry_attempts)
+
+    def test_bounded_control_state_survives_redispatch(self):
+        from symphony.agent import runner
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        issue = _issue("1")
+        with patch.object(orchestrator.threading.Thread, "start"):
+            orch._spawn_issue(
+                issue, settings, 1, None,
+                control_state={
+                    "control_attempt": 2,
+                    "bounded_attempt": 2,
+                    "wait_attempt": 0,
+                })
+        entry = orch.running["1"]
+        self.assertEqual(entry["bounded_attempt"], 2)
+        handle = entry["handle"]
+        handle.defer(
+            "linear_api_request: offline",
+            retryable=True,
+            code="linear_api_request")
+        with patch.object(orchestrator, "CONTROL_DEFERRAL_LIMIT", 2):
+            orch._on_worker_done("1", entry["ref"], runner.DONE_DEFERRED)
+        self.assertIn("1", orch.blocked)
+        self.assertIn("control-plane deferral limit exceeded",
+                      orch.blocked["1"]["error"])
+
+    def test_capacity_wait_past_control_limit_still_queues_other_issue(self):
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        orch.max_concurrent_agents = 1
+        orch.running["occupied"] = {"issue": _issue("occupied")}
+        metadata = {
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "error": "no available orchestrator slots",
+        }
+        for _index in range(31):
+            orch._handle_active_retry(_issue("1"), 2, metadata, settings)
+        self.assertNotIn("1", orch.blocked)
+        retry = orch.retry_attempts["1"]
+        self.assertEqual(retry["attempt"], 2)
+        self.assertEqual(retry["control_policy"], "wait")
+        self.assertEqual(retry["wait_attempt"], 31)
+        self.assertEqual(retry["bounded_attempt"], 0)
+        retry["timer"].cancel()
+
+        orch.running.clear()
+        with patch.object(orch, "_dispatch_issue") as dispatch:
+            orch._choose_issues([_issue("1"), _issue("2")], settings)
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[0].id, "2")
+
+    def test_permanent_prestart_error_blocks_without_control_retry(self):
+        from symphony.agent import runner
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        issue = _issue("1")
+        handle = runner.RunHandle()
+        handle.defer(
+            "missing_pi_command: None",
+            retryable=False,
+            code="missing_pi_command")
+        orch.running["1"] = {
+            "ref": 1,
+            "handle": handle,
+            "identifier": issue.identifier,
+            "issue": issue,
+        }
+        orch.claimed.add("1")
+        with patch.object(orch, "_schedule_control_retry") as schedule:
+            orch._on_worker_done("1", 1, runner.DONE_DEFERRED)
+        schedule.assert_not_called()
+        self.assertIn("1", orch.blocked)
+        self.assertIn("blocked before start", orch.blocked["1"]["error"])
+        self.assertEqual(
+            orch.blocked["1"]["deferred_code"], "missing_pi_command")
+
+    def test_live_run_lease_deferral_uses_wait_policy(self):
+        from symphony.agent import runner
+        settings = self._limited_settings(2)
+        orch = _orchestrator(settings)
+        issue = _issue("1")
+        handle = runner.RunHandle()
+        handle.defer(
+            "workspace run lease is held by another live process",
+            retryable=True,
+            code="run_lease_held",
+            wait=True)
+        orch.running["1"] = {
+            "ref": 1,
+            "handle": handle,
+            "identifier": issue.identifier,
+            "issue": issue,
+        }
+        with patch.object(orch, "_schedule_control_retry") as schedule:
+            orch._on_worker_done("1", 1, runner.DONE_DEFERRED)
+        self.assertEqual(schedule.call_args.kwargs["policy"], "wait")
+        self.assertNotIn("1", orch.blocked)
+
     def test_continuation_is_not_blocked_by_retry_limit(self):
         settings = self._limited_settings(2)
         orch = _orchestrator(settings)
@@ -297,6 +586,98 @@ class ReconciliationTest(unittest.TestCase):
         self.assertNotIn("1", orch.claimed)
 
 
+class StopLifecycleTest(unittest.TestCase):
+    def test_timeout_forces_pi_and_cleanup_runs_after_runner_exit(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+        forced = threading.Event()
+
+        class Handle:
+            cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+            def force_terminate(self):
+                forced.set()
+                return True
+
+            def termination_is_confirmed(self):
+                return True
+
+        handle = Handle()
+        thread = threading.Thread(target=lambda: forced.wait(2), daemon=True)
+        thread.start()
+        entry = {
+            "ref": 1,
+            "thread": thread,
+            "handle": handle,
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "started_at": datetime.datetime.now(datetime.timezone.utc),
+        }
+        orch.running["1"] = entry
+        orch.claimed.add("1")
+
+        def assert_exited_then_cleanup(*_args, **_kwargs):
+            self.assertFalse(thread.is_alive())
+            self.assertIn("1", orch.running)
+            self.assertIn("1", orch.claimed)
+
+        with patch.object(orchestrator, "STOP_GRACE_S", 0.01), \
+                patch.object(orchestrator, "STOP_FORCE_WAIT_S", 1.0), \
+                patch.object(orch, "_cleanup_issue_workspace",
+                             side_effect=assert_exited_then_cleanup):
+            self.assertTrue(
+                orch._terminate_running_issue("1", True, settings))
+        self.assertTrue(handle.cancelled)
+        self.assertTrue(forced.is_set())
+        self.assertNotIn("1", orch.running)
+        self.assertNotIn("1", orch.claimed)
+
+    def test_exited_runner_rechecks_unconfirmed_pi_termination(self):
+        orch = _orchestrator()
+        settings = orch._store.settings()
+
+        class Handle:
+            def __init__(self):
+                self.force_calls = 0
+                self.confirmed = False
+
+            def cancel(self):
+                pass
+
+            def force_terminate(self):
+                self.force_calls += 1
+                self.confirmed = True
+                return True
+
+            def termination_is_confirmed(self):
+                return self.confirmed
+
+        handle = Handle()
+        thread = threading.Thread(target=lambda: None, daemon=True)
+        thread.start()
+        thread.join()
+        entry = {
+            "ref": 1,
+            "thread": thread,
+            "handle": handle,
+            "identifier": "GH-1",
+            "issue": _issue("1"),
+            "termination_unconfirmed": True,
+            "started_at": datetime.datetime.now(datetime.timezone.utc),
+        }
+        orch.running["1"] = entry
+        orch.claimed.add("1")
+
+        self.assertTrue(
+            orch._terminate_running_issue("1", False, settings))
+        self.assertEqual(handle.force_calls, 1)
+        self.assertNotIn("1", orch.running)
+        self.assertNotIn("1", orch.claimed)
+
+
 class TokenDeltaTest(unittest.TestCase):
     def test_turn_completed_usage(self):
         orch = _orchestrator()
@@ -339,7 +720,7 @@ class StallTest(unittest.TestCase):
         settings.codex.stall_timeout_ms = 1000
         orch._reconcile_stalled_running_issues(settings)
         self.assertNotIn("1", orch.running)
-        self.assertNotIn("1", orch.claimed)
+        self.assertIn("1", orch.claimed)
         self.assertIn("1", orch.retry_attempts)
         self.assertIn("stalled", orch.retry_attempts["1"]["error"])
         orch.retry_attempts["1"]["timer"].cancel()
@@ -372,6 +753,23 @@ class _FakeHandle:
     def cancel(self):
         self.cancelled = True
 
+    def has_started(self):
+        return True
+
+    def force_terminate(self):
+        return True
+
+    def termination_is_confirmed(self):
+        return True
+
+
+class _FakeLease:
+    def __init__(self):
+        self.released = False
+
+    def release(self):
+        self.released = True
+
 
 class RunnerContinuationTest(unittest.TestCase):
     """The run loop ends on refreshed local state, not on cached data."""
@@ -388,7 +786,8 @@ class RunnerContinuationTest(unittest.TestCase):
                                "rework"], required_labels=[]),
             runtime=SimpleNamespace(kind="pi"),
             agent=SimpleNamespace(max_turns=2),
-            worker=SimpleNamespace(ssh_hosts=[]))
+            worker=SimpleNamespace(ssh_hosts=[]),
+            workspace=SimpleNamespace(root="unused"))
         done, turns = [], []
         with patch.object(runner.tracker_adapter, "begin_run_issue",
                           return_value="ok"), \
@@ -398,6 +797,8 @@ class RunnerContinuationTest(unittest.TestCase):
              patch.object(runner.tracker_adapter, "routable",
                           return_value=True), \
              patch.object(runner, "_workflow_path", return_value=None), \
+             patch.object(runner.workspace_mod, "acquire_run_lease",
+                          return_value=_FakeLease()), \
              patch.object(runner.workspace_mod, "create_for_issue",
                           return_value="ws"), \
              patch.object(runner.workspace_mod, "run_before_run",
@@ -408,7 +809,7 @@ class RunnerContinuationTest(unittest.TestCase):
              patch.object(runner.pi_runtime, "start_session",
                           return_value="sess"), \
              patch.object(runner.pi_runtime, "stop_session",
-                          return_value=None), \
+                          return_value=True), \
              patch.object(runner.pi_runtime, "run_turn",
                           side_effect=lambda *a, **k:
                           turns.append(1) or {"session_id": "s1"}):
@@ -432,6 +833,208 @@ class RunnerContinuationTest(unittest.TestCase):
         done, turns = self._run_with_state(_issue("1"))
         self.assertEqual(len(turns), 2)  # max_turns=2, issue stays active
         self.assertEqual(done[0][1], "normal")
+
+
+class RunnerDeferralTest(unittest.TestCase):
+    def test_only_temporary_http_statuses_are_retryable(self):
+        from symphony.agent import runner
+        self.assertTrue(runner._deferral_is_retryable(
+            WorkflowError(
+                "linear_api_http_error", {"status": 503})))
+        self.assertTrue(runner._deferral_is_retryable(
+            WorkflowError(
+                "linear_api_http_error", {"status": 429})))
+        self.assertFalse(runner._deferral_is_retryable(
+            WorkflowError(
+                "linear_api_http_error", {"status": 401})))
+        self.assertFalse(runner._deferral_is_retryable(
+            WorkflowError("unsupported_runtime_kind", "codex")))
+
+    def test_temporary_tracker_error_is_retryable(self):
+        from symphony.agent import runner
+        issue = _issue("1")
+        done = []
+        handle = runner.RunHandle()
+        lease = _FakeLease()
+        with patch.object(
+                runner.workspace_mod, "acquire_run_lease",
+                return_value=lease), \
+                patch.object(
+                    runner.tracker_adapter, "begin_run_issue",
+                    side_effect=WorkflowError(
+                        "linear_api_request", "offline")):
+            runner.run(
+                issue, _settings(), lambda *args: None,
+                lambda *args: done.append(args), handle)
+        self.assertEqual(done, [(issue.id, runner.DONE_DEFERRED)])
+        self.assertTrue(handle.deferred_retryable)
+        self.assertEqual(handle.deferred_policy, "bounded")
+        self.assertEqual(handle.deferred_code, "linear_api_request")
+        self.assertTrue(lease.released)
+
+    def test_missing_runtime_command_is_permanent(self):
+        from symphony.agent import runner
+        issue = _issue("1")
+        settings = _settings()
+        settings.runtime.kind = "pi"
+        done = []
+        handle = runner.RunHandle()
+        lease = _FakeLease()
+        with patch.object(
+                runner.workspace_mod, "acquire_run_lease",
+                return_value=lease), \
+                patch.object(
+                    runner.tracker_adapter, "begin_run_issue",
+                    return_value="ok"), \
+                patch.object(
+                    runner.workspace_mod, "create_for_issue",
+                    return_value="workspace"), \
+                patch.object(
+                    runner.workspace_mod, "run_before_run",
+                    return_value="workspace"), \
+                patch.object(
+                    runner.workspace_mod, "run_after_run",
+                    return_value=None), \
+                patch.object(
+                    runner.pi_runtime, "start_session",
+                    side_effect=WorkflowError("missing_pi_command")):
+            runner.run(
+                issue, settings, lambda *args: None,
+                lambda *args: done.append(args), handle)
+        self.assertEqual(done, [(issue.id, runner.DONE_DEFERRED)])
+        self.assertFalse(handle.deferred_retryable)
+        self.assertEqual(handle.deferred_policy, "permanent")
+        self.assertEqual(handle.deferred_code, "missing_pi_command")
+        self.assertTrue(lease.released)
+
+    def test_post_popen_setup_failure_consumes_execution_budget(self):
+        from symphony.agent import runner
+        issue = _issue("1")
+        settings = _settings()
+        settings.runtime.kind = "pi"
+        done = []
+        handle = runner.RunHandle()
+        lease = _FakeLease()
+        with patch.object(
+                runner.workspace_mod, "acquire_run_lease",
+                return_value=lease), \
+                patch.object(
+                    runner.tracker_adapter, "begin_run_issue",
+                    return_value="ok"), \
+                patch.object(
+                    runner.workspace_mod, "create_for_issue",
+                    return_value="workspace"), \
+                patch.object(
+                    runner.workspace_mod, "run_before_run",
+                    return_value="workspace"), \
+                patch.object(
+                    runner.workspace_mod, "run_after_run",
+                    return_value=None), \
+                patch.object(
+                    runner.pi_runtime, "start_session",
+                    side_effect=runner.pi_runtime.PiStartupError(
+                        "pi_started_then_failed", "lease write failed")), \
+                patch.object(
+                    runner.tracker_adapter, "record_issue_failure"):
+            runner.run(
+                issue, settings, lambda *args: None,
+                lambda *args: done.append(args), handle)
+        self.assertEqual(len(done), 1)
+        self.assertNotEqual(done[0][1], runner.DONE_DEFERRED)
+        self.assertIn("pi_started_then_failed", done[0][1])
+        self.assertTrue(handle.has_started())
+
+    def test_post_start_temporary_refresh_failure_is_control_deferral(self):
+        from types import SimpleNamespace
+        from symphony.agent import runner
+        issue = _issue("1")
+        settings = SimpleNamespace(
+            tracker=SimpleNamespace(
+                active_states=["open"], required_labels=[]),
+            runtime=SimpleNamespace(kind="pi"),
+            agent=SimpleNamespace(max_turns=1),
+            worker=SimpleNamespace(ssh_hosts=[]),
+            workspace=SimpleNamespace(root="unused"))
+        done = []
+        handle = runner.RunHandle()
+        lease = _FakeLease()
+        with patch.object(
+                runner.workspace_mod, "acquire_run_lease",
+                return_value=lease), \
+                patch.object(
+                    runner.tracker_adapter, "begin_run_issue",
+                    return_value="ok"), \
+                patch.object(
+                    runner.workspace_mod, "create_for_issue",
+                    return_value="workspace"), \
+                patch.object(
+                    runner.workspace_mod, "run_before_run",
+                    return_value=None), \
+                patch.object(
+                    runner.workspace_mod, "run_after_run",
+                    return_value=None), \
+                patch.object(
+                    runner, "_build_turn_prompt",
+                    return_value="prompt"), \
+                patch.object(
+                    runner.pi_runtime, "start_session",
+                    return_value="session"), \
+                patch.object(
+                    runner.pi_runtime, "stop_session",
+                    return_value=True) as stop_session, \
+                patch.object(
+                    runner.pi_runtime, "run_turn",
+                    return_value={"session_id": "s1"}), \
+                patch.object(
+                    runner.tracker_adapter, "fetch_issues_by_ids",
+                    side_effect=WorkflowError(
+                        "linear_api_request", "offline")), \
+                patch.object(
+                    runner.tracker_adapter,
+                    "record_issue_failure") as record_failure:
+            runner.run(
+                issue, settings, lambda *args: None,
+                lambda *args: done.append(args), handle)
+        self.assertEqual(done, [(issue.id, runner.DONE_DEFERRED)])
+        self.assertTrue(handle.has_started())
+        self.assertTrue(handle.deferred_retryable)
+        self.assertEqual(handle.deferred_policy, "bounded")
+        self.assertEqual(handle.deferred_code, "linear_api_request")
+        self.assertTrue(lease.released)
+        stop_session.assert_called_once_with("session")
+        record_failure.assert_not_called()
+        self.assertTrue(lease.released)
+
+    def test_successful_stop_restores_termination_confirmation(self):
+        from symphony.agent import runner
+
+        issue = _issue("1")
+        settings = _settings()
+        settings.runtime.kind = "pi"
+        handle = runner.RunHandle()
+        lease = _FakeLease()
+        session = object()
+        handle.set_lease(lease)
+        handle.mark_termination_unconfirmed()
+
+        with patch.object(
+                runner.pi_runtime, "start_session",
+                return_value=session), \
+                patch.object(
+                    runner.pi_runtime, "stop_session",
+                    return_value=True), \
+                patch.object(
+                    runner, "_do_run_turns",
+                    return_value=runner.DONE_NORMAL):
+            outcome = runner._run_agent_turns(
+                "workspace", issue, settings, lambda *args: None,
+                handle, None, None)
+
+        self.assertEqual(outcome, runner.DONE_NORMAL)
+        self.assertIsNone(handle.session)
+        self.assertTrue(handle.termination_is_confirmed())
+        handle.release_confirmed_lease()
+        self.assertTrue(lease.released)
 
 
 class SnapshotShapeTest(unittest.TestCase):

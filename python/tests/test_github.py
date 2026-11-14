@@ -59,6 +59,31 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(issue.labels, ["agent", "bug"])
 
 
+class ResponseMetadataTest(unittest.TestCase):
+    def test_rate_limit_delay_prefers_retry_after(self):
+        self.assertEqual(
+            client.retry_after_seconds({"Retry-After": "42"}), 42.0)
+
+    def test_rate_limit_delay_uses_reset_when_quota_is_exhausted(self):
+        headers = {
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": "200",
+        }
+        self.assertEqual(
+            client.retry_after_seconds(headers, now=170), 30.0)
+
+    def test_untrusted_header_error_text_is_not_exposed(self):
+        metadata = client._response_metadata({
+            "Retry-After": "12",
+            "X-RateLimit-Reset": "100",
+            "Set-Cookie": "private",
+        })
+        self.assertEqual(metadata, {
+            "Retry-After": "12",
+            "X-RateLimit-Reset": "100",
+        })
+
+
 class AllowRequestTest(unittest.TestCase):
     """github_api policy: configured-repo boundary + method/body allowlist."""
 

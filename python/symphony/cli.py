@@ -94,6 +94,7 @@ def main(argv=None):
     orchestrator = Orchestrator(store, session_reporter=reporter)
     orchestrator.start()
     delivery = DeliveryController(store, session_reporter=reporter).start()
+    orchestrator.delivery_controller = delivery
     server = http_api.start(orchestrator, store, path, host, port)
 
     stop = {"flag": False}

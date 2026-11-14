@@ -76,17 +76,32 @@ def _load_record(settings, issue_id):
 
 def _save_record(settings, record):
     path = _state_path(settings, record["issue_id"])
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    temp = path + ".tmp"
-    with open(temp, "w", encoding="utf-8") as handle:
-        json.dump(record, handle, ensure_ascii=False)
-        handle.flush()
-        os.fsync(handle.fileno())
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
     try:
-        os.chmod(temp, 0o600)
+        os.chmod(directory, 0o700)
     except OSError:
         pass
-    os.replace(temp, path)
+    temp = "%s.tmp.%d.%s" % (path, os.getpid(), uuid.uuid4().hex)
+    try:
+        with open(temp, "x", encoding="utf-8") as handle:
+            json.dump(record, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(temp, 0o600)
+        except OSError:
+            pass
+        os.replace(temp, path)
+    finally:
+        try:
+            os.remove(temp)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            log.warning(
+                "Unable to remove temporary agent-session record path=%s "
+                "error=%s", temp, error)
 
 
 def _external_urls(issue, extra=None):

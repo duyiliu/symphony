@@ -680,6 +680,9 @@ def state_payload(orchestrator):
     reporter = getattr(orchestrator, "session_reporter", None)
     if reporter is not None:
         result["agent_sessions"] = reporter.snapshot()
+    delivery_controller = getattr(orchestrator, "delivery_controller", None)
+    if delivery_controller is not None:
+        result["delivery"] = delivery_controller.snapshot()
     return result
 
 

@@ -28,7 +28,12 @@ from .workflow import WorkflowError
 log = logging.getLogger("symphony.orchestrator")
 
 CONTINUATION_RETRY_DELAY_MS = 1_000
+CONTROL_RETRY_DELAY_MS = 1_000
+CONTROL_RETRY_MAX_MS = 30_000
+CONTROL_DEFERRAL_LIMIT = 30
 FAILURE_RETRY_BASE_MS = 10_000
+STOP_GRACE_S = 2.0
+STOP_FORCE_WAIT_S = 3.0
 
 _EMPTY_TOTALS = {
     "input_tokens": 0,
@@ -36,6 +41,11 @@ _EMPTY_TOTALS = {
     "total_tokens": 0,
     "seconds_running": 0,
 }
+
+
+class _WorkspaceIssue:
+    def __init__(self, identifier):
+        self.identifier = identifier
 
 
 def _now():
@@ -129,7 +139,16 @@ class Orchestrator:
         for entry in list(self.running.values()):
             thread = entry.get("thread")
             if thread:
-                thread.join(timeout=10)
+                thread.join(timeout=STOP_GRACE_S)
+                if thread.is_alive():
+                    handle = entry.get("handle")
+                    if handle:
+                        handle.force_terminate()
+                    thread.join(timeout=STOP_FORCE_WAIT_S)
+                if thread.is_alive():
+                    log.error(
+                        "Agent runner still alive during orchestrator stop: "
+                        "issue_id=%s", entry.get("identifier"))
 
     # -- public API (thread-safe) -----------------------------------------
 
@@ -383,6 +402,7 @@ class Orchestrator:
             and issue.id not in self.claimed
             and issue.id not in self.running
             and issue.id not in self.blocked
+            and issue.id not in self.retry_attempts
             and self._available_slots() > 0
             and self._state_slots_available(issue, settings)
             and self._worker_slots_available(settings)
@@ -464,7 +484,9 @@ class Orchestrator:
             return ("skip", refreshed)
         return refreshed
 
-    def _spawn_issue(self, issue, settings, attempt, worker_host):
+    def _spawn_issue(self, issue, settings, attempt, worker_host,
+                     control_state=None):
+        control_state = control_state or {}
         ref = self._new_token()
         handle = agent_runner.RunHandle()
 
@@ -512,35 +534,43 @@ class Orchestrator:
             "codex_last_reported_total_tokens": 0,
             "turn_count": 0,
             "retry_attempt": attempt if isinstance(attempt, int) and attempt > 0 else 0,
+            "control_attempt": control_state.get("control_attempt", 0),
+            "bounded_attempt": control_state.get("bounded_attempt", 0),
+            "wait_attempt": control_state.get("wait_attempt", 0),
+            "control_policy": control_state.get("control_policy"),
+            "deferred_code": control_state.get("deferred_code"),
+            "stop_requested": None,
             "started_at": _now(),
         }
+        # Register ownership before the worker can enqueue worker_done. The
+        # mailbox event may arrive immediately, but it is not handled until
+        # this method returns; the running entry must already exist by then.
+        self.running[issue.id] = entry
+        self.claimed.add(issue.id)
         try:
             thread.start()
         except Exception as error:  # noqa: BLE001
             log.error("Unable to spawn agent for %s: %r", _issue_context(issue), error)
-            next_attempt = (attempt + 1) if isinstance(attempt, int) and attempt > 0 else 1
-            if self._retry_limit_exceeded(next_attempt, settings):
-                block_error = self._retry_limit_error(
-                    next_attempt, settings, "failed to spawn agent: %r" % error)
-                self._block_issue_from_entry(issue.id, {
-                    "identifier": issue.identifier,
-                    "issue": issue,
-                    "worker_host": worker_host,
-                }, block_error)
-                return
-            self._schedule_issue_retry(issue.id, attempt + 1 if attempt else None, {
+            self.running.pop(issue.id, None)
+            execution_attempt = (
+                attempt if isinstance(attempt, int) and attempt > 0 else 0)
+            self._schedule_control_retry(issue.id, execution_attempt, {
                 "identifier": issue.identifier,
                 "issue_url": issue.url,
                 "error": "failed to spawn agent: %r" % error,
+                "issue": issue,
+                "control_attempt": control_state.get("control_attempt", 0),
+                "bounded_attempt": control_state.get("bounded_attempt", 0),
+                "wait_attempt": control_state.get("wait_attempt", 0),
+                "control_policy": "bounded",
+                "deferred_code": control_state.get("deferred_code"),
                 "worker_host": worker_host,
-            }, settings)
+            }, settings, policy="bounded")
             return
 
         log.info(
             "Agent runner spawned for issue: %s attempt=%r worker_host=%s",
             _issue_context(issue), attempt, worker_host or "local")
-        self.running[issue.id] = entry
-        self.claimed.add(issue.id)
         self.retry_attempts.pop(issue.id, None)
         if self.session_reporter:
             self.session_reporter.started(
@@ -551,6 +581,11 @@ class Orchestrator:
     def _on_worker_done(self, issue_id, ref, reason):
         entry = self.running.get(issue_id)
         if entry is None or entry.get("ref") != ref:
+            return
+        if entry.get("stop_requested"):
+            entry["thread_exited"] = True
+            self._record_session_completion_totals(entry)
+            self._finalize_stopped_issue(issue_id, entry)
             return
         entry = self.running.pop(issue_id)
         self._record_session_completion_totals(entry)
@@ -563,6 +598,64 @@ class Orchestrator:
                 "Agent run skipped for issue_id=%s: task not in an active "
                 "state; releasing claim", issue_id)
             self._release_issue_claim(issue_id)
+        elif reason == agent_runner.DONE_DEFERRED:
+            handle = entry.get("handle")
+            deferred_reason = getattr(handle, "deferred_reason", None) \
+                or "agent execution deferred by control plane"
+            retryable = getattr(handle, "deferred_retryable", True)
+            deferred_code = getattr(handle, "deferred_code", None)
+            deferral_policy = getattr(
+                handle, "deferred_policy", "bounded" if retryable else "permanent")
+            if retryable is False:
+                error = (
+                    "agent execution blocked before start: %s"
+                    % deferred_reason)
+                log.error(
+                    "Agent execution has a local permanent error for "
+                    "issue_id=%s: %s", issue_id, deferred_reason)
+                self._block_issue_from_entry(
+                    issue_id, entry, error, deferred_code=deferred_code)
+                return
+            log.warning(
+                "Agent execution deferred for issue_id=%s: %s",
+                issue_id, deferred_reason)
+            self.claimed.add(issue_id)
+            self._schedule_control_retry(
+                issue_id,
+                entry.get("retry_attempt")
+                if isinstance(entry.get("retry_attempt"), int) else 0,
+                {
+                    "identifier": entry.get("identifier"),
+                    "issue_url": entry["issue"].url if entry.get("issue") else None,
+                    "error": deferred_reason,
+                    "deferred_code": deferred_code,
+                    "issue": entry.get("issue"),
+                    "control_attempt": entry.get("control_attempt", 0),
+                    "bounded_attempt": entry.get("bounded_attempt", 0),
+                    "wait_attempt": entry.get("wait_attempt", 0),
+                    "control_policy": deferral_policy,
+                    "worker_host": entry.get("worker_host"),
+                    "workspace_path": entry.get("workspace_path"),
+                },
+                policy=deferral_policy)
+        elif reason == agent_runner.DONE_CANCELLED:
+            # Host cancellation does not spend the Agent execution retry budget.
+            self.claimed.add(issue_id)
+            self._schedule_control_retry(
+                issue_id,
+                entry.get("retry_attempt")
+                if isinstance(entry.get("retry_attempt"), int) else 0,
+                {
+                    "identifier": entry.get("identifier"),
+                    "issue_url": entry["issue"].url if entry.get("issue") else None,
+                    "error": "agent execution cancelled",
+                    "issue": entry.get("issue"),
+                    "worker_host": entry.get("worker_host"),
+                    "workspace_path": entry.get("workspace_path"),
+                },
+                policy="wait")
+        elif reason == agent_runner.DONE_TERMINATION_UNCONFIRMED:
+            self._record_termination_unconfirmed(issue_id, entry)
         elif reason == agent_runner.DONE_NORMAL:
             if self._input_required_blocker(entry):
                 self._block_input_required(issue_id, entry, session_id, "normal")
@@ -592,7 +685,12 @@ class Orchestrator:
         issue = entry.get("issue")
         if issue is None or not self.session_reporter:
             return
-        if reason == agent_runner.DONE_SKIPPED:
+        if reason in {
+                agent_runner.DONE_SKIPPED,
+                agent_runner.DONE_DEFERRED,
+                agent_runner.DONE_CANCELLED,
+                agent_runner.DONE_TERMINATION_UNCONFIRMED,
+        }:
             return
         normal = reason == agent_runner.DONE_NORMAL
         self.session_reporter.worker_finished(issue, normal)
@@ -704,6 +802,17 @@ class Orchestrator:
                 or previous.get("identifier") or issue_id,
             "issue_url": metadata.get("issue_url") or previous.get("issue_url"),
             "error": metadata.get("error") or previous.get("error"),
+            "control_attempt": metadata.get(
+                "control_attempt", previous.get("control_attempt", 0)),
+            "bounded_attempt": metadata.get(
+                "bounded_attempt", previous.get("bounded_attempt", 0)),
+            "wait_attempt": metadata.get(
+                "wait_attempt", previous.get("wait_attempt", 0)),
+            "control_policy": metadata.get("control_policy")
+                or previous.get("control_policy") or "bounded",
+            "deferred_code": metadata.get("deferred_code")
+                or previous.get("deferred_code"),
+            "issue": metadata.get("issue") or previous.get("issue"),
             "worker_host": metadata.get("worker_host") or previous.get("worker_host"),
             "workspace_path": metadata.get("workspace_path") or previous.get("workspace_path"),
         }
@@ -719,8 +828,60 @@ class Orchestrator:
             "Retrying issue_id=%s issue_identifier=%s in %dms (attempt %d)%s",
             issue_id, entry["identifier"], delay_ms, next_attempt, error_suffix)
 
+    def _schedule_control_retry(self, issue_id, attempt, metadata, settings=None,
+                                policy="bounded"):
+        """Defer without spending execution attempts, but with a separate bound."""
+        metadata = dict(metadata or {})
+        policy = policy if policy in {"bounded", "wait"} else "bounded"
+        control_attempt = metadata.get("control_attempt")
+        if not isinstance(control_attempt, int) or control_attempt < 0:
+            previous = self.retry_attempts.get(issue_id, {})
+            control_attempt = previous.get("control_attempt")
+        if not isinstance(control_attempt, int) or control_attempt < 0:
+            control_attempt = 0
+        control_attempt += 1
+        metadata["control_attempt"] = control_attempt
+        metadata["control_policy"] = policy
+        count_key = "bounded_attempt" if policy == "bounded" else "wait_attempt"
+        policy_attempt = metadata.get(count_key)
+        if not isinstance(policy_attempt, int) or policy_attempt < 0:
+            previous = self.retry_attempts.get(issue_id, {})
+            policy_attempt = previous.get(count_key)
+        if not isinstance(policy_attempt, int) or policy_attempt < 0:
+            policy_attempt = 0
+        policy_attempt += 1
+        metadata[count_key] = policy_attempt
+        if policy == "bounded" and policy_attempt > CONTROL_DEFERRAL_LIMIT:
+            error = (
+                "control-plane deferral limit exceeded after %d deferrals: %s; "
+                "manual intervention required"
+                % (policy_attempt - 1, metadata.get("error")
+                   or "unknown control-plane failure"))
+            log.error(
+                "Control-plane deferral limit exceeded for issue_id=%s: %s",
+                issue_id, error)
+            self._block_issue_from_entry(issue_id, metadata, error)
+            return False
+        metadata["delay_type"] = "control"
+        self._schedule_issue_retry(issue_id, attempt, metadata, settings)
+        return True
+
     def _retry_delay(self, attempt, metadata, settings):
-        if metadata.get("delay_type") == "continuation" and attempt == 1:
+        delay_type = metadata.get("delay_type")
+        if delay_type == "control":
+            base_ms = max(
+                CONTROL_RETRY_DELAY_MS,
+                int(getattr(settings.polling, "interval_ms", 0) or 0))
+            if metadata.get("control_policy") == "wait":
+                return base_ms
+            bounded_attempt = metadata.get("bounded_attempt", 1)
+            if not isinstance(bounded_attempt, int) or bounded_attempt < 1:
+                bounded_attempt = 1
+            multiplier = 1 << min(bounded_attempt - 1, 5)
+            return min(
+                base_ms * multiplier,
+                max(base_ms, CONTROL_RETRY_MAX_MS))
+        if delay_type == "continuation" and attempt == 1:
             return CONTINUATION_RETRY_DELAY_MS
         return self._failure_retry_delay(attempt, settings)
 
@@ -758,6 +919,12 @@ class Orchestrator:
             "identifier": entry.get("identifier"),
             "issue_url": entry.get("issue_url"),
             "error": entry.get("error"),
+            "control_attempt": entry.get("control_attempt", 0),
+            "bounded_attempt": entry.get("bounded_attempt", 0),
+            "wait_attempt": entry.get("wait_attempt", 0),
+            "control_policy": entry.get("control_policy") or "bounded",
+            "deferred_code": entry.get("deferred_code"),
+            "issue": entry.get("issue"),
             "worker_host": entry.get("worker_host"),
             "workspace_path": entry.get("workspace_path"),
             "delay_type": entry.get("delay_type"),
@@ -771,7 +938,7 @@ class Orchestrator:
                 "Retry poll failed for issue_id=%s issue_identifier=%s: %r",
                 issue_id, metadata.get("identifier") or issue_id, error)
             metadata["error"] = "retry poll failed: %r" % error
-            self._schedule_issue_retry(issue_id, attempt + 1, metadata, settings)
+            self._schedule_control_retry(issue_id, attempt, metadata, settings)
             return
         issue = next(
             (candidate for candidate in issues if candidate.id == issue_id), None)
@@ -800,21 +967,7 @@ class Orchestrator:
         self._release_issue_claim(issue_id)
 
     def _handle_active_retry(self, issue, attempt, metadata, settings):
-        if metadata.get("delay_type") != "continuation" \
-                and self._retry_limit_exceeded(attempt, settings):
-            error = self._retry_limit_error(
-                attempt, settings,
-                metadata.get("error") or "retry limit reached before dispatch")
-            log.error(
-                "Retry limit exceeded before dispatch for %s; blocking: %s",
-                _issue_context(issue), error)
-            self._block_issue_from_entry(issue.id, {
-                "identifier": issue.identifier,
-                "issue": issue,
-                "worker_host": metadata.get("worker_host"),
-                "workspace_path": metadata.get("workspace_path"),
-            }, error)
-            return
+        metadata["issue"] = issue
         terminal = self._terminal_state_set(settings)
         active = self._active_state_set(settings)
         slots = self._candidate_issue(issue, active, terminal, settings) and (
@@ -822,12 +975,29 @@ class Orchestrator:
             and self._state_slots_available(issue, settings)
             and self._worker_slots_available(settings, metadata.get("worker_host")))
         if slots:
+            if metadata.get("delay_type") not in {"continuation", "control"} \
+                    and self._retry_limit_exceeded(attempt, settings):
+                error = self._retry_limit_error(
+                    attempt, settings,
+                    metadata.get("error")
+                    or "retry limit reached before dispatch")
+                log.error(
+                    "Retry limit exceeded before dispatch for %s; blocking: %s",
+                    _issue_context(issue), error)
+                self._block_issue_from_entry(issue.id, {
+                    "identifier": issue.identifier,
+                    "issue": issue,
+                    "worker_host": metadata.get("worker_host"),
+                    "workspace_path": metadata.get("workspace_path"),
+                }, error)
+                return
             refreshed = self._refresh_issue_for_dispatch(issue, settings)
             if isinstance(refreshed, tuple) and refreshed[0] == "error":
                 metadata["identifier"] = issue.identifier
                 metadata["error"] = \
                     "retry dispatch refresh failed: %r" % (refreshed[1],)
-                self._schedule_issue_retry(issue.id, attempt + 1, metadata, settings)
+                self._schedule_control_retry(
+                    issue.id, attempt, metadata, settings)
                 return
             if not hasattr(refreshed, "id"):
                 stale = refreshed[1] if isinstance(refreshed, tuple) else None
@@ -840,16 +1010,26 @@ class Orchestrator:
                   _issue_context(issue))
         metadata["identifier"] = issue.identifier
         metadata["error"] = "no available orchestrator slots"
-        self._schedule_issue_retry(issue.id, attempt + 1, metadata, settings)
+        self._schedule_control_retry(
+            issue.id, attempt, metadata, settings, policy="wait")
 
     def _dispatch_refreshed(self, issue, settings, attempt, metadata):
         worker_host = self._select_worker_host(settings, metadata.get("worker_host"))
         if worker_host == "no_worker_capacity":
             metadata["identifier"] = issue.identifier
             metadata["error"] = "no available orchestrator slots"
-            self._schedule_issue_retry(issue.id, attempt + 1, metadata, settings)
+            self._schedule_control_retry(
+                issue.id, attempt, metadata, settings, policy="wait")
             return
-        self._spawn_issue(issue, settings, attempt, worker_host)
+        self._spawn_issue(
+            issue, settings, attempt, worker_host,
+            control_state={
+                "control_attempt": metadata.get("control_attempt", 0),
+                "bounded_attempt": metadata.get("bounded_attempt", 0),
+                "wait_attempt": metadata.get("wait_attempt", 0),
+                "control_policy": metadata.get("control_policy"),
+                "deferred_code": metadata.get("deferred_code"),
+            })
 
     def _release_issue_claim(self, issue_id):
         self.claimed.discard(issue_id)
@@ -999,6 +1179,10 @@ class Orchestrator:
         for issue_id, entry in list(self.running.items()):
             if issue_id in self.blocked:
                 continue
+            handle = entry.get("handle")
+            if handle is not None and hasattr(handle, "has_started") \
+                    and not handle.has_started():
+                continue
             last = entry.get("last_codex_timestamp") or entry.get("started_at")
             if not isinstance(last, datetime.datetime):
                 continue
@@ -1015,7 +1199,6 @@ class Orchestrator:
                     "Issue blocked: issue_id=%s issue_identifier=%s session_id=%s "
                     "elapsed_ms=%s; %s", issue_id, identifier, session_id,
                     elapsed_ms, error)
-                self._record_session_completion_totals(entry)
                 self._stop_and_block_issue(issue_id, entry, error)
             else:
                 log.warning(
@@ -1031,15 +1214,25 @@ class Orchestrator:
                         "Issue stalled and retry limit exceeded: issue_id=%s "
                         "issue_identifier=%s session_id=%s; blocking: %s",
                         issue_id, identifier, session_id, error)
-                    self._record_session_completion_totals(entry)
                     self._stop_and_block_issue(issue_id, entry, error)
                 else:
-                    self._terminate_running_issue(issue_id, False, settings)
-                    self._schedule_issue_retry(issue_id, next_attempt, {
-                        "identifier": identifier,
-                        "issue_url": entry["issue"].url if entry.get("issue") else None,
-                        "error": "stalled for %dms without codex activity" % elapsed_ms,
-                    })
+                    self._request_running_issue_stop(
+                        issue_id, entry,
+                        {
+                            "kind": "retry",
+                            "attempt": next_attempt,
+                            "metadata": {
+                                "identifier": identifier,
+                                "issue_url": entry["issue"].url
+                                if entry.get("issue") else None,
+                                "error": (
+                                    "stalled for %dms without codex activity"
+                                    % elapsed_ms),
+                                "worker_host": entry.get("worker_host"),
+                                "workspace_path": entry.get("workspace_path"),
+                            },
+                        },
+                        settings)
 
     def _log_missing_running_issue(self, issue_id):
         entry = self.running.get(issue_id)
@@ -1057,49 +1250,193 @@ class Orchestrator:
         entry = self.running.get(issue_id)
         if entry is None:
             self._release_issue_claim(issue_id)
-            return
-        self._record_session_completion_totals(entry)
+            return True
+        return self._request_running_issue_stop(
+            issue_id, entry,
+            {"kind": "release", "cleanup_workspace": bool(cleanup_workspace)},
+            settings)
+
+    def _stop_and_block_issue(self, issue_id, entry, error):
+        self._request_running_issue_stop(
+            issue_id, entry, {"kind": "block", "error": error},
+            self._store.settings())
+
+    def _request_running_issue_stop(self, issue_id, entry, action, settings):
+        """Request stop and defer state release until the runner has exited."""
+        current = entry.get("stop_requested")
+        if current is None:
+            entry["stop_requested"] = action
+        elif action.get("kind") == "release" \
+                and action.get("cleanup_workspace") is True:
+            current["cleanup_workspace"] = True
+
         handle = entry.get("handle")
         if handle:
             handle.cancel()
-        if cleanup_workspace:
+
+        thread = entry.get("thread")
+        is_current = self.running.get(issue_id) is entry
+        if thread is not None:
+            thread.join(timeout=STOP_GRACE_S)
+            if thread.is_alive():
+                log.warning(
+                    "Agent did not stop within %.1fs; force-terminating Pi "
+                    "process tree issue_id=%s identifier=%s",
+                    STOP_GRACE_S, issue_id, entry.get("identifier"))
+                confirmed = handle.force_terminate() \
+                    if handle is not None and hasattr(handle, "force_terminate") \
+                    else False
+                if not confirmed:
+                    if is_current:
+                        self.running[issue_id] = entry
+                    entry["termination_unconfirmed"] = True
+                    log.error(
+                        "Forced Pi termination was not confirmed; retaining "
+                        "claim and slot issue_id=%s identifier=%s",
+                        issue_id, entry.get("identifier"))
+                    return False
+                thread.join(timeout=STOP_FORCE_WAIT_S)
+            if thread.is_alive():
+                if is_current:
+                    self.running[issue_id] = entry
+                entry["termination_unconfirmed"] = True
+                log.error(
+                    "Agent runner did not exit after forced termination; "
+                    "retaining claim and slot issue_id=%s identifier=%s",
+                    issue_id, entry.get("identifier"))
+                return False
+        if handle is not None \
+                and hasattr(handle, "termination_is_confirmed") \
+                and not handle.termination_is_confirmed():
+            # A worker can exit after reporting unconfirmed termination. Keep
+            # probing the retained session so capacity is not leaked forever
+            # once the orphan eventually dies.
+            confirmed = handle.force_terminate() \
+                if hasattr(handle, "force_terminate") else False
+            if not confirmed:
+                if is_current:
+                    self.running[issue_id] = entry
+                entry["termination_unconfirmed"] = True
+                log.error(
+                    "Pi termination remains unconfirmed; retaining claim and "
+                    "slot issue_id=%s identifier=%s",
+                    issue_id, entry.get("identifier"))
+                return False
+
+        entry["thread_exited"] = True
+        if is_current:
+            self._record_session_completion_totals(entry)
+            self._finalize_stopped_issue(issue_id, entry, settings)
+        elif action.get("kind") == "block":
+            self._block_issue_from_entry(
+                issue_id, entry, action.get("error") or "agent stopped")
+        elif action.get("kind") == "retry":
+            self.claimed.add(issue_id)
+            self._schedule_issue_retry(
+                issue_id, action.get("attempt"),
+                action.get("metadata") or {}, settings)
+        return True
+
+    def _finalize_stopped_issue(self, issue_id, entry, settings=None):
+        if self.running.get(issue_id) is not entry:
+            return
+        settings = settings or self._store.settings()
+        handle = entry.get("handle")
+        if handle is not None and hasattr(handle, "termination_is_confirmed") \
+                and not handle.termination_is_confirmed():
+            entry["termination_unconfirmed"] = True
+            log.error(
+                "Pi termination is still unconfirmed; retaining claim and slot "
+                "issue_id=%s identifier=%s",
+                issue_id, entry.get("identifier"))
+            return
+        if handle is not None and hasattr(handle, "release_confirmed_lease"):
+            handle.release_confirmed_lease()
+
+        action = entry.get("stop_requested") or {
+            "kind": "release", "cleanup_workspace": False}
+        kind = action.get("kind")
+        if kind == "block":
+            self._block_issue_from_entry(
+                issue_id, entry, action.get("error") or "agent stopped")
+            return
+        if kind == "retry":
+            self.running.pop(issue_id, None)
+            self.claimed.add(issue_id)
+            self._schedule_issue_retry(
+                issue_id,
+                action.get("attempt"),
+                action.get("metadata") or {},
+                settings)
+            return
+
+        if action.get("cleanup_workspace"):
             self._cleanup_issue_workspace(
                 entry.get("issue") or entry.get("identifier"), entry, settings)
         self.running.pop(issue_id, None)
-        self.claimed.discard(issue_id)
-        self.blocked.pop(issue_id, None)
-        retry = self.retry_attempts.pop(issue_id, None)
-        if retry and retry.get("timer"):
-            retry["timer"].cancel()
+        self._release_issue_claim(issue_id)
 
-    def _stop_and_block_issue(self, issue_id, entry, error):
-        handle = entry.get("handle")
-        if handle:
-            handle.cancel()
-        self._block_issue_from_entry(issue_id, entry, error)
+    def _record_termination_unconfirmed(self, issue_id, entry):
+        """Retain capacity and ownership when an orphan may still be alive."""
+        entry["termination_unconfirmed"] = True
+        entry.setdefault("stop_requested", {
+            "kind": "release", "cleanup_workspace": False})
+        self.running[issue_id] = entry
+        self.claimed.add(issue_id)
+        log.error(
+            "Keeping issue claim and slot because Pi termination is "
+            "unconfirmed issue_id=%s identifier=%s",
+            issue_id, entry.get("identifier"))
 
     def _cleanup_issue_workspace(self, issue_or_identifier, metadata, settings):
         workspace_path = (metadata or {}).get("workspace_path") \
             if isinstance(metadata, dict) else None
         worker_host = (metadata or {}).get("worker_host") \
             if isinstance(metadata, dict) else None
-        if present_string(workspace_path):
-            try:
-                workspace_mod.remove_recorded(
-                    settings, workspace_path, worker_host=worker_host,
-                    workflow_path=self._store.path)
-            except WorkflowError:
-                pass
-            return
-        identifiers = []
-        if hasattr(issue_or_identifier, "identifier"):
-            identifiers = [issue_or_identifier.identifier]
-        elif isinstance(issue_or_identifier, str):
-            identifiers = [issue_or_identifier]
-        if identifiers:
-            workspace_mod.remove_issue_workspaces(
-                settings, identifiers, workflow_path=self._store.path,
-                worker_host=worker_host)
+        if worker_host is not None:
+            return False
+        identifier = getattr(issue_or_identifier, "identifier", None)
+        if identifier is None and isinstance(issue_or_identifier, str):
+            identifier = issue_or_identifier
+        try:
+            if present_string(workspace_path):
+                lease_path = workspace_path
+            elif hasattr(issue_or_identifier, "identifier"):
+                lease_path = workspace_mod.workspace_path(
+                    settings, issue_or_identifier, self._store.path)
+            else:
+                lease_path = workspace_mod.workspace_path(
+                    settings, _WorkspaceIssue(identifier), self._store.path)
+            lease = workspace_mod.acquire_path_run_lease(
+                settings, lease_path,
+                issue_id=getattr(issue_or_identifier, "id", None),
+                identifier=identifier, workflow_path=self._store.path)
+        except Exception as error:  # noqa: BLE001 - cleanup is best effort
+            log.warning(
+                "Unable to acquire workspace cleanup lease identifier=%s "
+                "path=%s error=%r", identifier, workspace_path, error)
+            return False
+        if lease is None:
+            log.warning(
+                "Skipping workspace cleanup because its run lease is active "
+                "identifier=%s path=%s",
+                identifier, workspace_path)
+            return False
+        try:
+            if present_string(workspace_path):
+                try:
+                    return workspace_mod.remove_recorded(
+                        settings, workspace_path, worker_host=worker_host,
+                        workflow_path=self._store.path)
+                except WorkflowError:
+                    return False
+            if identifier:
+                return workspace_mod.remove_issue_workspaces(
+                    settings, [identifier], workflow_path=self._store.path,
+                    worker_host=worker_host)
+            return False
+        finally:
+            lease.release()
 
     def _run_terminal_workspace_cleanup(self):
         try:
@@ -1159,8 +1496,11 @@ class Orchestrator:
     def _record_session_completion_totals(self, entry):
         if not isinstance(entry, dict):
             return
+        if entry.get("session_completion_totals_recorded") is True:
+            return
         started = entry.get("started_at")
         if isinstance(started, datetime.datetime):
+            entry["session_completion_totals_recorded"] = True
             seconds = max(0, int((_now() - started).total_seconds()))
             self.codex_totals["seconds_running"] = max(
                 0, self.codex_totals.get("seconds_running", 0) + seconds)

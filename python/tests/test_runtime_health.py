@@ -61,6 +61,19 @@ class HealthTest(unittest.TestCase):
         self.orch._publish_snapshot()
         self.assertEqual(http_api.state_payload(self.orch)["health"]["status"], "degraded")
 
+    def test_state_payload_includes_delivery_backoff_health(self):
+        self.orch._publish_snapshot()
+        self.orch.delivery_controller = SimpleNamespace(snapshot=lambda: {
+            "enabled": True,
+            "thread_alive": True,
+            "deferred_count": 1,
+            "global_backoff_remaining_ms": 60000,
+        })
+        payload = http_api.state_payload(self.orch)
+        self.assertEqual(payload["delivery"]["deferred_count"], 1)
+        self.assertEqual(
+            payload["delivery"]["global_backoff_remaining_ms"], 60000)
+
     def test_worker_finish_queues_waiting_instead_of_terminal_result(self):
         reporter = Mock()
         self.orch.session_reporter = reporter

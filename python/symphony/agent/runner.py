@@ -20,6 +20,23 @@ log = logging.getLogger("symphony.runner")
 DONE_NORMAL = "normal"
 DONE_SKIPPED = "skipped"  # claim-time recheck: task left active states
 DONE_CANCELLED = "cancelled"
+DONE_DEFERRED = "deferred"
+DONE_TERMINATION_UNCONFIRMED = "termination_unconfirmed"
+
+_RETRYABLE_DEFERRAL_REASONS = frozenset({
+    "github_api_request",
+    "github_unknown_payload",
+    "linear_api_request",
+    "linear_graphql_errors",
+    "linear_rate_limited",
+    "linear_unknown_payload",
+})
+
+_CONTROL_DEFERRAL_REASONS = frozenset({
+    "github_api_status",
+    "issue_state_refresh_failed",
+    "linear_api_http_error",
+}) | _RETRYABLE_DEFERRAL_REASONS
 
 
 def _issue_context(issue):
@@ -33,6 +50,13 @@ class RunHandle:
         self.cancel_event = threading.Event()
         self.session = None
         self.lock = threading.Lock()
+        self.lease = None
+        self.agent_started = False
+        self.termination_confirmed = True
+        self.deferred_reason = None
+        self.deferred_code = None
+        self.deferred_retryable = None
+        self.deferred_policy = None
 
     def cancel(self):
         self.cancel_event.set()
@@ -48,6 +72,63 @@ class RunHandle:
     def set_session(self, session):
         with self.lock:
             self.session = session
+
+    def set_lease(self, lease):
+        with self.lock:
+            self.lease = lease
+
+    def mark_agent_started(self):
+        with self.lock:
+            self.agent_started = True
+
+    def has_started(self):
+        with self.lock:
+            return self.agent_started is True
+
+    def current_lease(self):
+        with self.lock:
+            return self.lease
+
+    def mark_termination_unconfirmed(self):
+        with self.lock:
+            self.termination_confirmed = False
+
+    def mark_termination_confirmed(self):
+        with self.lock:
+            self.termination_confirmed = True
+
+    def termination_is_confirmed(self):
+        with self.lock:
+            return self.termination_confirmed is True
+
+    def defer(self, reason, retryable=True, code=None, wait=False):
+        with self.lock:
+            self.deferred_reason = str(reason)
+            self.deferred_retryable = bool(retryable)
+            self.deferred_code = code
+            self.deferred_policy = (
+                "permanent" if not retryable else
+                "wait" if wait else "bounded")
+
+    def force_terminate(self):
+        with self.lock:
+            session = self.session
+            started = self.agent_started
+        if session is None:
+            return not started
+        confirmed = pi_runtime.force_terminate_session(session)
+        with self.lock:
+            self.termination_confirmed = bool(confirmed)
+        return confirmed
+
+    def release_confirmed_lease(self):
+        with self.lock:
+            lease = self.lease
+            confirmed = self.termination_confirmed
+            if confirmed:
+                self.lease = None
+        if lease is not None and confirmed:
+            lease.release()
 
 
 def selected_worker_host(preferred, configured_hosts):
@@ -76,43 +157,148 @@ def run(issue, settings, on_update, on_done, handle, opts=None):
     context = _issue_context(issue)
     log.info("Starting agent run for %s worker_host=%s",
              context, worker_host or "local")
+    workflow_path = _workflow_path()
+    try:
+        lease = workspace_mod.acquire_run_lease(
+            settings, issue, workflow_path=workflow_path,
+            worker_host=worker_host)
+    except Exception as error:  # noqa: BLE001 - lease failure blocks execution
+        reason = "workspace run lease acquisition failed: %r" % (error,)
+        handle.defer(
+            reason, retryable=_deferral_is_retryable(error),
+            code=_error_reason(error))
+        log.error("Deferring agent run for %s: %s", context, reason)
+        on_done(issue.id, DONE_DEFERRED)
+        return
+    if lease is None:
+        reason = "workspace run lease is held by another live process"
+        handle.defer(
+            reason, retryable=True, code="run_lease_held", wait=True)
+        log.warning("Deferring agent run for %s: %s", context, reason)
+        on_done(issue.id, DONE_DEFERRED)
+        return
+    handle.set_lease(lease)
 
+    outcome = None
     try:
         admission = tracker_adapter.begin_run_issue(issue, tracker)
         if admission != "ok":
-            on_done(issue.id, DONE_SKIPPED)
-            return
-        _run_on_worker_host(
-            issue, settings, on_update, on_done, handle, worker_host,
-            attempt=opts.get("attempt"))
+            outcome = DONE_SKIPPED
+        else:
+            outcome = _run_on_worker_host(
+                issue, settings, on_update, handle, worker_host,
+                attempt=opts.get("attempt"), workflow_path=workflow_path)
     except _Cancelled:
-        on_done(issue.id, DONE_CANCELLED)
+        outcome = DONE_CANCELLED
+    except pi_runtime.TerminationError as error:
+        if getattr(error, "session", None) is not None:
+            handle.set_session(error.session)
+        handle.mark_termination_unconfirmed()
+        log.error("Agent run termination unconfirmed for %s: %s", context, error)
+        outcome = DONE_TERMINATION_UNCONFIRMED
+    except pi_runtime.PiStartupError as error:
+        # Popen succeeded, so this belongs to the Agent execution budget even
+        # though no usable PiSession was returned to the turn loop.
+        handle.mark_agent_started()
+        outcome = _fail(issue, tracker, str(error))
     except pi_runtime.TurnError as error:
         if error.reason == "cancelled":
-            on_done(issue.id, DONE_CANCELLED)
+            outcome = DONE_CANCELLED
+        elif not handle.has_started():
+            handle.defer(
+                error.reason,
+                retryable=_deferral_is_retryable(error),
+                code=_error_reason(error))
+            outcome = DONE_DEFERRED
         else:
-            _fail(issue, tracker, on_done, error)
+            outcome = _fail(issue, tracker, error)
     except WorkflowError as error:
-        _fail(issue, tracker, on_done, error.describe())
+        if _is_control_deferral(error) or not handle.has_started():
+            handle.defer(
+                error.describe(),
+                retryable=_deferral_is_retryable(error),
+                code=_error_reason(error))
+            outcome = DONE_DEFERRED
+        else:
+            outcome = _fail(issue, tracker, error.describe())
     except Exception as error:  # noqa: BLE001 - runner isolates all failures
-        _fail(issue, tracker, on_done, error)
+        if _is_control_deferral(error) or not handle.has_started():
+            handle.defer(
+                error,
+                retryable=_deferral_is_retryable(error),
+                code=_error_reason(error))
+            outcome = DONE_DEFERRED
+        else:
+            outcome = _fail(issue, tracker, error)
+    finally:
+        handle.release_confirmed_lease()
+    on_done(issue.id, outcome or DONE_NORMAL)
 
 
-def _fail(issue, tracker, on_done, reason):
+def _error_reason(error):
+    reason = getattr(error, "reason", None)
+    if reason == "issue_state_refresh_failed":
+        cause = error.__cause__
+        if isinstance(cause, BaseException):
+            return _error_reason(cause)
+    if isinstance(reason, str):
+        return reason
+    if isinstance(reason, tuple) and reason:
+        return str(reason[0])
+    return None
+
+
+def _deferral_is_retryable(error):
+    """Classify failures before Pi starts without hiding local misconfiguration."""
+    if getattr(error, "reason", None) == "issue_state_refresh_failed" \
+            and isinstance(error.__cause__, BaseException):
+        return _deferral_is_retryable(error.__cause__)
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+    reason = _error_reason(error)
+    if reason in _RETRYABLE_DEFERRAL_REASONS:
+        return True
+    if reason in {"github_api_status", "linear_api_http_error"}:
+        detail = getattr(error, "detail", None)
+        status = detail.get("status") if isinstance(detail, dict) else detail
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status in {408, 425, 429} or status >= 500
+        return False
+    if isinstance(reason, str) and reason.startswith("github_status_"):
+        try:
+            status = int(reason.rsplit("_", 1)[1])
+        except (TypeError, ValueError):
+            return False
+        return status in {408, 425, 429} or status >= 500
+    return False
+
+
+def _is_control_deferral(error):
+    """Return whether an error came from the tracker/control plane."""
+    if getattr(error, "reason", None) == "issue_state_refresh_failed" \
+            and isinstance(error.__cause__, BaseException):
+        return True
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+    reason = _error_reason(error)
+    return reason in _CONTROL_DEFERRAL_REASONS \
+        or (isinstance(reason, str) and reason.startswith("github_status_"))
+
+
+def _fail(issue, tracker, reason):
     try:
         tracker_adapter.record_issue_failure(issue, tracker, reason)
     except Exception:  # noqa: BLE001
         pass
     log.error("Agent run failed for %s: %s", _issue_context(issue), reason)
-    on_done(issue.id, reason)
+    return reason
 
 
-def _run_on_worker_host(issue, settings, on_update, on_done, handle, worker_host,
-                        attempt=None):
+def _run_on_worker_host(issue, settings, on_update, handle, worker_host,
+                        attempt=None, workflow_path=None):
     context = _issue_context(issue)
     log.info("Starting worker attempt for %s worker_host=%s",
              context, worker_host or "local")
-    workflow_path = _workflow_path()
     workspace = workspace_mod.create_for_issue(
         settings, issue, workflow_path=workflow_path, worker_host=worker_host)
     on_update(issue.id, {
@@ -130,7 +316,7 @@ def _run_on_worker_host(issue, settings, on_update, on_done, handle, worker_host
         workspace_mod.run_after_run(
             settings, issue, workflow_path=workflow_path,
             worker_host=worker_host)
-    on_done(issue.id, reason or DONE_NORMAL)
+    return reason or DONE_NORMAL
 
 
 def _run_agent_turns(workspace, issue, settings, on_update, handle, worker_host,
@@ -140,14 +326,22 @@ def _run_agent_turns(workspace, issue, settings, on_update, handle, worker_host,
     if settings.runtime.kind != "pi":
         raise WorkflowError("unsupported_runtime_kind", settings.runtime.kind)
     session = pi_runtime.start_session(
-        workspace, settings, worker_host=worker_host)
+        workspace, settings, worker_host=worker_host,
+        run_lease=handle.current_lease(), issue=issue)
     handle.set_session(session)
+    handle.mark_agent_started()
     try:
         return _do_run_turns(
             session, workspace, issue, settings, on_update, handle, 1, attempt)
     finally:
-        handle.set_session(None)
-        pi_runtime.stop_session(session)
+        confirmed = pi_runtime.stop_session(session)
+        if confirmed:
+            handle.set_session(None)
+            handle.mark_termination_confirmed()
+        else:
+            handle.mark_termination_unconfirmed()
+            raise pi_runtime.TerminationError(
+                "pi process tree is still alive after SIGKILL escalation")
 
 
 def _do_run_turns(session, workspace, issue, settings, on_update, handle,
@@ -185,8 +379,9 @@ def _continue_with_issue(issue, settings):
     try:
         issues = tracker_adapter.fetch_issues_by_ids(
             settings.tracker, [issue.id])
-    except Exception as error:  # noqa: BLE001 - a refresh failure is a run failure
-        raise WorkflowError("issue_state_refresh_failed", str(error))
+    except Exception as error:  # noqa: BLE001 - preserve control-plane detail
+        raise WorkflowError(
+            "issue_state_refresh_failed", str(error)) from error
     refreshed = next(
         (candidate for candidate in issues if candidate.id == issue.id), None)
     if refreshed is None:
