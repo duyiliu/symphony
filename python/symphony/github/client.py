@@ -22,12 +22,13 @@ VALID_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE"}
 
 LABEL_PREFIX = "agent:"
 LABEL_STATE_PRIORITY = {
-    "agent:done": 3,
-    "agent:merging": 4,
+    "agent:done": 6,
+    "agent:merging": 5,
+    "agent:review": 4,
+    "agent:rework": 3,
     "agent:in-progress": 2,
     "agent:todo": 1,
 }
-LABEL_STATE_EXCLUDE = frozenset({"agent:approved"})
 
 
 class GitHubError(Exception):
@@ -64,9 +65,9 @@ def _derive_state(issue, labels, use_label_states):
     state = None
     for label in labels:
         if label.startswith(LABEL_PREFIX):
-            if label in LABEL_STATE_EXCLUDE:
+            p = LABEL_STATE_PRIORITY.get(label)
+            if p is None:
                 continue
-            p = LABEL_STATE_PRIORITY.get(label, 0)
             if p > priority:
                 priority = p
                 state = label[len(LABEL_PREFIX):]

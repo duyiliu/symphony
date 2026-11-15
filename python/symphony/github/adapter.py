@@ -16,7 +16,7 @@ LABEL_STATES = frozenset(
     label[len(gh_client.LABEL_PREFIX):]
     for label in gh_client.LABEL_STATE_PRIORITY
     if label.startswith(gh_client.LABEL_PREFIX)
-) | frozenset({"review", "rework", "merging", "done", "closed"})
+) | frozenset({"done", "closed"})
 
 
 def _validate_states(states, missing_error, tracker_settings):
@@ -54,19 +54,13 @@ def validate_config(tracker_settings):
 def fetch_candidate_issues(tracker_settings):
     """Return issues eligible for orchestrator dispatch.
 
-    In label-state mode ``review``/``done``/``closed`` are delivery-owned
-    and excluded from the candidate pool; the delivery layer uses
-    ``fetch_issues_by_states`` directly and can see all states.
-    In native mode every configured active state is a candidate.
+    Every configured active state is a candidate, matching the upstream
+    Linear adapter semantics.  In label-state mode the operator controls
+    dispatch by choosing which ``agent:*`` labels appear in
+    ``tracker.active_states`` (e.g. ``review`` is typically excluded so
+    the host-only review state does not dispatch an agent).
     """
-    if gh_client._use_label_states(tracker_settings):
-        candidate_states = [
-            state for state in tracker_settings.active_states
-            if normalize_issue_state(state) in ("todo", "in-progress")
-        ]
-    else:
-        candidate_states = tracker_settings.active_states
-    return fetch_issues_by_states(tracker_settings, candidate_states)
+    return fetch_issues_by_states(tracker_settings, tracker_settings.active_states)
 
 
 def fetch_issues_by_states(tracker_settings, state_names):

@@ -124,7 +124,7 @@ class LabelStatesTest(unittest.TestCase):
 
     def test_fetch_terminal_states_includes_done_and_closed(self):
         rows = [
-            self._raw_with_labels(1, ["agent:done"], state="closed"),
+            self._raw_with_labels(1, [], state="closed"),
             self._raw_with_labels(2, ["agent:todo"]),
             self._raw_with_labels(3, ["bug"], state="closed"),
         ]
@@ -163,10 +163,22 @@ class LabelStatesTest(unittest.TestCase):
         self.assertEqual(issues[0].state, "todo")
 
     def test_multiple_symphony_labels_highest_priority_wins(self):
-        row = self._raw_with_labels(1, ["agent:todo", "agent:done"])
+        row = self._raw_with_labels(1, ["agent:todo", "agent:merging"])
         issue = gh_client.normalize_issue(
             row, "octo/repo", use_label_states=True)
-        self.assertEqual(issue.state, "done")
+        self.assertEqual(issue.state, "merging")
+
+    def test_unknown_agent_label_is_ignored(self):
+        row = self._raw_with_labels(1, ["agent:todo", "agent:unknown"])
+        issue = gh_client.normalize_issue(
+            row, "octo/repo", use_label_states=True)
+        self.assertEqual(issue.state, "todo")
+
+    def test_only_unknown_agent_label_is_not_dispatchable(self):
+        row = self._raw_with_labels(1, ["agent:unknown"])
+        issue = gh_client.normalize_issue(
+            row, "octo/repo", use_label_states=True)
+        self.assertIsNone(issue)
 
     def test_no_symphony_labels_is_not_dispatchable(self):
         row = self._raw_with_labels(1, ["bug", "enhancement"])

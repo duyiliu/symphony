@@ -246,3 +246,12 @@ delivery backoff 覆盖。
   断连后的 SIGHUP，未做远程进程扫描，与原版“关闭 SSH 端口”边界一致。
 - 远程 MCP 反向隧道使用与宿主 bridge 相同的远程端口；端口冲突时
   `ExitOnForwardFailure=yes` 会让 SSH 退出，属于 fail-closed。
+
+## Phase 5：GitHub label-state 对齐 Linear 行为（当前进行中）
+
+- [x] `agent:*` label → Linear 状态推导（`_derive_state`），优先级：done > merging > review > rework > in-progress > todo > backlog。
+- [x] `LABEL_STATES` 对齐 Linear 7 态：backlog / todo / in-progress / review / merging / rework / done（+ closed 终态别名）。
+- [x] `fetch_candidate_issues` 不再过滤 label 状态——`active_states` 配什么就拉什么，行为与 Linear adapter 一致。
+- [x] `active_states = [todo, in-progress, merging, rework]`，`review`/`backlog` 留给人工，host-only。
+- [x] 砍掉 delivery 自动 merge/transition；`agent:merging` 由 agent 跑 `land` skill 完成 merge，merge 后 agent 自己改 `agent:done`。
+- [ ] E2E：新 issue 走完 `agent:todo` → `agent:in-progress` → `agent:review` → 人工改 `agent:merging` → agent 跑 land merge → `agent:done`。
