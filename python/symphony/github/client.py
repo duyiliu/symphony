@@ -26,6 +26,7 @@ LABEL_STATE_PRIORITY = {
     "agent:in-progress": 2,
     "agent:todo": 1,
 }
+LABEL_STATE_EXCLUDE = frozenset({"agent:approved"})
 
 
 class GitHubError(Exception):
@@ -62,6 +63,8 @@ def _derive_state(issue, labels, use_label_states):
     state = None
     for label in labels:
         if label.startswith(LABEL_PREFIX):
+            if label in LABEL_STATE_EXCLUDE:
+                continue
             p = LABEL_STATE_PRIORITY.get(label, 0)
             if p > priority:
                 priority = p
