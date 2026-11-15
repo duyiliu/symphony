@@ -1215,6 +1215,23 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             log.debug("http client aborted during dashboard response")
 
+    def _serve_static(self, body, content_type):
+        """Serve a static asset with the upstream dashboard cache headers."""
+        keep_alive = self._discard_body()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "public, max-age=31536000")
+            if not keep_alive:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            log.debug("http client aborted during static response")
+
     def _handle_sessions_list(self):
         payload = sessions_payload(self.api.orchestrator, self.api.settings())
         self._json(200, payload)
@@ -1540,6 +1557,14 @@ class _Handler(BaseHTTPRequestHandler):
             # :issue_identifier route, so GET must be 405, not an issue lookup.
             self._error(
                 405, "method_not_allowed", "Method not allowed")
+            return
+        if path == "/dashboard.css":
+            self._serve_static(
+                dashboard_live.DASHBOARD_CSS.encode("utf-8"),
+                "text/css; charset=utf-8")
+            return
+        if path == "/favicon.png":
+            self._serve_static(dashboard_live.DASHBOARD_FAVICON, "image/png")
             return
         if path == "/":
             self._serve_dashboard()

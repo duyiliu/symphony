@@ -32,6 +32,7 @@ Design notes
 
 import json
 import logging
+import os
 import threading
 import time
 
@@ -110,13 +111,7 @@ def stream_dashboard(orchestrator, request, close_event):
 # and an Agent live-log tail (both fed by extra /api/v1 endpoints).
 # ---------------------------------------------------------------------------
 
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Symphony Observability</title>
-<style>
+DASHBOARD_CSS = r"""
 :root {
   color-scheme: light;
   --page: #f7f7f8;
@@ -319,13 +314,35 @@ select {
   .hero-grid { grid-template-columns: 1fr; }
   .status-stack { justify-items: start; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .error-card { border-radius: 20px; padding: 1rem; }
 }
 @media (max-width: 560px) {
   .metric-grid { grid-template-columns: 1fr; }
   .section-card, .hero-card, .error-card { border-radius: 20px; padding: 1rem; }
 }
-</style>
+"""
+
+
+def _load_favicon():
+    path = os.path.join(os.path.dirname(__file__), "static", "favicon.png")
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return b""
+
+
+DASHBOARD_FAVICON = _load_favicon()
+
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Symphony Observability</title>
+<link rel="icon" type="image/png" sizes="128x128" href="/favicon.png">
+<link rel="stylesheet" href="/dashboard.css">
+
 </head>
 <body>
 <main class="app-shell">
@@ -456,7 +473,7 @@ select {
       <div class="section-header">
         <div>
           <h2 class="section-title">Blocked sessions</h2>
-          <p class="section-copy">Issues paused because the agent requested operator input or approval.</p>
+          <p class="section-copy">Issues paused because Codex requested operator input or approval.</p>
         </div>
       </div>
       <p class="empty-state" id="blocked-empty">No blocked sessions.</p>
