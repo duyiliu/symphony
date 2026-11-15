@@ -115,6 +115,22 @@ class GitHub:
                 "retry_after": gh_client.retry_after_seconds(headers),
             })
 
+    def pages(self, path, field=None):
+        rows = []
+        page = 1
+        while True:
+            params = {"per_page": 100, "page": page}
+            payload = self.request("GET", path, params=params)
+            current = payload.get(field) if field else payload
+            if not isinstance(current, list):
+                raise DeliveryError("github_unknown_payload", path)
+            rows.extend(current)
+            if len(current) < 100:
+                return rows
+            page += 1
+            if page > 100:
+                raise DeliveryError("github_pagination_limit", path)
+
 
 def _tracker_kind(settings):
     return (settings.tracker.kind or "").strip().lower()
@@ -236,22 +252,6 @@ def _comment_exists(settings, issue_id, notice_key, github=None):
             raise DeliveryError("invalid_linear_comment_pagination")
         after = cursor
     raise DeliveryError("linear_comment_pagination_limit")
-
-    def pages(self, path, field=None):
-        rows = []
-        page = 1
-        while True:
-            params = {"per_page": 100, "page": page}
-            payload = self.request("GET", path, params=params)
-            current = payload.get(field) if field else payload
-            if not isinstance(current, list):
-                raise DeliveryError("github_unknown_payload", path)
-            rows.extend(current)
-            if len(current) < 100:
-                return rows
-            page += 1
-            if page > 100:
-                raise DeliveryError("github_pagination_limit", path)
 
 
 def _repo_path(repo, suffix):
@@ -432,8 +432,13 @@ def protection_gate(delivery, protection, successful, approvals):
     return True, False, None
 
 
-def discover_pr(issue, repo):
-    """Return the single PR number attached to this Linear issue."""
+def discover_pr(issue, repo, settings=None, github=None):
+    """Return the PR number attached to this issue.
+
+    Linear issues carry PR links in ``attachments``. GitHub issues do not
+    have that concept, so for GitHub trackers we fall back to matching
+    the issue identifier against open PR head branches.
+    """
     found = []
     for attachment in issue.attachments or []:
         if not isinstance(attachment, dict):
@@ -446,7 +451,7 @@ def discover_pr(issue, repo):
         if number not in found:
             found.append(number)
     if not found:
-        return None
+        return _discover_pr_by_branch(issue, repo, settings, github)
     if len(found) > 1:
         open_numbers = []
         for attachment in issue.attachments or []:
@@ -462,6 +467,33 @@ def discover_pr(issue, repo):
         raise DeliveryError(
             "ambiguous_pr_association", "multiple PRs: %s" % found)
     return found[0]
+
+
+def _discover_pr_by_branch(issue, repo, settings, github):
+    """Find the open PR whose head branch contains the issue identifier."""
+    if settings is None or _tracker_kind(settings) != "github":
+        return None
+    identifier = getattr(issue, "identifier", None)
+    if not isinstance(identifier, str) or not identifier.strip():
+        return None
+    if github is None:
+        github = GitHub(settings.delivery)
+    pulls = github.request(
+        "GET", _repo_path(repo, "/pulls"),
+        params={"state": "open", "per_page": "100"})
+    if not isinstance(pulls, list):
+        return None
+    matches = []
+    for pr in pulls:
+        head_ref = (pr.get("head") or {}).get("ref") or ""
+        if _pr_branch_matches_issue(pr, issue):
+            matches.append(pr.get("number"))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise DeliveryError(
+            "ambiguous_pr_association", "multiple PRs: %s" % matches)
+    return None
 
 
 def _pr_repo_matches(pr, repo):
@@ -1128,7 +1160,8 @@ class DeliveryController:
             lock.release()
 
     def _check_locked(self, settings, issue, delivery):
-        pr_number = discover_pr(issue, delivery.repo)
+        github = GitHub(delivery)
+        pr_number = discover_pr(issue, delivery.repo, settings, github)
         if pr_number is None:
             return
         records = DeliveryRecordStore(delivery.state_dir)
@@ -1153,7 +1186,6 @@ class DeliveryController:
                 issue.identifier, record.get("pr"), pr_number,
                 record.get("lifecycle_marker"), lifecycle_marker)
             record = {}
-        github = GitHub(delivery)
 
         pr = github.request(
             "GET", _repo_path(delivery.repo, "/pulls/%s" % pr_number))
