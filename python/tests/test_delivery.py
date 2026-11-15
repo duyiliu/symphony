@@ -1064,7 +1064,7 @@ class GitHubLabelTransitionTest(unittest.TestCase):
         delete_calls = [c for c in calls if c[0] == "DELETE"]
         post_calls = [c for c in calls if c[0] == "POST"]
         self.assertTrue(any(
-            "/issues/42/labels/agent:review" in c[1]
+            "/issues/42/labels/agent%3Ain-progress" in c[1]
             for c in delete_calls))
         self.assertTrue(any(
             "/issues/42/labels" in c[1]

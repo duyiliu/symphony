@@ -159,14 +159,19 @@ def _transition_state(settings, issue, state_name, github=None):
         if github is None:
             github = GitHub(settings.delivery)
         gh_label = _tracker_state_names(settings, state_name)
-        try:
-            github.request(
-                "DELETE",
-                _repo_path(
-                    settings.delivery.repo,
-                    "/issues/%s/labels/agent:review" % issue.id))
-        except DeliveryError:
-            pass  # label may not exist
+        for old_label in list(issue.labels or []):
+            if isinstance(old_label, str) \
+                    and old_label.startswith(gh_client.LABEL_PREFIX) \
+                    and old_label != gh_label:
+                try:
+                    github.request(
+                        "DELETE",
+                        _repo_path(
+                            settings.delivery.repo,
+                            "/issues/%s/labels/%s" % (
+                                issue.id, urllib.parse.quote(old_label))))
+                except DeliveryError:
+                    pass  # label may not exist
         github.request(
             "POST",
             _repo_path(
