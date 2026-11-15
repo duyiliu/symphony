@@ -841,6 +841,169 @@ def control_payload(orchestrator):
     return state
 
 
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def _live_log_dir(settings):
+    runtime = getattr(settings, "runtime", None) if settings is not None else None
+    directory = getattr(runtime, "live_log_dir", None) if runtime is not None else None
+    return directory or None
+
+
+def _session_files(directory):
+    """Map session_id -> absolute path for mirrored pi live logs."""
+    if not directory or not os.path.isdir(directory):
+        return {}
+    files = {}
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return {}
+    for name in names:
+        if not name.endswith(".live.jsonl"):
+            continue
+        stem = name[:-len(".live.jsonl")]
+        session_id = stem.rsplit("_", 1)[-1]
+        if not _SESSION_ID_RE.match(session_id):
+            continue
+        files[session_id] = os.path.join(directory, name)
+    return files
+
+
+def _summarize_live_event(event):
+    """Compact one raw pi JSONL record into a dashboard-friendly row."""
+    kind = event.get("type") or "unknown"
+    summary = ""
+    if kind == "session":
+        summary = "session start cwd=%s" % (event.get("cwd") or "?")
+    elif kind in ("turn_start", "turn_end", "agent_start", "agent_end",
+                  "agent_settled"):
+        summary = kind.replace("_", " ")
+    elif kind == "message_start":
+        role = (event.get("message") or {}).get("role") or "?"
+        summary = "%s message" % role
+    elif kind == "message_end":
+        role = (event.get("message") or {}).get("role") or "?"
+        summary = "%s message end" % role
+    elif kind == "message_update":
+        inner = event.get("assistantMessageEvent") or {}
+        inner_type = inner.get("type") or "update"
+        delta = inner.get("delta") or inner.get("content") or ""
+        if inner_type.endswith("_delta"):
+            inner_type = inner_type[:-len("_delta")]
+        if delta:
+            summary = "%s: %s" % (inner_type, str(delta)[:280])
+        else:
+            summary = inner_type
+    elif kind == "tool_execution_start":
+        args = event.get("args") or {}
+        try:
+            rendered = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            rendered = str(args)
+        summary = "%s %s" % (event.get("toolName") or "tool",
+                             rendered[:240])
+    elif kind == "tool_execution_end":
+        summary = "tool end %s%s" % (
+            event.get("toolName") or "",
+            " (error)" if event.get("isError") else "")
+    elif kind == "tool_execution_update":
+        content = (event.get("partialResult") or {}).get("content") or []
+        text = ""
+        for part in content:
+            if isinstance(part, dict) and part.get("text"):
+                text = " ".join(str(part["text"]).split())
+                break
+        summary = "%s%s" % (
+            event.get("toolName") or "tool",
+            (": …" + text[-160:]) if text else "")
+    elif kind == "response":
+        summary = "response %s %s" % (
+            event.get("command") or "",
+            "ok" if event.get("success") else "failed")
+    else:
+        summary = kind
+    return {"type": kind, "summary": summary}
+
+
+def session_log_payload(session_id, settings, limit=60):
+    """Tail the mirrored live log for one pi session."""
+    if not _SESSION_ID_RE.match(session_id or ""):
+        return None
+    directory = _live_log_dir(settings)
+    files = _session_files(directory)
+    path = files.get(session_id)
+    if path is None:
+        return None
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    limit = max(1, min(int(limit or 60), 500))
+    lines = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                lines.append(line)
+                if len(lines) > limit:
+                    lines.pop(0)
+    except OSError:
+        return None
+    events = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        events.append(_summarize_live_event(record))
+    return {
+        "session_id": session_id,
+        "file": os.path.basename(path),
+        "size": stat.st_size,
+        "mtime": _iso_full(datetime.datetime.fromtimestamp(
+            stat.st_mtime, datetime.timezone.utc)),
+        "events": events,
+    }
+
+
+def sessions_payload(orchestrator, settings):
+    """List mirrored live logs annotated with the running issue they belong to."""
+    directory = _live_log_dir(settings)
+    files = _session_files(directory)
+    running = {}
+    try:
+        snapshot = orchestrator.snapshot(SNAPSHOT_TIMEOUT_S)
+    except Exception:
+        snapshot = None
+    if isinstance(snapshot, dict):
+        for entry in snapshot.get("running") or []:
+            session_id = entry.get("session_id")
+            if session_id:
+                running[session_id] = entry.get("identifier")
+    sessions = []
+    for session_id, path in files.items():
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        sessions.append({
+            "session_id": session_id,
+            "identifier": running.get(session_id),
+            "file": os.path.basename(path),
+            "size": stat.st_size,
+            "mtime": _iso_full(datetime.datetime.fromtimestamp(
+                stat.st_mtime, datetime.timezone.utc)),
+            "live": session_id in running,
+        })
+    sessions.sort(key=lambda item: item.get("mtime") or "", reverse=True)
+    return {"directory": directory, "sessions": sessions}
+
+
 def _workspace_path(identifier, running, retry, blocked, settings, workflow_path):
     for entry in (running, retry, blocked):
         if entry and entry.get("workspace_path"):
@@ -1052,6 +1215,26 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             log.debug("http client aborted during dashboard response")
 
+    def _handle_sessions_list(self):
+        payload = sessions_payload(self.api.orchestrator, self.api.settings())
+        self._json(200, payload)
+
+    def _handle_session_log(self, session_id):
+        lines = 60
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        for part in query.split("&"):
+            key, _, value = part.partition("=")
+            if key == "lines":
+                try:
+                    lines = int(value)
+                except ValueError:
+                    lines = 60
+        payload = session_log_payload(session_id, self.api.settings(), lines)
+        if payload is None:
+            self._error(404, "session_not_found", "Session not found")
+            return
+        self._json(200, payload)
+
     def _sse_stream(self):
         """Long-lived Server-Sent Events stream of scheduler snapshots."""
         keep_alive = self._discard_body()
@@ -1091,9 +1274,11 @@ class _Handler(BaseHTTPRequestHandler):
     def _route_exists(path):
         """Paths that match a served route pattern (405 vs 404 on bad verbs)."""
         if path in ("/", "/api/v1/state", "/api/v1/stream", "/api/v1/refresh",
-                    "/api/v1/tasks", "/api/v1/tasks/import",
+                    "/api/v1/tasks", "/api/v1/tasks/import", "/api/v1/sessions",
                     "/api/v1/control", "/api/v1/control/pause",
                     "/api/v1/control/resume"):
+            return True
+        if path.startswith("/api/v1/sessions/") and path.endswith("/log"):
             return True
         if path.startswith("/api/v1/control/release/") \
                 or path.startswith("/api/v1/control/cleanup/"):
@@ -1358,6 +1543,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/":
             self._serve_dashboard()
+            return
+        if path == "/api/v1/sessions":
+            self._handle_sessions_list()
+            return
+        if path.startswith("/api/v1/sessions/") and path.endswith("/log"):
+            session_id = path[len("/api/v1/sessions/"):-len("/log")]
+            self._handle_session_log(session_id)
             return
         if path == "/api/v1/tasks":
             return self._handle_tasks_get("")

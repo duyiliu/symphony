@@ -181,6 +181,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
     padding: 8px; font-size: 11px; overflow-x: auto; max-height: 200px; overflow-y: auto;
   }
+  select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 5px 8px; font-family: var(--mono); font-size: 12px;
+  }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: rgba(96, 165, 250, .08); }
+  .log-body {
+    font-family: var(--mono); font-size: 11px; max-height: 340px;
+    overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  }
+  .log-line { padding: 2px 0; border-bottom: 1px solid rgba(31, 41, 55, .5); }
+  .log-type { color: var(--muted); }
+  .log-thinking { color: var(--warn); }
+  .log-tool { color: var(--accent); }
+  .log-error { color: var(--err); }
 </style>
 </head>
 <body>
@@ -236,6 +251,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </table>
     </div>
 
+    <div class="card" id="detail-card" style="grid-column: 1 / -1; display:none;">
+      <h2>Issue Detail <span id="detail-title" style="text-transform:none;letter-spacing:0;"></span></h2>
+      <div id="detail-body" class="empty">select a running issue</div>
+    </div>
+
     <div class="card" style="grid-column: 1 / -1;">
       <h2>Retrying</h2>
       <table id="retrying-table">
@@ -254,6 +274,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </tr></thead>
         <tbody><tr><td colspan="5" class="empty">none</td></tr></tbody>
       </table>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Agent Live Log</h2>
+      <div class="actions" style="margin-top:0;margin-bottom:8px;">
+        <select id="log-session"></select>
+        <span id="log-meta" class="meta" style="margin-left:8px;color:var(--muted);font-family:var(--mono);font-size:11px;"></span>
+      </div>
+      <div id="log-body" class="log-body empty">no live sessions</div>
     </div>
 
   </div>
@@ -284,8 +313,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   function esc(s) {
     if (s == null) return "";
-    return String(s).replace(/[&<>\"']/g, function (c) {
-      return {"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"}[c];
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
     });
   }
 
@@ -345,10 +374,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       runningBody.innerHTML = '<tr><td colspan="6" class="empty">no running issues</td></tr>';
     } else {
       runningBody.innerHTML = running.map(function (r) {
-        return "<tr>" +
-          issueCell(r.identifier, r.issue_url) +
+        return '<tr class="clickable" data-issue="' + esc(r.issue_identifier) + '">' +
+          issueCell(r.issue_identifier, r.issue_url) +
           "<td>" + esc(r.state || "—") + "</td>" +
-          "<td>" + esc(r.turn || "—") + "</td>" +
+          "<td>" + esc(r.turn_count != null ? r.turn_count : "—") + "</td>" +
           "<td>" + esc(fmtAgo(r.started_at)) + "</td>" +
           "<td>" + esc((r.session_id || "").slice(0, 8) || "—") + "</td>" +
           "<td>" + esc(r.workspace_path || r.worker_host || "—") + "</td>" +
@@ -363,7 +392,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     } else {
       retryingBody.innerHTML = retrying.map(function (r) {
         return "<tr>" +
-          issueCell(r.identifier, r.issue_url) +
+          issueCell(r.issue_identifier, r.issue_url) +
           "<td>" + esc(r.attempt || "—") + "</td>" +
           "<td>" + esc(r.due_at ? fmtAgo(r.due_at) : "—") + "</td>" +
           "<td>" + esc((r.error || "").slice(0, 80)) + "</td>" +
@@ -378,15 +407,130 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     } else {
       blockedBody.innerHTML = blocked.map(function (r) {
         return "<tr>" +
-          issueCell(r.identifier, r.issue_url) +
+          issueCell(r.issue_identifier, r.issue_url) +
           "<td>" + esc(r.state || "—") + "</td>" +
           "<td>" + esc((r.error || "").slice(0, 60)) + "</td>" +
           "<td>" + esc(fmtAgo(r.blocked_at)) + "</td>" +
-          '<td><button class="secondary" data-release="' + esc(r.identifier) + '">release</button>'
-          + '<button class="secondary" data-cleanup="' + esc(r.identifier) + '">cleanup</button></td>' +
+          '<td><button class="secondary" data-release="' + esc(r.issue_identifier) + '">release</button>'
+          + '<button class="secondary" data-cleanup="' + esc(r.issue_identifier) + '">cleanup</button></td>' +
           "</tr>";
       }).join("");
     }
+  }
+
+  var detailOpen = null;
+
+  function renderIssueDetail(d) {
+    var run = d.running || {};
+    var attempts = d.attempts || {};
+    var ws = d.workspace || {};
+    var tokens = run.tokens || {};
+    var pr = d.pull_request || {};
+    var rows = [
+      ["status", d.status],
+      ["state", run.state],
+      ["issue id", d.issue_id],
+      ["workspace", ws.path],
+      ["host", ws.host],
+      ["session", run.session_id],
+      ["turn", run.turn_count],
+      ["tokens", tokens.input_tokens + " in / " + tokens.output_tokens
+        + " out / " + tokens.total_tokens + " total"],
+      ["started", run.started_at],
+      ["last event", run.last_event],
+      ["last event at", run.last_event_at],
+      ["last message", run.last_message],
+      ["retry attempt", attempts.current_retry_attempt],
+      ["restarts", attempts.restart_count],
+      ["PR", pr.url]
+    ];
+    var html = '<dl class="kv">';
+    rows.forEach(function (pair) {
+      if (pair[1] == null || pair[1] === "") return;
+      html += "<dt>" + esc(pair[0]) + "</dt><dd>" + esc(pair[1]) + "</dd>";
+    });
+    html += "</dl>";
+    var body = document.getElementById("detail-body");
+    body.className = "";
+    body.innerHTML = html;
+  }
+
+  function toggleIssueDetail(identifier) {
+    var card = document.getElementById("detail-card");
+    var body = document.getElementById("detail-body");
+    if (detailOpen === identifier) {
+      detailOpen = null;
+      card.style.display = "none";
+      return;
+    }
+    detailOpen = identifier;
+    document.getElementById("detail-title").textContent = identifier;
+    card.style.display = "";
+    body.className = "empty";
+    body.textContent = "loading…";
+    fetch("/api/v1/" + encodeURIComponent(identifier))
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(renderIssueDetail)
+      .catch(function (e) { body.textContent = "failed: " + e; });
+  }
+
+  var selectedSession = null;
+  var logSessions = [];
+
+  function refreshLog() {
+    if (!selectedSession) return;
+    fetch("/api/v1/sessions/" + encodeURIComponent(selectedSession) + "/log?lines=80")
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        var body = document.getElementById("log-body");
+        document.getElementById("log-meta").textContent =
+          data.file + " · " + (data.size / 1024).toFixed(1) + " KB · "
+          + data.events.length + " events";
+        body.className = "log-body";
+        body.innerHTML = data.events.map(function (ev) {
+          var cls = ev.type.indexOf("tool_execution") === 0 ? "log-tool"
+            : ev.summary.indexOf("thinking") === 0 ? "log-thinking"
+            : (ev.type === "agent_settled" || ev.type === "agent_end") ? "log-error" : "";
+          return '<div class="log-line ' + cls + '"><span class="log-type">'
+            + esc(ev.type) + "</span> " + esc(ev.summary) + "</div>";
+        }).join("") || '<span class="empty">no events</span>';
+      })
+      .catch(function (e) {
+        document.getElementById("log-body").textContent = "log unavailable: " + e;
+      });
+  }
+
+  function refreshSessions() {
+    fetch("/api/v1/sessions").then(function (r) { return r.json(); })
+      .then(function (data) {
+        logSessions = data.sessions || [];
+        var select = document.getElementById("log-session");
+        var live = logSessions.filter(function (s) { return s.live; });
+        var options = (live.length ? live : logSessions).slice(0, 20);
+        if (!options.length) {
+          select.innerHTML = "";
+          selectedSession = null;
+          document.getElementById("log-body").textContent = "no live sessions";
+          return;
+        }
+        var known = options.some(function (s) { return s.session_id === selectedSession; });
+        if (!known) selectedSession = options[0].session_id;
+        select.innerHTML = options.map(function (s) {
+          var label = (s.identifier ? s.identifier + " · " : "")
+            + s.session_id.slice(0, 8) + (s.live ? " ●" : "");
+          return '<option value="' + esc(s.session_id) + '"'
+            + (s.session_id === selectedSession ? " selected" : "") + ">"
+            + esc(label) + "</option>";
+        }).join("");
+        refreshLog();
+      })
+      .catch(function () { /* SSE loop will retry */ });
   }
 
   function post(path, body) {
@@ -413,6 +557,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   document.addEventListener("click", function (ev) {
     var t = ev.target;
     if (!(t instanceof HTMLElement)) return;
+    if (t.closest("a") || t.closest("button")) return;
+    var row = t.closest("tr");
+    var issueId = row && row.getAttribute("data-issue");
+    if (issueId) {
+      toggleIssueDetail(issueId);
+      return;
+    }
     var release = t.getAttribute("data-release");
     var cleanup = t.getAttribute("data-cleanup");
     if (release) {
@@ -422,6 +573,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       post("/api/v1/control/cleanup/" + encodeURIComponent(cleanup))
         .catch(function (e) { alert("cleanup failed: " + e); });
     }
+  });
+
+  document.getElementById("log-session").addEventListener("change", function (ev) {
+    selectedSession = ev.target.value;
+    refreshLog();
   });
 
   var source = new EventSource("/api/v1/stream");
@@ -454,6 +610,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   fetch("/api/v1/state").then(function (r) { return r.json(); })
     .then(renderSnapshot)
     .catch(function () { /* SSE will fill in */ });
+
+  refreshSessions();
+  setInterval(refreshSessions, 3000);
 })();
 </script>
 
