@@ -124,6 +124,11 @@ def allow_request_for(repo_name, method, url, body):
         return len(tail) == 3 and tail[0] == "issues" \
             and tail[1] == "comments"
     if method == "PUT":
+        # Merge endpoint only: in the label-state workflow the merging
+        # issue is dispatched to an agent which runs the land flow itself.
+        if len(tail) == 3 and tail[0] == "pulls" and tail[2] == "merge":
+            return _keys(body, {"merge_method", "commit_title",
+                                "commit_message", "sha"})
         return False
     if method == "PATCH":
         if len(tail) == 3 and tail[0] == "issues" and tail[1] == "comments":

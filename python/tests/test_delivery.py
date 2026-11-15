@@ -1201,10 +1201,16 @@ class AgentToolBoundaryTest(unittest.TestCase):
             },
         }
 
-    def test_worker_cannot_merge(self):
-        self.assertFalse(workflow_policy.allow_request_for(
+    def test_worker_merge_requires_whitelisted_body(self):
+        # In the label-state workflow a worker in `agent:merging` performs
+        # the merge itself via github_api, so the endpoint is allowed with
+        # a strictly whitelisted body.
+        self.assertTrue(workflow_policy.allow_request_for(
             "o/r", "PUT", "https://api.github.com/repos/o/r/pulls/1/merge",
             {"sha": "a" * 40, "merge_method": "squash"}))
+        self.assertFalse(workflow_policy.allow_request_for(
+            "o/r", "PUT", "https://api.github.com/repos/o/r/pulls/1/merge",
+            {"sha": "a" * 40, "merge_method": "squash", "admin": True}))
 
     def test_worker_can_create_pr_and_comment(self):
         self.assertTrue(workflow_policy.allow_request_for(

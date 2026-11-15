@@ -108,7 +108,7 @@ class AllowRequestTest(unittest.TestCase):
         self.assertTrue(self._ok(
             "POST", "https://api.github.com/repos/o/r/issues/1/comments",
             {"body": "hi"}))
-        self.assertFalse(self._ok(
+        self.assertTrue(self._ok(
             "PUT", "https://api.github.com/repos/o/r/pulls/1/merge",
             {"sha": "a" * 40, "merge_method": "squash"}))
         self.assertTrue(self._ok(
@@ -132,9 +132,13 @@ class AllowRequestTest(unittest.TestCase):
     def test_disallowed_methods_and_bodies(self):
         self.assertFalse(self._ok(
             "DELETE", "https://api.github.com/repos/o/r/pulls/1"))
+        # Merge body is whitelisted; unknown merge fields are rejected.
         self.assertFalse(self._ok(
             "PUT", "https://api.github.com/repos/o/r/pulls/1/merge",
             {"sha": "a" * 40, "merge_method": "squash", "extra": 1}))
+        self.assertFalse(self._ok(
+            "PUT", "https://api.github.com/repos/o/r/pulls/1",
+            {"state": "closed"}))
         self.assertFalse(self._ok(
             "POST", "https://api.github.com/repos/o/r/issues/1/comments",
             {"body": "hi", "evil": True}))
