@@ -19,6 +19,8 @@ import hmac
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import dashboard_live
+
 from . import mcp_bridge
 
 log = logging.getLogger("symphony.http_api")
@@ -1032,13 +1034,63 @@ class _Handler(BaseHTTPRequestHandler):
     def _error(self, status, code, message):
         self._json(status, {"error": {"code": code, "message": message}})
 
+    def _serve_dashboard(self):
+        """Serve the live observability dashboard HTML."""
+        body = dashboard_live.DASHBOARD_HTML.encode("utf-8")
+        keep_alive = self._discard_body()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            if not keep_alive:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            log.debug("http client aborted during dashboard response")
+
+    def _sse_stream(self):
+        """Long-lived Server-Sent Events stream of scheduler snapshots."""
+        keep_alive = self._discard_body()
+        # SSE must not be closed prematurely by the keep-alive handler; the
+        # connection stays open until the client disconnects or shutdown.
+        self.close_connection = True
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
+
+        close = threading.Event()
+        try:
+            for frame in dashboard_live.stream_dashboard(
+                    self.api.orchestrator, self, close):
+                if close.is_set():
+                    break
+                try:
+                    self.wfile.write(frame)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionAbortedError,
+                        ConnectionResetError, OSError):
+                    break
+        finally:
+            close.set()
+
     def _path(self):
         return self.path.split("?", 1)[0]
 
     @staticmethod
     def _route_exists(path):
         """Paths that match a served route pattern (405 vs 404 on bad verbs)."""
-        if path in ("/", "/api/v1/state", "/api/v1/refresh",
+        if path in ("/", "/api/v1/state", "/api/v1/stream", "/api/v1/refresh",
                     "/api/v1/tasks", "/api/v1/tasks/import",
                     "/api/v1/control", "/api/v1/control/pause",
                     "/api/v1/control/resume"):
@@ -1281,6 +1333,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/state":
             self._json(200, state_payload(self.api.orchestrator))
             return
+        if path == "/api/v1/stream":
+            self._sse_stream()
+            return
         if path == "/api/v1/control":
             payload = control_payload(self.api.orchestrator)
             if payload is None:
@@ -1302,9 +1357,7 @@ class _Handler(BaseHTTPRequestHandler):
                 405, "method_not_allowed", "Method not allowed")
             return
         if path == "/":
-            # Phoenix serves the LiveView dashboard here; the Python port ships
-            # no dashboard, so a minimal service document is returned instead.
-            self._json(200, {"service": "symphony", "status": "ok"})
+            self._serve_dashboard()
             return
         if path == "/api/v1/tasks":
             return self._handle_tasks_get("")
