@@ -35,9 +35,8 @@ class _State:
         self._lock = threading.Lock()
         self._scopes = {}
 
-    def register_scope(self, tracker_settings, delivery_settings, issue_scope):
+    def register_scope(self, tracker_settings, issue_scope):
         tracker_snapshot = _freeze_tracker_settings(tracker_settings)
-        delivery_snapshot = copy.deepcopy(delivery_settings)
         with self._lock:
             if len(self._scopes) >= MAX_SCOPES:
                 raise RuntimeError("mcp_scope_limit_reached")
@@ -45,7 +44,6 @@ class _State:
             digest = _token_digest(token)
             self._scopes[digest] = (
                 tracker_snapshot,
-                delivery_snapshot,
                 issue_scope,
             )
             return token
@@ -100,7 +98,7 @@ def _handle_rpc(request, scope=None):
     if method == "tools/list":
         if scope is None:
             return _error(request, -32602, "Missing worker scope")
-        tracker_settings, delivery, _issue_scope = scope
+        tracker_settings, _issue_scope = scope
         tools = [
             {
                 "name": spec.get("name"),
@@ -109,7 +107,7 @@ def _handle_rpc(request, scope=None):
                     or spec.get("input_schema") or {"type": "object"},
             }
             for spec in (_tools().tool_specs(
-                tracker_settings, delivery_settings=delivery) or [])
+                tracker_settings) or [])
         ]
         return _result(request, {"tools": tools})
     if method == "tools/call":
@@ -120,10 +118,10 @@ def _handle_rpc(request, scope=None):
         arguments = params.get("arguments") or {}
         if not (isinstance(name, str) and name != ""):
             return _error(request, -32602, "Missing tool name")
-        tracker_settings, delivery, issue_scope = scope
+        tracker_settings, issue_scope = scope
         result = _tools().execute_agent_tool(
             name, arguments, tracker_settings,
-            issue_scope=issue_scope, delivery_settings=delivery)
+            issue_scope=issue_scope)
         return _result(request, _to_mcp_result(result))
     return _error(request, -32601, "Method not found")
 
@@ -333,7 +331,7 @@ def client_config(workspace, settings, issue):
             or not isinstance(identifier, str) or not identifier:
         return None
     token = bridge.register_scope(
-        settings.tracker, settings.delivery,
+        settings.tracker,
         IssueScope(id=issue_id, identifier=identifier),
     )
     config = {
@@ -343,8 +341,7 @@ def client_config(workspace, settings, issue):
                 "headers": {"Authorization": "Bearer %s" % token},
                 "exposure": "direct",
                 "description": (
-                    "Symphony tools scoped to this workspace's Linear issue "
-                    "and delivery repository."
+                    "Symphony tools scoped to this workspace's issue."
                 ),
             }
         }

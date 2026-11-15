@@ -172,7 +172,6 @@ class ReporterTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.cfg = make_settings(self.temp.name)
-        self.cfg.delivery.repo = "owner/repo"
         self.now = 100
         self.store = SimpleNamespace(settings=lambda: self.cfg)
         self.reporter = agent_sessions.Reporter(self.store, clock=lambda: self.now)
@@ -207,28 +206,6 @@ class ReporterTest(unittest.TestCase):
         self.pump()
         self.assertNotIn("response", self.types())
         self.assertEqual(self.reporter.records[self.issue.id]["phase"], "waiting")
-
-    def test_merge_is_terminal_and_late_worker_does_not_reopen(self):
-        self.start()
-        self.reporter.delivery(self.issue, "merged", "checks passed", 7, "a" * 40)
-        self.pump()
-        self.reporter.worker_finished(self.issue, True)
-        self.pump()
-        self.reporter.stopped(self.issue)
-        self.pump()
-        self.assertEqual(self.types(), ["thought", "response"])
-        self.assertEqual(self.reporter.records[self.issue.id]["phase"], "merged")
-        urls = self.api.updates[-1]["input"]["addedExternalUrls"]
-        self.assertIn("https://github.com/owner/repo/pull/7",
-                      [item["url"] for item in urls])
-
-    def test_paused_remains_awaiting_input_after_worker_finishes(self):
-        self.start()
-        self.reporter.delivery(self.issue, "paused", "high-risk path", 7, "a" * 40)
-        self.pump()
-        self.reporter.worker_finished(self.issue, True)
-        self.pump()
-        self.assertEqual(self.types(), ["thought", "elicitation"])
 
     def test_summary_has_real_schema_length_and_no_newlines(self):
         agent_sessions.finish_session(
@@ -273,7 +250,7 @@ class ReporterTest(unittest.TestCase):
     def test_restart_recovers_durable_pending_event(self):
         self.start()
         self.api.fail_activity_once = True
-        self.reporter.delivery(self.issue, "merged", "merged", 7, "a" * 40)
+        self.reporter.stopped(self.issue)
         self.pump()
         restarted = agent_sessions.Reporter(self.store, clock=lambda: self.now)
         restarted._recover()
@@ -284,19 +261,12 @@ class ReporterTest(unittest.TestCase):
 
     def test_reopened_issue_gets_new_session(self):
         self.start()
-        self.reporter.delivery(self.issue, "merged", "merged", 7, "a" * 40)
+        self.reporter.stopped(self.issue)
         self.pump()
         self.reporter.started(self.issue)
         self.pump()
         self.assertEqual(len(self.api.sessions), 2)
         self.assertEqual(self.types(), ["thought", "response", "thought"])
-
-    def test_repeated_delivery_poll_does_not_repeat_activity(self):
-        self.start()
-        for _ in range(3):
-            self.reporter.delivery(self.issue, "waiting", "CI pending", 7, "a" * 40)
-            self.pump()
-        self.assertEqual(self.types(), ["thought", "thought"])
 
     def test_progress_is_throttled_and_never_reports_tool_arguments(self):
         self.start()
@@ -318,7 +288,7 @@ class ReporterTest(unittest.TestCase):
                           agent_sessions.WorkflowError(
                               "linear_api_http_error",
                               {"status": 429, "retry_after": "120"})):
-            self.reporter.delivery(self.issue, "merged", "merged", 7, "a" * 40)
+            self.reporter.stopped(self.issue)
             self.pump()
         self.now += 31
         calls = len(self.api.calls)
@@ -328,11 +298,6 @@ class ReporterTest(unittest.TestCase):
         self.now += 90
         self.pump()
         self.assertEqual(self.types(), ["thought", "response"])
-
-    def test_old_delivery_records_do_not_create_sessions(self):
-        self.reporter.delivery(self.issue, "paused", "high risk", 7, "a" * 40)
-        self.pump()
-        self.assertEqual(self.api.sessions, [])
 
 
 if __name__ == "__main__":

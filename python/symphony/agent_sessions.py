@@ -1,8 +1,8 @@
 """Best-effort, asynchronous Linear Agent Session reporting.
 
-The scheduler and delivery controller enqueue semantic events. A host-only
-reporter owns OAuth, session state and a durable outbox; network failures never
-block the execution loop. Worker completion is not delivery completion.
+The scheduler enqueues semantic events. A host-only reporter owns OAuth,
+session state and a durable outbox; network failures never block the
+execution loop.
 """
 
 import datetime
@@ -25,10 +25,6 @@ log = logging.getLogger("symphony.agent_sessions")
 _tokens = TokenCache()
 _lock = threading.RLock()
 _FINAL_PHASES = {"merged", "completed", "stopped"}
-_LIFECYCLE_BOUNDARY_PHASES = _FINAL_PHASES | {
-    "merged_pending_sync",
-    "superseded_pending_sync",
-}
 
 
 def _conf(settings):
@@ -297,7 +293,6 @@ class Reporter:
         self.last_error = None
         self.api_retry_at = 0
         self._active_root = None
-        self._delivery_scan_at = 0
 
     def start(self):
         self._thread = threading.Thread(
@@ -399,49 +394,6 @@ class Reporter:
         self._enqueue(
             issue, "stopped", "任务已离开执行范围，执行器已停止；这不表示代码已经合并。")
 
-    def delivery_event(self, issue, phase, reason, pr_number=None, sha=None):
-        """Pure envelope, also saved atomically with the host delivery result."""
-        settings = self.store.settings()
-        if not enabled(settings):
-            return None
-        url = (
-            "https://github.com/%s/pull/%s" % (settings.delivery.repo, pr_number)
-            if pr_number else None)
-        body = {
-            "waiting": "PR 已提交，正在等待 CI、Review 或其他交付门禁。",
-            "rework": "交付检查需要返工，已交回执行器。",
-            "paused": "自动交付已暂停，需要人工处理。",
-            "merged": "GitHub PR 已确认合并，Linear 已更新为 Done。",
-            "merged_pending_sync": "GitHub PR 已确认合并，Linear 状态仍需核对。",
-        }.get(phase, "正在核对交付状态。")
-        body += "\n\n原因：%s" % reason
-        if url:
-            body += "\nPR：%s\nHEAD：%s" % (url, sha or "unknown")
-        identity, event = self._event(
-            issue, phase, body,
-            key="delivery:%s:%s:%s:%s" % (phase, pr_number, sha, reason),
-            urls=[{"url": url, "label": "Pull request"}] if url else [])
-        record = _load_record(settings, issue.id)
-        return {
-            "identity": identity, "event": event,
-            "lifecycle": record.get("marker"),
-        }
-
-    def delivery(self, issue, phase, reason, pr_number=None, sha=None):
-        if not enabled(self.store.settings()):
-            return
-        envelope = self.delivery_event(issue, phase, reason, pr_number, sha)
-        if envelope is None:
-            return
-        identity, event = envelope["identity"], envelope["event"]
-        try:
-            self.queue.put_nowait((identity, event))
-        except queue.Full:
-            with self._overflow_lock:
-                self._overflow[
-                    (identity["state_root"], issue.id, event["key"])
-                ] = identity, event
-
     def _recover(self, settings=None):
         settings = settings or self.store.settings()
         if not enabled(settings):
@@ -468,54 +420,11 @@ class Reporter:
             self.records.clear()
             self.retry_at.clear()
             self.api_retry_at = 0
-            self._delivery_scan_at = 0
             self._active_root = root
             with self._progress_lock:
                 self._progress.clear()
             if root:
                 self._recover(settings)
-
-    def _recover_delivery(self, settings):
-        if not settings.delivery.enabled or self.clock() < self._delivery_scan_at:
-            return
-        self._delivery_scan_at = self.clock() + 5
-        from .delivery import DeliveryRecordStore
-
-        source = DeliveryRecordStore(settings.delivery.state_dir)
-        for record in list(self.records.values()):
-            if not record.get("marker") or any(
-                    item["phase"] == "running" for item in record.get("pending", [])):
-                continue
-            issue = SimpleNamespace(id=record["issue_id"])
-            envelope = source.load(issue).get("agent_session_report") or {}
-            identity, event = envelope.get("identity"), envelope.get("event")
-            if not isinstance(identity, dict) or not isinstance(event, dict):
-                continue
-            if identity.get("state_root") != self._active_root \
-                    or envelope.get("lifecycle") != record["marker"]:
-                continue
-            self._stage(settings, identity, event)
-
-    def _delivery_lifecycle_ended(self, settings, issue_id, record):
-        """Return true when a new run follows an already-ended delivery."""
-        if record.get("phase") in _LIFECYCLE_BOUNDARY_PHASES or any(
-                item.get("phase") in _LIFECYCLE_BOUNDARY_PHASES
-                for item in record.get("pending", [])):
-            return True
-        if not getattr(settings, "delivery", None) \
-                or not settings.delivery.enabled:
-            return False
-        try:
-            from .delivery import DeliveryRecordStore
-            delivery_record = DeliveryRecordStore(
-                settings.delivery.state_dir).load(
-                    SimpleNamespace(id=issue_id))
-        except Exception as error:  # noqa: BLE001 - reporting stays best effort
-            log.warning(
-                "Agent lifecycle delivery check failed reason=%s",
-                getattr(error, "reason", type(error).__name__))
-            return False
-        return delivery_record.get("phase") in _LIFECYCLE_BOUNDARY_PHASES
 
     def process_pending(self, wait=0):
         """One deterministic pump, also used by local integration tests."""
@@ -548,11 +457,6 @@ class Reporter:
         if not enabled(settings):
             self._pending_count = 0
             return
-        try:
-            self._recover_delivery(settings)
-        except Exception as error:  # noqa: BLE001 - local reporting cannot stop execution
-            self.last_error = getattr(error, "reason", type(error).__name__)
-            log.warning("Agent delivery recovery deferred reason=%s", self.last_error)
         for issue_id, record in list(self.records.items()):
             if not record.get("pending") or self.clock() < max(
                     self.retry_at.get(issue_id, 0), self.api_retry_at):
@@ -584,19 +488,6 @@ class Reporter:
         record = self.records.get(issue_id)
         if record is None:
             record = _load_record(settings, issue_id)
-        if event["phase"] == "running" \
-                and self._delivery_lifecycle_ended(
-                    settings, issue_id, record):
-            # A running event after a merge/pending-sync belongs to a new task
-            # lifecycle. Discard the old unsent controls before they can be
-            # attached to the new Linear Agent Session.
-            record["pending"] = []
-            record["sent_keys"] = []
-            record["phase"] = "running"
-            for key in ("session_id", "marker", "creation_attempted"):
-                record.pop(key, None)
-            with self._progress_lock:
-                self._progress.pop(issue_id, None)
         record.update(
             issue_id=issue_id, identifier=identity["identifier"], url=identity["url"])
         pending = record.setdefault("pending", [])

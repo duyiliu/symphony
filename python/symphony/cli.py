@@ -16,7 +16,6 @@ from . import (
     status_dashboard,
     workflow_store,
 )
-from .delivery import DeliveryController
 from .agent_sessions import Reporter
 from .orchestrator import Orchestrator
 from .workflow import WorkflowError
@@ -91,7 +90,7 @@ def _build_parser():
         help="Log root; writes <root>/log/symphony.log (default: cwd)")
     parser.add_argument(
         "--restore-state", default=None, metavar="ARCHIVE",
-        help="Restore delivery and Agent Session state from a backup zip, "
+        help="Restore Agent Session state from a backup zip, "
              "then exit")
     parser.add_argument(
         GUARDRAIL_FLAG, dest="acknowledge_guardrails", action="store_true",
@@ -145,8 +144,7 @@ def main(argv=None):
             workflow_store.stop_store()
             return 2
         log.info(
-            "State restored delivery=%d agent_sessions=%d",
-            restored[state_backup.DELIVERY_PREFIX],
+            "State restored agent_sessions=%d",
             restored[state_backup.SESSION_PREFIX])
         if not args.check:
             workflow_store.stop_store()
@@ -167,8 +165,6 @@ def main(argv=None):
     reporter = Reporter(store).start()
     orchestrator = Orchestrator(store, session_reporter=reporter)
     orchestrator.start()
-    delivery = DeliveryController(store, session_reporter=reporter).start()
-    orchestrator.delivery_controller = delivery
     backup = state_backup.StateBackup(store.settings()).start()
     orchestrator.state_backup = backup
     server = http_api.start(orchestrator, store, path, host, port)
@@ -205,8 +201,6 @@ def main(argv=None):
             server.shutdown()
         except Exception:  # noqa: BLE001
             pass
-        if delivery is not None:
-            delivery.stop()
         orchestrator.stop()
         reporter.stop()
         backup.stop()

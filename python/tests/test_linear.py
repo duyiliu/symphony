@@ -552,8 +552,6 @@ class LinearTrackerTests(unittest.TestCase):
 
     def test_worker_can_attach_pr_to_current_issue(self):
         cfg = settings()
-        cfg.delivery.enabled = True
-        cfg.delivery.repo = "duyiliu/symphony"
         scope = issue_scope()
 
         def response(_settings, query, _variables):
@@ -583,8 +581,7 @@ class LinearTrackerTests(unittest.TestCase):
         with patch.object(linear, "graphql", side_effect=response):
             result = tracker.execute_agent_tool(
                 "linear_graphql", {"query": query, "variables": variables},
-                cfg.tracker, issue_scope=scope,
-                delivery_settings=cfg.delivery)
+                cfg.tracker, issue_scope=scope)
         self.assertTrue(result["data"]["attachmentLinkGitHubPR"]["success"])
 
         create = (
@@ -600,28 +597,32 @@ class LinearTrackerTests(unittest.TestCase):
             generic = tracker.execute_agent_tool(
                 "linear_graphql",
                 {"query": create, "variables": create_variables},
-                cfg.tracker, issue_scope=scope,
-                delivery_settings=cfg.delivery)
+                cfg.tracker, issue_scope=scope)
         self.assertTrue(generic["data"]["attachmentCreate"]["success"])
 
         variables["url"] = "https://github.com/other/repo/pull/13"
         with patch.object(linear, "graphql", side_effect=response):
-            denied = tracker.execute_agent_tool(
+            allowed = tracker.execute_agent_tool(
                 "linear_graphql", {"query": query, "variables": variables},
-                cfg.tracker, issue_scope=scope,
-                delivery_settings=cfg.delivery)
-        self.assertEqual(denied["error"]["code"], "linear_tool_forbidden")
+                cfg.tracker, issue_scope=scope)
+        self.assertTrue(allowed["data"]["attachmentLinkGitHubPR"]["success"])
 
         create_variables["input"]["url"] = (
             "https://github.com/other/repo/pull/13")
         with patch.object(linear, "graphql", side_effect=response):
-            denied_create = tracker.execute_agent_tool(
+            allowed_create = tracker.execute_agent_tool(
                 "linear_graphql",
                 {"query": create, "variables": create_variables},
-                cfg.tracker, issue_scope=scope,
-                delivery_settings=cfg.delivery)
-        self.assertEqual(
-            denied_create["error"]["code"], "linear_tool_forbidden")
+                cfg.tracker, issue_scope=scope)
+        self.assertTrue(
+            allowed_create["data"]["attachmentCreate"]["success"])
+
+        variables["url"] = "https://gitlab.com/other/repo/pull/13"
+        with patch.object(linear, "graphql", side_effect=response):
+            denied = tracker.execute_agent_tool(
+                "linear_graphql", {"query": query, "variables": variables},
+                cfg.tracker, issue_scope=scope)
+        self.assertEqual(denied["error"]["code"], "linear_tool_forbidden")
 
     def test_worker_tool_requires_spawn_issue_scope(self):
         cfg = settings().tracker

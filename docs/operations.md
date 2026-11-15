@@ -39,8 +39,6 @@ Backoff queue）。隐藏进程或非 TTY 默认关闭；需要强制开启时�
 | `agent_session_queue_backlog` | warning | 队列 ≥ 200 |
 | `agent_session_outbox_backlog` | warning | 持久化 outbox ≥ 100 |
 | `agent_session_reporter_down` | critical | Agent Session 线程未运行 |
-| `delivery_thread_down` | critical | 宿主交付线程未运行 |
-| `delivery_deferred` | info | 交付因限流或门禁延迟 |
 
 阈值定义在 `python/symphony/http_api.py` 顶部，调整后重启服务生效。
 
@@ -70,7 +68,6 @@ running/retrying/blocked 时返回 `issue_busy`。
 
 需要备份的本地状态：
 
-- `delivery.state_dir`：交付记录 JSON，默认位于工作区根目录下的 `_delivery`。
 - Agent Session 状态目录：默认位于工作区根目录下的 `_agent_sessions`。
 - MCP scope 只在内存中，重启后由新 Worker 重新签发；不需要备份。
 - 工作区目录：可重建，但包含 Agent 尚未提交的改动，清理前必须先确认。
@@ -94,15 +91,14 @@ running/retrying/blocked 时返回 `issue_busy`。
 python -m symphony --workflow deploy/WORKFLOW.local.md --restore-state <archive.zip>
 ```
 
-恢复会校验归档路径与每个 JSON 对象，只覆盖 `delivery/` 和
-`agent_sessions/` 前缀的文件；损坏或多个未知前缀的归档会被拒绝。
+恢复会校验归档路径与每个 JSON 对象，只覆盖 `agent_sessions/` 前缀的文件；
+损坏或未知前缀的归档会被拒绝。
 
 恢复顺序：
 
-1. 恢复 `_delivery` 和 `_agent_sessions` 目录。
+1. 恢复 `_agent_sessions` 目录。
 2. 启动服务，确认 `/api/v1/state` 的 `health.status=healthy`。
-3. 检查 `agent_sessions.pending_events` 和 `delivery.deferred_count` 是否归零。
-4. 对 `merged_pending_sync` 记录触发一次 refresh，确认 Linear 状态被核对。
+3. 检查 `agent_sessions.pending_events` 是否归零。
 
 ## 日志保留
 
@@ -113,7 +109,6 @@ python -m symphony --workflow deploy/WORKFLOW.local.md --restore-state <archive.
 ## 依赖不可用时的行为
 
 - Linear 轮询失败：保留上次快照，`health.status=degraded`，下个周期重试。
-- GitHub 交付失败：记录 `delivery` deferred/backoff，不阻塞调度。
 - Pi 启动失败：按控制面策略重试；本地永久错误进入 blocked，等待人工处理。
 - Agent Session 上报失败：进入持久化 outbox，恢复后补发并去重。
 - MCP scope 达到上限：拒绝新 Worker（fail-closed），不会静默降级。

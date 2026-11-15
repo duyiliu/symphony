@@ -688,11 +688,6 @@ def state_payload(orchestrator):
     if reporter is not None:
         reporter_snapshot = reporter.snapshot()
         result["agent_sessions"] = reporter_snapshot
-    delivery_controller = getattr(orchestrator, "delivery_controller", None)
-    delivery_snapshot = None
-    if delivery_controller is not None:
-        delivery_snapshot = delivery_controller.snapshot()
-        result["delivery"] = delivery_snapshot
     backup_controller = getattr(orchestrator, "state_backup", None)
     if backup_controller is not None:
         result["state_backup"] = backup_controller.snapshot()
@@ -761,19 +756,6 @@ def _alerts(result):
             "code": "agent_session_reporter_down",
             "severity": "critical",
             "message": "Agent Session reporter thread is not running",
-        })
-    delivery = result.get("delivery") or {}
-    if delivery.get("enabled") and delivery.get("thread_alive") is False:
-        alerts.append({
-            "code": "delivery_thread_down",
-            "severity": "critical",
-            "message": "Delivery controller thread is not running",
-        })
-    if delivery.get("deferred_count"):
-        alerts.append({
-            "code": "delivery_deferred",
-            "severity": "info",
-            "message": "Delivery deferred for %s item(s)" % delivery.get("deferred_count"),
         })
     backup = result.get("state_backup") or {}
     if backup.get("enabled") and backup.get("thread_alive") is False:

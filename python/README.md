@@ -124,52 +124,18 @@ GitLab 按项目分页读取 Issue，`opened` / `closed` 会映射为 GitLab 状
 按 IID 刷新时 404 会跳过；`gitlab_api` 仅允许相对路径和 GET/POST/PUT/DELETE，
 凭据只保留在宿主。也支持 `GITLAB_PROJECT_PATH`、`GITLAB_PAT` 环境变量回退。
 
-## 安全自动交付（可选）
+## 人工审批的合并流程
 
-在 Workflow 中增加 `delivery` 段后，宿主会轮询处于 `review_state` / `merge_state`
-的 Linear Issue，并从 Issue attachment 中读取 GitHub PR：
+合并由人工驱动，不由宿主自动完成：
 
-```yaml
-delivery:
-  enabled: true
-  repo: duyiliu/symphony-e2e
-  token: "$SYMPHONY_GITHUB_TOKEN"   # 仅宿主可读，绝不传给 Pi
-  base_branch: main
-  review_state: Human Review
-  merge_state: Merging
-  rework_state: Rework
-  done_state: Done
-  allow_auto_merge: true
-  require_branch_protection: true
-  required_approvals: 0
-  max_auto_files: 10
-  max_rework_attempts: 2
-  risk_paths:
-    - "**/*.sql"
-    - "**/auth/**"
-    - ".github/workflows/**"
-  risk_labels: [high-risk, security, database]
-```
+1. Worker 完成实现后把 issue 移到 `Human Review`（`agent:review` label）并附上 PR 链接；
+2. 人工审查 PR；
+3. 人工把 issue 移到 `Merging`（`agent:merging` label）；
+4. Orchestrator 拉起 worker 运行 `land` skill 完成 merge + 关闭 issue；
+5. 如需返工，人工把 issue 移到 `Rework`（`agent:rework` label），worker 重做。
 
-安全边界：
-
-- `review_state` 和 `merge_state` 不能出现在 `tracker.active_states` 中，否则启动失败；
-  合并由宿主控制，不能让 Pi 在 `Merging` 状态再次运行 `land`。
-- 宿主必须拿到 PR 当前真实 HEAD SHA，并只接受该 SHA 的 check-runs / commit statuses、
-  Review 和合并结果；新 commit 会重新跑全部门禁。
-- 无 CI、CI 失败、冲突、`CHANGES_REQUESTED`、缺少必需 Review、分支保护不可用或
-  风险路径命中时，默认暂停并回到 `Human Review`，不会合并。
-- `required_approvals` 与 GitHub 分支保护中的必需 Review 数取更严格结果；测试环境
-  若暂时无法启用分支保护，必须显式设置 `allow_without_branch_protection: true`，
-  生产环境不应这样做。
-- 自动返工只会在失败原因和 HEAD SHA 变化时重新排队，最多 `max_rework_attempts` 次；
-  达到上限或返工没有产生新 SHA 时暂停，等待人工处理。
-- 宿主合并后必须重新读取 GitHub 的 `merged` 状态且确认 HEAD SHA 未变化，再更新
-  Linear 为 `done_state`。任何无法确认的合并结果都按失败暂停。
-
-Pi 不应持有可合并的 GitHub 凭据。推荐使用只读/写 Contents 的部署密钥或细粒度
-Token 推送分支，PR 创建通过宿主 `github_api` 工具完成；该工具的 allowlist 明确
-禁止 `PUT /pulls/{n}/merge`。`runtime.mcp.enabled` 必须为 `true` 才能使用该工具。
+Pi 可以通过 `github_api` 工具调用 GitHub REST API（comments、PR、labels、merge 等），
+由 `runtime.mcp.enabled` 控制；工具的 allowlist 限定在配置的仓库内。
 
 ## 运行安全
 
@@ -177,8 +143,7 @@ Token 推送分支，PR 创建通过宿主 `github_api` 工具完成；该工具
 - `linear_graphql` 是与官方相同的原生 GraphQL 工具：**凭据权限可能覆盖多个项目**，
   项目级读取限制不等于工具写权限隔离；应使用权限最小的身份和受控主机。
 - 回归官方 Linear 流程的迁移已在测试 Linear 项目验证自动领取、Pi 执行、PR 创建、
-  失败重试上限、取消收敛和 PR 复用；安全合并与重启恢复需按
-  `docs/linear-safe-delivery.md` 的验证清单执行。
+  失败重试上限、取消收敛和 PR 复用；人工审批后由 worker 跑 land 完成合并。
 - GitHub Issues 和本地 Board 仍是受支持的辅助 Tracker；默认部署主链路为
   Linear + Pi。
 

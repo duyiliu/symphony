@@ -44,10 +44,10 @@ Contents-only deploy key。不要把真实配置、密钥或 token 放进 Git。
   GitHub PR URL 还必须属于配置仓库。
 - `github_api` 的 GET 可读取配置仓库；写操作只能创建 head 分支包含当前
   Issue identifier 的 PR，或修改/评论同一仓库中该 identifier 对应的 open PR。
-  `symphony` label 是唯一允许的仓库级 label 创建。worker 没有 merge 能力。
+  `symphony` label 是唯一允许的仓库级 label 创建。
 - 工作区运行锁位于可删除 worktree 之外，同时使用进程内 map、跨进程 OS 字节锁、
   host/agent PID 身份和 Pi session token 扫描。无法验证的存活状态一律保持 busy。
-- Agent Session 和 delivery 状态使用 UUID 临时文件、`fsync` 与原子替换；
+- Agent Session 状态使用 UUID 临时文件、`fsync` 与原子替换；
   失败路径清理临时文件。MCP HTTP 单请求上限为 1 MiB，畸形、重复、负数或超限
   `Content-Length` 在读取 body 前拒绝。
 
@@ -156,7 +156,6 @@ YIL-182：19:22:56 自动领取，19:23:02 启动 Pi，19:25:05 进入 `Human Re
 PR `duyiliu/symphony-e2e#21`（HEAD
 `f650de9151fa962a265a21c65b5899bdbe50c27d`）三个 `test` 检查全部成功，
 宿主门禁 11:25:25Z 合并，merge commit
-`e18b992b3ca38a222e7efa2c0c72cd1797bcd64a`。Linear 为 Done，delivery
-`phase=merged`、`merge_attempts=1`；Agent Session
+`e18b992b3ca38a222e7efa2c0c72cd1797bcd64a`。Linear 为 Done；Agent Session
 `5f6be763-42a8-4de6-a497-f59c343aaccb` 上报 `phase=merged`，pending 为空。
 这次验收覆盖“当前未提交工作树”的完整闭环，不代表公网 webhook 或人工消息回传。

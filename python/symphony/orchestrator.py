@@ -1273,12 +1273,7 @@ class Orchestrator:
                 "Issue moved to non-active state: %s state=%s; stopping active agent",
                 _issue_context(issue), issue.state)
             if self.session_reporter:
-                if settings.delivery.enabled and state_name in {
-                        normalize_issue_state(settings.delivery.review_state),
-                        normalize_issue_state(settings.delivery.merge_state)}:
-                    self.session_reporter.worker_finished(issue, True)
-                else:
-                    self.session_reporter.stopped(issue)
+                self.session_reporter.stopped(issue)
             self._terminate_running_issue(issue.id, False, settings)
 
     def _reconcile_blocked_issues(self):

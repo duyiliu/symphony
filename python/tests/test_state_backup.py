@@ -22,8 +22,6 @@ def _settings(root, keep=24, interval_ms=3_600_000):
     }
     return SimpleNamespace(
         workspace=SimpleNamespace(root=workspace_root),
-        delivery=SimpleNamespace(
-            state_dir=os.path.join(root, "delivery")),
         server=SimpleNamespace(
             state_backup_dir=os.path.join(root, "backups"),
             state_backup_interval_ms=interval_ms,
@@ -44,23 +42,21 @@ def _write(path, payload):
 
 
 def _state_files(settings):
-    delivery = os.path.join(settings.delivery.state_dir, "issue-1.json")
     sessions_root = agent_sessions.state_root(settings)
     session = os.path.join(sessions_root, "issue-1.json")
-    return delivery, session
+    return session
 
 
 class BackupTest(unittest.TestCase):
     def _populate(self, settings):
-        delivery, session = _state_files(settings)
-        _write(delivery, {"issue_id": "issue-1", "phase": "merged"})
+        session = _state_files(settings)
         _write(session, {
             "issue_id": "issue-1", "phase": "running", "pending": []})
-        temp = delivery + ".tmp.1.abc"
+        temp = session + ".tmp.1.abc"
         with open(temp, "w", encoding="utf-8") as handle:
             handle.write("partial")
         owner = os.path.join(
-            os.path.dirname(delivery), "issue-1.owner.json")
+            os.path.dirname(session), "issue-1.owner.json")
         _write(owner, {"pid": 1})
 
     def test_backup_writes_only_durable_json_state(self):
@@ -73,12 +69,11 @@ class BackupTest(unittest.TestCase):
                 now=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc))
 
             self.assertIsNotNone(result)
-            self.assertEqual(result["files"], 2)
+            self.assertEqual(result["files"], 1)
             with zipfile.ZipFile(result["path"]) as archive:
                 names = sorted(archive.namelist())
             self.assertEqual(names, [
                 "agent_sessions/issue-1.json",
-                "delivery/issue-1.json",
             ])
 
     def test_backup_returns_none_without_state(self):
@@ -109,19 +104,15 @@ class BackupTest(unittest.TestCase):
             settings = _settings(root)
             self._populate(settings)
             result = state_backup.backup_once(settings)
-            delivery, session = _state_files(settings)
-            os.remove(delivery)
+            session = _state_files(settings)
             os.remove(session)
 
             restored = state_backup.restore_backup(
                 result["path"], settings)
 
             self.assertEqual(restored, {
-                state_backup.DELIVERY_PREFIX: 1,
                 state_backup.SESSION_PREFIX: 1,
             })
-            with open(delivery, encoding="utf-8") as handle:
-                self.assertEqual(json.load(handle)["phase"], "merged")
             with open(session, encoding="utf-8") as handle:
                 self.assertEqual(json.load(handle)["phase"], "running")
 
@@ -130,12 +121,12 @@ class BackupTest(unittest.TestCase):
             settings = _settings(root)
             archive_path = os.path.join(root, "bad.zip")
             with zipfile.ZipFile(archive_path, "w") as archive:
-                archive.writestr("delivery/../escape.json", "{}")
+                archive.writestr("agent_sessions/../escape.json", "{}")
             with self.assertRaises(state_backup.StateBackupError):
                 state_backup.restore_backup(archive_path, settings)
 
             with zipfile.ZipFile(archive_path, "w") as archive:
-                archive.writestr("delivery/broken.json", "not-json")
+                archive.writestr("agent_sessions/broken.json", "not-json")
             with self.assertRaises(state_backup.StateBackupError):
                 state_backup.restore_backup(archive_path, settings)
 
@@ -149,8 +140,7 @@ class BackupServiceTest(unittest.TestCase):
     def test_service_records_success_and_disabled_state(self):
         with tempfile.TemporaryDirectory(prefix="symphony-backup-") as root:
             settings = _settings(root)
-            delivery, session = _state_files(settings)
-            _write(delivery, {"issue_id": "issue-1"})
+            session = _state_files(settings)
             _write(session, {"issue_id": "issue-1"})
 
             service = state_backup.StateBackup(settings)

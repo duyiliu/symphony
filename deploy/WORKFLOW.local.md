@@ -30,21 +30,6 @@ workspace:
 # worker:
 #   ssh_hosts: ["deploy@worker-a:2222", "worker-b"]
 #   max_concurrent_agents_per_host: 2
-delivery:
-  enabled: true
-  repo: "$SYMPHONY_REPO"
-  token: "$SYMPHONY_GITHUB_TOKEN"
-  base_branch: main
-  review_state: Human Review
-  merge_state: Merging
-  rework_state: Rework
-  done_state: Done
-  require_branch_protection: true
-  allow_without_branch_protection: false
-  required_approvals: 0
-  max_auto_files: 10
-  max_rework_attempts: 2
-  poll_interval_ms: 10000
 hooks:
   after_create: |
     GIT_SSH_COMMAND="ssh -i \"$SYMPHONY_DEPLOY_KEY\" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new" git clone "git@github.com:$SYMPHONY_REPO.git" .
@@ -84,7 +69,7 @@ Description:
   the requested scope, run the required tests, commit and push the branch.
 - Use a branch name containing `{{ issue.identifier }}` (for example
   `feature/{{ issue.identifier }}-short-description`). The host binds PR writes
-  and automatic delivery to branches containing the current issue identifier.
+  to branches containing the current issue identifier.
 - Reuse the current branch/PR for rework. Use a fresh branch if the old PR was
   already closed or merged. Do not create duplicate PRs.
 - Git uses the workspace's Contents-only SSH deploy key. Never obtain another
@@ -93,8 +78,10 @@ Description:
   open PR and PR comments. Address actionable feedback and rerun validation.
 - Attach the PR to the issue with `attachmentCreate`, add the `symphony` PR label,
   and move the issue to Human Review only after the required validation is green.
-- Human Review and Merging belong to the host delivery controller. Stop working
-  in those states. Never merge PRs or mark the issue Done yourself.
+- A human reviews the PR, then moves the issue to `Merging` to hand it back for
+  merge, or `Rework` to send it back for changes. Stop working in `Human Review`.
+- When you are dispatched in `Merging`, run the land flow: merge the PR, move the
+  issue to Done.
 - For a real external blocker, record exactly what is missing and why in the
   Workpad and move to Human Review. Do not request interactive assistance.
 - The host owns Agent Session reporting. Do not create sessions or emit activities.

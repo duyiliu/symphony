@@ -509,30 +509,22 @@ def _coerce_issue_scope(issue_scope):
     return scope
 
 
-def _state_is_protected(state_name, settings, delivery=None):
+def _state_is_protected(state_name, settings):
     normalized = normalize_issue_state(state_name)
     protected = {
         normalize_issue_state(state)
         for state in (settings.terminal_states or [])
     } | set(_PROTECTED_STATES)
-    if delivery is not None and delivery.enabled:
-        protected.update({
-            normalize_issue_state(delivery.merge_state),
-            normalize_issue_state(delivery.done_state),
-        })
     return normalized in protected
 
 
-def _worker_allowed_states(settings, delivery=None):
+def _worker_allowed_states(settings):
     names = list(settings.active_states or [])
-    if delivery is not None:
-        names.append(delivery.review_state)
-    else:
-        names.append("Human Review")
+    names.append("Human Review")
     return {
         normalize_issue_state(name) for name in names
         if present_string(name)
-        and not _state_is_protected(name, settings, delivery)
+        and not _state_is_protected(name, settings)
     }
 
 
@@ -579,20 +571,16 @@ def _validate_comment_scope(settings, issue_scope, comment_id):
         _forbidden("comment belongs to another issue or project")
 
 
-def _validate_github_pr_url(url, delivery):
-    if delivery is None or not delivery.enabled or not present_string(url):
-        _forbidden("GitHub PR attachment requires delivery scope")
+def _validate_github_pr_url(url):
+    if not present_string(url):
+        _forbidden("GitHub PR URL can't be blank")
     parsed = urlsplit(url)
     path_parts = [part for part in parsed.path.split("/") if part]
-    expected = (delivery.repo or "").split("/", 1)
     if parsed.scheme != "https" or parsed.hostname != "github.com" \
             or parsed.port is not None or parsed.username is not None \
             or parsed.password is not None or len(path_parts) != 4 \
-            or path_parts[2] != "pull" or not path_parts[3].isdigit() \
-            or len(expected) != 2 \
-            or [part.lower() for part in path_parts[:2]] \
-            != [part.lower() for part in expected]:
-        _forbidden("attachment URL is outside the configured repository")
+            or path_parts[2] != "pull" or not path_parts[3].isdigit():
+        _forbidden("attachment URL must be a GitHub pull request URL")
 
 
 def _validate_selection(fields, context, path):
@@ -637,7 +625,7 @@ def _validate_worker_query(fields, issue_scope):
 
 
 def _validate_worker_mutation(
-        fields, issue_scope, settings, delivery, states):
+        fields, issue_scope, settings, states):
     if len(fields) != 1:
         _forbidden("one approved GraphQL mutation is allowed per call")
     field = fields[0]
@@ -660,9 +648,9 @@ def _validate_worker_mutation(
             None,
         )
         if target is None or not present_string(target.get("name")) \
-                or _state_is_protected(target["name"], settings, delivery) \
+                or _state_is_protected(target["name"], settings) \
                 or normalize_issue_state(target["name"]) \
-                not in _worker_allowed_states(settings, delivery):
+                not in _worker_allowed_states(settings):
             _forbidden("issueUpdate target state is not worker-writable")
         return
 
@@ -705,14 +693,14 @@ def _validate_worker_mutation(
         if parsed.hostname == "github.com" \
                 and len(path_parts) >= 3 \
                 and path_parts[2] == "pull":
-            _validate_github_pr_url(value["url"], delivery)
+            _validate_github_pr_url(value["url"])
         return
 
     if name == "attachmentLinkGitHubPR":
         if set(arguments) != {"issueId", "url", "title", "linkKind"} \
                 or not _same_issue(arguments.get("issueId"), issue_scope):
             _forbidden("attachmentLinkGitHubPR is outside the bound issue")
-        _validate_github_pr_url(arguments.get("url"), delivery)
+        _validate_github_pr_url(arguments.get("url"))
 
 
 def _validate_mutation_root(fields):
@@ -1021,7 +1009,7 @@ def tool_specs():
 
 
 def execute_agent_tool(
-        settings, tool_name, arguments, issue_scope=None, delivery=None):
+        settings, tool_name, arguments, issue_scope=None):
     if tool_name != "linear_graphql":
         return {"error": {"code": "unknown_tool", "detail": tool_name}}
     if isinstance(arguments, str):
@@ -1049,7 +1037,7 @@ def execute_agent_tool(
             _validate_mutation_root(fields)
             states = _live_issue_scope(settings, scope)
             _validate_worker_mutation(
-                fields, scope, settings, delivery, states)
+                fields, scope, settings, states)
         else:
             _forbidden("GraphQL operation is not allowed")
         return graphql(settings, query, variables)

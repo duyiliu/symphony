@@ -144,20 +144,14 @@ def record_issue_failure(issue, tracker_settings, reason):
         _board().record_issue_failure(issue, tracker_settings, reason)
 
 
-def tool_specs(tracker_settings=None, delivery_settings=None):
+def tool_specs(tracker_settings=None):
     from .github import agent_tool
     if tracker_settings is None:
         from .workflow_store import get_store
         store = get_store()
         tracker_settings = store.settings().tracker if store else None
     if tracker_settings and _is_linear(tracker_settings):
-        specs = linear_adapter.tool_specs()
-        delivery = delivery_settings
-        if delivery is None:
-            delivery = _delivery_settings()
-        if delivery is not None and delivery.enabled:
-            specs = specs + agent_tool.delivery_tool_specs()
-        return specs
+        return linear_adapter.tool_specs()
     if tracker_settings and _is_jira(tracker_settings):
         return jira_adapter.tool_specs()
     if tracker_settings and _is_asana(tracker_settings):
@@ -169,24 +163,16 @@ def tool_specs(tracker_settings=None, delivery_settings=None):
 
 def execute_agent_tool(
         tool_name, arguments, tracker_settings=None, issue_scope=None,
-        delivery_settings=None):
+        ):
     from .github import agent_tool
     if tracker_settings is None:
         from .workflow_store import get_store
         store = get_store()
         tracker_settings = store.settings().tracker if store else None
     if tracker_settings and _is_linear(tracker_settings):
-        if tool_name == "github_api":
-            delivery = delivery_settings
-            if delivery is None:
-                delivery = _delivery_settings()
-            if delivery is None or not delivery.enabled:
-                return {"error": {"code": "unknown_tool", "detail": tool_name}}
-            return agent_tool.execute_delivery_tool(
-                arguments, delivery, issue_scope=issue_scope)
         return linear_adapter.execute_agent_tool(
             tracker_settings, tool_name, arguments,
-            issue_scope=issue_scope, delivery=delivery_settings)
+            issue_scope=issue_scope)
     if tracker_settings and _is_jira(tracker_settings):
         return jira_adapter.execute_agent_tool(
             tool_name, arguments, tracker_settings=tracker_settings)
@@ -198,15 +184,6 @@ def execute_agent_tool(
             tool_name, arguments, tracker_settings=tracker_settings)
     return agent_tool.execute_agent_tool(tool_name, arguments,
                                          tracker_settings)
-
-
-def _delivery_settings():
-    from .workflow_store import get_store
-
-    store = get_store()
-    if store is None:
-        return None
-    return store.settings().delivery
 
 
 def secret_environment_names(tracker_settings):

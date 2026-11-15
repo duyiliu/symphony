@@ -19,7 +19,7 @@ from symphony.linear import IssueScope
 from symphony.workflow import WorkflowError
 
 
-def settings(project_slug="project-a", repo="acme/repo-a"):
+def settings(project_slug="project-a"):
     cfg = config.parse_settings({
         "tracker": {
             "kind": "linear",
@@ -29,11 +29,6 @@ def settings(project_slug="project-a", repo="acme/repo-a"):
             },
             "active_states": ["Todo", "In Progress", "Rework"],
             "terminal_states": ["Done", "Cancelled"],
-        },
-        "delivery": {
-            "enabled": True,
-            "repo": repo,
-            "token": "host-github-secret",
         },
         "runtime": {"kind": "pi", "mcp": {"enabled": True}},
         "workspace": {"root": os.path.join(
@@ -47,7 +42,7 @@ class McpBridgeScopeTests(unittest.TestCase):
         state = mcp_bridge._State(None, 1234)
         cfg = settings()
         state.register_scope(
-            cfg.tracker, cfg.delivery, IssueScope(id="issue-a", identifier="ABC-1"))
+            cfg.tracker, IssueScope(id="issue-a", identifier="ABC-1"))
 
         stats = state.stats()
 
@@ -130,7 +125,7 @@ class McpBridgeScopeTests(unittest.TestCase):
         bridge = mcp_bridge.start()
         try:
             token = bridge.register_scope(
-                cfg.tracker, cfg.delivery,
+                cfg.tracker,
                 IssueScope(id=issue.id, identifier=issue.identifier))
             url = "http://127.0.0.1:%d%s" % (bridge.port, mcp_bridge.MCP_PATH)
             request = {
@@ -167,7 +162,7 @@ class McpBridgeScopeTests(unittest.TestCase):
         bridge = mcp_bridge.start()
         try:
             token = bridge.register_scope(
-                cfg.tracker, cfg.delivery,
+                cfg.tracker,
                 IssueScope(id=issue.id, identifier=issue.identifier))
             headers = {
                 "Authorization": "Bearer " + token,
@@ -229,35 +224,32 @@ class McpBridgeScopeTests(unittest.TestCase):
         self.assertIsNotNone(state.scope_for_token(second_token))
 
     def test_hot_reload_does_not_mutate_old_worker_scope(self):
-        old_cfg = settings(project_slug="project-a", repo="acme/repo-a")
+        old_cfg = settings(project_slug="project-a")
         issue = SimpleNamespace(id="issue-a", identifier="ABC-1")
         scope = IssueScope(id=issue.id, identifier=issue.identifier)
         state = mcp_bridge._State(None, 1234)
         old_token = state.register_scope(
-            old_cfg.tracker, old_cfg.delivery, scope)
+            old_cfg.tracker, scope)
 
-        new_cfg = settings(project_slug="project-b", repo="acme/repo-b")
+        new_cfg = settings(project_slug="project-b")
         new_token = state.register_scope(
-            new_cfg.tracker, new_cfg.delivery, scope)
+            new_cfg.tracker, scope)
 
         self.assertNotEqual(old_token, new_token)
-        old_tracker, old_delivery, old_issue = state.scope_for_token(old_token)
-        new_tracker, new_delivery, new_issue = state.scope_for_token(new_token)
+        old_tracker, old_issue = state.scope_for_token(old_token)
+        new_tracker, new_issue = state.scope_for_token(new_token)
         self.assertEqual(old_tracker.project_slug, "project-a")
-        self.assertEqual(old_delivery.repo, "acme/repo-a")
         self.assertEqual(new_tracker.project_slug, "project-b")
-        self.assertEqual(new_delivery.repo, "acme/repo-b")
         self.assertEqual(old_issue, new_issue)
 
         body = {"method": "GET", "path": "/repos/acme/repo-a/pulls/13"}
         with patch(
-                "symphony.github.agent_tool.execute_delivery_tool",
+                "symphony.tracker.execute_agent_tool",
                 return_value={"status": 200}) as execute:
             result = tracker.execute_agent_tool(
                 "github_api", body, old_tracker,
-                issue_scope=old_issue, delivery_settings=old_delivery)
+                issue_scope=old_issue)
         self.assertEqual(result, {"status": 200})
-        self.assertEqual(execute.call_args.args[1].repo, "acme/repo-a")
         self.assertEqual(execute.call_args.kwargs["issue_scope"], old_issue)
 
     def test_tools_use_frozen_scope_not_live_workflow_store(self):
@@ -265,7 +257,7 @@ class McpBridgeScopeTests(unittest.TestCase):
         issue = SimpleNamespace(id="issue-a", identifier="ABC-1")
         state = mcp_bridge._State(None, 1234)
         scope = IssueScope(id=issue.id, identifier=issue.identifier)
-        token = state.register_scope(cfg.tracker, cfg.delivery, scope)
+        token = state.register_scope(cfg.tracker, scope)
         frozen = state.scope_for_token(token)
 
         request = {
@@ -281,8 +273,7 @@ class McpBridgeScopeTests(unittest.TestCase):
 
         self.assertTrue(response["result"]["content"][0]["text"])
         self.assertEqual(execute.call_args.args[2].project_slug, "project-a")
-        self.assertEqual(
-            execute.call_args.kwargs["delivery_settings"].repo, "acme/repo-a")
+        self.assertNotIn("delivery_settings", execute.call_args.kwargs)
         self.assertEqual(execute.call_args.kwargs["issue_scope"], scope)
 
     def test_unknown_or_missing_bearer_has_no_scope(self):
@@ -314,7 +305,7 @@ class McpBridgeScopeTests(unittest.TestCase):
         issue = SimpleNamespace(id="issue-a", identifier="ABC-1")
         state = mcp_bridge._State(None, 1234)
         token = state.register_scope(
-            cfg.tracker, cfg.delivery,
+            cfg.tracker,
             IssueScope(id=issue.id, identifier=issue.identifier))
         process = Mock()
         process.stdin = Mock()
@@ -350,7 +341,7 @@ class McpBridgeScopeTests(unittest.TestCase):
         issue = SimpleNamespace(id="issue-a", identifier="ABC-1")
         state = mcp_bridge._State(None, 1234)
         token = state.register_scope(
-            cfg.tracker, cfg.delivery,
+            cfg.tracker,
             IssueScope(id=issue.id, identifier=issue.identifier))
         process = Mock()
         process.pid = 4321

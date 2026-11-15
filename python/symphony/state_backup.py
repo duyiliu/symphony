@@ -1,8 +1,8 @@
 """Periodic backup and restore of durable scheduler state.
 
-Only JSON records owned by the delivery controller and the Agent Session
-reporter are copied. Runtime-only state (MCP scopes, retry queue) is rebuilt
-on restart and intentionally excluded.
+Only JSON records owned by the Agent Session reporter are copied.
+Runtime-only state (MCP scopes, retry queue) is rebuilt on restart and
+intentionally excluded.
 """
 
 import datetime
@@ -20,7 +20,6 @@ log = logging.getLogger("symphony.state_backup")
 
 BACKUP_PREFIX = "state-"
 BACKUP_SUFFIX = ".zip"
-DELIVERY_PREFIX = "delivery"
 SESSION_PREFIX = "agent_sessions"
 _TEMP_MARKER = ".tmp."
 
@@ -40,9 +39,6 @@ def backup_directory(settings):
 
 def source_directories(settings):
     sources = []
-    delivery_dir = getattr(settings.delivery, "state_dir", None)
-    if delivery_dir and os.path.isdir(delivery_dir):
-        sources.append((DELIVERY_PREFIX, os.path.abspath(delivery_dir)))
     sessions_dir = agent_sessions.state_root(settings)
     if os.path.isdir(sessions_dir):
         sources.append((SESSION_PREFIX, sessions_dir))
@@ -150,13 +146,7 @@ def _safe_relative(relative):
 
 
 def _restore_targets(settings):
-    workspace_root = os.path.abspath(
-        settings.workspace.root or os.getcwd())
-    delivery_dir = (
-        settings.delivery.state_dir
-        or os.path.join(workspace_root, "_delivery"))
     return {
-        DELIVERY_PREFIX: os.path.abspath(delivery_dir),
         SESSION_PREFIX: agent_sessions.state_root(settings),
     }
 
@@ -181,7 +171,7 @@ def _write_restored_file(target, payload):
 
 
 def restore_backup(archive_path, settings):
-    """Restore delivery and Agent Session JSON records from an archive.
+    """Restore Agent Session JSON records from an archive.
 
     Every entry is validated as a JSON object before any file is replaced.
     The service should be stopped before calling this function.
@@ -191,7 +181,7 @@ def restore_backup(archive_path, settings):
     except OSError as error:
         raise StateBackupError("pre_restore_backup_failed") from error
     targets = _restore_targets(settings)
-    restored = {DELIVERY_PREFIX: 0, SESSION_PREFIX: 0}
+    restored = {SESSION_PREFIX: 0}
     pending = []
     try:
         archive = zipfile.ZipFile(archive_path, "r")
@@ -223,8 +213,8 @@ def restore_backup(archive_path, settings):
     for target, payload in pending:
         _write_restored_file(target, payload)
     log.info(
-        "State restore complete delivery=%d agent_sessions=%d",
-        restored[DELIVERY_PREFIX], restored[SESSION_PREFIX])
+        "State restore complete agent_sessions=%d",
+        restored[SESSION_PREFIX])
     return restored
 
 

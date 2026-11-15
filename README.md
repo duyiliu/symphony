@@ -28,7 +28,7 @@ Tell your favorite coding agent to build Symphony in a programming language of y
 ### Option 2. Use this Python + Pi implementation
 
 The Python core in [python/README.md](python/README.md) is the product runtime for this
-repository: Python orchestrator, Pi JSON-RPC workers, Linear tracker, host-side safe delivery
+repository: Python orchestrator, Pi JSON-RPC workers, Linear tracker, human-approved merging
 and the local board. Start from [deploy/WORKFLOW.local.md](deploy/WORKFLOW.local.md), which
 keeps merge authority on the host.
 

@@ -30,7 +30,7 @@ Pi 是唯一受支持的 Agent Runtime；原版 Codex App Server 不移植。
 
 | 原版模块 | 职责 | Python 对应 | 状态 | 说明 |
 |---|---|---|---|---|
-| `config.ex` / `config/schema.ex` | 配置解析、默认值、校验、环境变量 | `config.py` | 已对齐 | 主体字段已对齐；新增 `runtime`、`delivery`、`server.api_token`；默认 Runtime 为 Pi |
+| `config.ex` / `config/schema.ex` | 配置解析、默认值、校验、环境变量 | `config.py` | 已对齐 | 主体字段已对齐；新增 `runtime`、`server.api_token`；默认 Runtime 为 Pi |
 | `workflow.ex` | WORKFLOW.md front matter + prompt | `workflow.py` | 已对齐 | 支持纯 prompt、front matter、非法 front matter 测试 |
 | `workflow_store.ex` | 1 秒轮询、last-known-good、热加载 | `workflow_store.py` | 已对齐 | 文件戳 + 内容哈希；失败保留上一版 |
 | `prompt_builder.ex` | 严格变量渲染、日期/嵌套对象 | `template.py` | 已对齐 | Liquid tags + 常用 filters、`assign`/`capture`/`case`/`raw`；strict variables/filters 行为一致；错误文本为 Python 风格 |
@@ -60,7 +60,6 @@ Pi 是唯一受支持的 Agent Runtime；原版 Codex App Server 不移植。
 
 | 能力 | Python 位置 | 边界 |
 |---|---|---|
-| 宿主侧安全交付 | `delivery.py`、`github/workflow_policy.py` | 合并只能由宿主执行；Pi 不持有合并凭据 |
 | Agent Session 生命周期 | `agent_sessions.py` | OAuth、进度、终态、outbox、重启恢复 |
 | MCP scope 隔离 | `mcp_bridge.py` | 每次 Worker 独立 bearer；Issue/项目 scope；AST allowlist；停止请求即撤销 |
 | 工作区跨进程租约 | `workspace.py` | 防止同一 Issue 双执行；终止未确认时 fail-closed |
@@ -87,7 +86,7 @@ Pi 是唯一受支持的 Agent Runtime；原版 Codex App Server 不移植。
 
 ### P1：长期无人值守运行
 
-6. **统一生命周期与启动对账**：Tracker 状态、调度内存、delivery JSON、
+6. **统一生命周期与启动对账**：Tracker 状态、调度内存、
    Agent Session JSON 的事实源和启动扫描顺序。
 7. **可观测性（已完成）**：领取延迟、运行时长、重试率、阻塞率、outbox 积压、
    MCP scope 使用量、终止未确认数量，以及 `health.alerts` 阈值告警。
