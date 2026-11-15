@@ -316,8 +316,14 @@ select {
 .log-error { color: var(--danger); }
 @media (max-width: 860px) {
   .app-shell { padding: 1rem 0.85rem 2rem; }
-  .hero-card { border-radius: 20px; }
+  .hero-grid { grid-template-columns: 1fr; }
+  .status-stack { justify-items: start; }
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .error-card { border-radius: 20px; padding: 1rem; }
+}
+@media (max-width: 560px) {
+  .metric-grid { grid-template-columns: 1fr; }
+  .section-card, .hero-card, .error-card { border-radius: 20px; padding: 1rem; }
 }
 </style>
 </head>
@@ -734,8 +740,9 @@ select {
     }
     card.style.display = "";
     content.style.display = "none";
-    document.getElementById("error-copy").textContent =
-      (payload.error.code || "error") + ": " + (payload.error.message || "");
+    document.getElementById("error-copy").innerHTML =
+      "<strong>" + esc(payload.error.code || "error") + ":</strong> "
+      + esc(payload.error.message || "");
   }
 
   function renderSnapshot(payload) {
