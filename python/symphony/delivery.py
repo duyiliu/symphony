@@ -566,9 +566,18 @@ def evaluate(settings, issue, pr, checks, files, reviews, protection,
             "sha": sha}
 
     required = delivery.required_approvals
-    if approvals < required:
-        return "wait", "%s required approval(s), found %s" % (
-            required, approvals), {"sha": sha}
+    if required > 0:
+        if approvals < required:
+            label_approved = any(
+                isinstance(label, str)
+                and label.strip().lower() == "agent:approved"
+                for label in (issue.labels or [])
+            )
+            if not label_approved:
+                return "wait", (
+                    "%s required approval(s), found %s; "
+                    "add 'agent:approved' label to authorize merge"
+                    % (required, approvals)), {"sha": sha}
 
     risk_reason = risk_files(delivery, files, issue.labels)
     if risk_reason:
