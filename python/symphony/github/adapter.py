@@ -16,7 +16,7 @@ LABEL_STATES = frozenset(
     label[len(gh_client.LABEL_PREFIX):]
     for label in gh_client.LABEL_STATE_PRIORITY
     if label.startswith(gh_client.LABEL_PREFIX)
-) | frozenset({"review", "done", "closed"})
+) | frozenset({"review", "rework", "done", "closed"})
 
 
 def _validate_states(states, missing_error, tracker_settings):

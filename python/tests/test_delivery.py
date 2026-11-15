@@ -1023,7 +1023,7 @@ class GitHubLabelTransitionTest(unittest.TestCase):
                     "token": "tok",
                     "use_label_states": True,
                 },
-                "active_states": ["todo", "in-progress"],
+                "active_states": ["todo", "in-progress", "rework"],
                 "terminal_states": ["done", "closed"],
             },
             "delivery": {
@@ -1032,7 +1032,7 @@ class GitHubLabelTransitionTest(unittest.TestCase):
                 "token": "tok",
                 "review_state": "review",
                 "merge_state": "merging",
-                "rework_state": "todo",
+                "rework_state": "rework",
                 "done_state": "done",
             },
         })

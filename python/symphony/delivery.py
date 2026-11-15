@@ -146,7 +146,7 @@ def _tracker_state_names(settings, state_name):
         label_map = {
             settings.delivery.review_state: "agent:review",
             settings.delivery.merge_state: "agent:review",
-            settings.delivery.rework_state: "agent:todo",
+            settings.delivery.rework_state: "agent:rework",
             settings.delivery.done_state: "agent:done",
         }
         return label_map.get(state_name, "agent:%s" % state_name)
