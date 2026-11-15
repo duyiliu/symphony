@@ -145,7 +145,7 @@ def _tracker_state_names(settings, state_name):
     if _tracker_kind(settings) == "github":
         label_map = {
             settings.delivery.review_state: "agent:review",
-            settings.delivery.merge_state: "agent:review",
+            settings.delivery.merge_state: "agent:merging",
             settings.delivery.rework_state: "agent:rework",
             settings.delivery.done_state: "agent:done",
         }

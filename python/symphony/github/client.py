@@ -23,6 +23,7 @@ VALID_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE"}
 LABEL_PREFIX = "agent:"
 LABEL_STATE_PRIORITY = {
     "agent:done": 3,
+    "agent:merging": 4,
     "agent:in-progress": 2,
     "agent:todo": 1,
 }
