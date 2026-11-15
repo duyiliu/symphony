@@ -1643,6 +1643,12 @@ class DeliveryController:
             log.warning(
                 "merged PR but issue is already terminal identifier=%s state=%s",
                 issue.identifier, current.state)
+            try:
+                self._transition(settings, issue, delivery.done_state)
+            except Exception as error:  # noqa: BLE001 - label sync is best-effort
+                log.warning(
+                    "merged PR but label transition failed identifier=%s "
+                    "error=%s", issue.identifier, error)
         else:
             try:
                 self._transition(settings, issue, delivery.done_state)
